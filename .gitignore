@@ -1,0 +1,25 @@
+# ---- 机密:绝不上传 ----
+.env
+.env.*
+!.env.example
+
+# ---- 解包/分析产物(体积巨大,不入仓) ----
+target/
+**/process/extracted/
+**/process/filtered/
+**/process/analysis/
+**/process/agent/
+**/process/.cve_cache/
+**/process/fileinfo.json
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# ---- Docker 构建临时物 / 第三方嵌入源码 / 大型发布包 ----
+*.tar.gz
+*.tgz
+firmware_audit/docker/binwalk/binwalk/
+firmware_audit/docker/ghidra/ghidra*.zip

@@ -1,0 +1,14 @@
+# 增量层:从 sandbox 镜像移除误装的 pip binwalk(2026-08-18)
+#
+# 教训(实测):PyPI 的 `binwalk` 是停更的 2.1.0(pure python),Python 3.11 下
+# import 即崩;binwalk v3 是 Rust 二进制但需 GLIBC 2.39,跨镜像复制到
+# bullseye 基座(2.31)无法运行。结论:binwalk 不进 sandbox,Step5
+# binwalk_rescan 直接用 binwalk 专用镜像(保留不动)。
+#
+# 本层仅做卸载清理;不直接全量重建主 Dockerfile 的原因:基座是压扁镜像(单层),
+# 全量重建会把 radare2 编译整段重跑,而 r2 构建期要 git clone
+# vector35-arch-*(GitHub 网络被掐断,GnuTLS Error 128,实测失败)。
+FROM firm_audit/sandbox:latest
+
+RUN pip3 uninstall -y binwalk \
+    && rm -f /usr/local/bin/binwalk /usr/local/bin/binwalk-2.1.0*

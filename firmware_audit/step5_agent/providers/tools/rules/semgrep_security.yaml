@@ -1,0 +1,88 @@
+# Step5 semgrep_scan 本地规则集(离线可用,不依赖 p/ 网络规则)。
+#
+# 针对固件里提取的脚本/源码,覆盖嵌入式常见高危信号:
+#   - 命令注入 / 危险执行   (os.system / subprocess shell / exec / eval / system)
+#   - SQL 注入拼接 (Python/JS 非参数化查询)
+#   - 不安全反序列化 (pickle/yaml.load)
+#   - 硬编码密钥 / 证书(由 gitleaks_scan 兜底,这里只标明显赋值与弱加密)
+#   - PHP/Lua 危险函数
+# 规则保持精简,学 verify_agent_tools.sh 的可解释性:每条 rule 有 message/severity
+# 直接进 finding 摘要,方便 LLM 快速归类 → xref/decompile 复查。
+rules:
+  - id: py-os-system
+    message: "Python os.system() 执行外部命令,若参数含外部输入可命令注入"
+    languages: [python]
+    severity: WARNING
+    patterns:
+      - pattern: os.system(...)
+  - id: py-subprocess-shell
+    message: "subprocess 使用 shell=True,拼接命令可命令注入"
+    languages: [python]
+    severity: WARNING
+    pattern: subprocess.$CALL(..., shell=True, ...)
+  - id: py-eval-exec
+    message: "eval/exec 动态执行代码,不可信输入可 RCE"
+    languages: [python]
+    severity: WARNING
+    patterns:
+      - pattern: eval(...)
+      - pattern: exec(...)
+  - id: py-pickle-load
+    message: "pickle.load(s) 反序列化不可信数据可 RCE"
+    languages: [python]
+    severity: WARNING
+    patterns:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: yaml.load(...)
+  - id: py-sql-format
+    message: "SQL 用字符串拼接/格式化拼入,可 SQL 注入"
+    languages: [python]
+    severity: WARNING
+    patterns:
+      - pattern: execute(f"$SQL ...")
+      - pattern: cursor.execute(... % ...)
+  - id: js-eval-exec
+    message: "JavaScript eval/new Function 动态执行,可 RCE"
+    languages: [javascript]
+    severity: WARNING
+    patterns:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: child_process.exec(...)
+  - id: js-sql-concat
+    message: "SQL 字符串拼接(未参数化),可 SQL 注入"
+    languages: [javascript]
+    severity: WARNING
+    patterns:
+      - pattern: "$Q.execute($SQL + ...)"
+      - pattern: "$Q.query($SQL + ...)"
+  - id: php-system-eval
+    message: "PHP system/eval/exec/passthru 执行外部命令,可命令注入"
+    languages: [php]
+    severity: WARNING
+    patterns:
+      - pattern: system(...)
+      - pattern: exec(...)
+      - pattern: passthru(...)
+      - pattern: shell_exec(...)
+      - pattern: eval(...)
+  - id: php-sql-concat
+    message: "PHP SQL 字符串拼接(非 prepared statement),可 SQL 注入"
+    languages: [php]
+    severity: WARNING
+    patterns:
+      - pattern: '$Q->query("... $VAR ...")'
+      - pattern-regex: mysqli_query\s*\(\s*.*['"]\s*\$
+  - id: lua-os-execute
+    message: "Lua os.execute/popen 执行外部命令,可命令注入"
+    languages: [lua]
+    severity: WARNING
+    patterns:
+      - pattern: os.execute(...)
+      - pattern: io.popen(...)
+  - id: sh-eval-var
+    message: "shell eval 未引用变量的命令拼接,可命令注入"
+    languages: [bash]
+    severity: WARNING
+    pattern: eval $VAR

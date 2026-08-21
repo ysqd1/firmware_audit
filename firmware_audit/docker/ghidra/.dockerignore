@@ -1,0 +1,7 @@
+build.log
+build_stdout.log
+build_stderr.log
+build_pid.txt
+find_elf.sh
+test_decompile.py
+test_output

@@ -1,0 +1,60 @@
+## Ghidra Headless 反编译镜像 - 精简版
+## 用途: step4 对 ELF 并行反编译(ThreadPoolExecutor 每 ELF 起独立容器)
+##
+## 为什么精简: 原 ghidra 镜像(8.38GB)基于 deepaudit/sandbox(5.33GB,内含
+## semgrep/bandit/gitleaks/trufflehog/osv-scanner 等大量反编译用不到的
+## DeepAudit 安全工具),并行 4 容器时内存/IO 开销巨大。
+## 本镜像只保留运行 Ghidra 所需的: ubuntu 基础 + JDK 21 + Ghidra 本体 +
+## 最小字体库(fontconfig,Java AWT 需要)。体积 ~1.8GB,减约 78%。
+##
+## 运行时依赖说明:
+##   - libfontconfig1/libfreetype6: Java AWT 字体初始化需要(即便 headless,
+##     缺失会 UnsatisfiedLinkError: fontconfig)
+##   - libgomp1: Ghidra decompiler 的 OpenMP 运行时(小,保险)
+##   - tzdata: Java 时区,避免警告
+##
+## 构建可离线(Ghidra zip + JDK tar 本地 COPY),仅首次 apt 需要网络
+FROM ubuntu:25.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+ARG GHIDRA_VERSION="11.3.2"
+ARG GHIDRA_INSTALL_DIR="/opt/ghidra"
+ARG JDK21_INSTALL_DIR="/opt/jdk-21"
+
+# 最小运行依赖 + unzip(解压用,解压后本可删,但保留以便未来重装脚本层
+# 也不至于再下载;体积影响极小)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        unzip \
+        ca-certificates \
+        tzdata \
+        fontconfig \
+        libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# COPY 本地已下载的 Ghidra zip + JDK 21 tar(避免构建时网络下载)
+COPY ghidra_11.3.2_PUBLIC.zip /tmp/ghidra.zip
+COPY jdk21.tar.gz /tmp/jdk21.tar.gz
+
+# 解压 Ghidra + JDK 21
+RUN unzip -q /tmp/ghidra.zip -d /opt \
+    && mv /opt/ghidra_${GHIDRA_VERSION}_PUBLIC ${GHIDRA_INSTALL_DIR} \
+    && rm /tmp/ghidra.zip \
+    && tar xzf /tmp/jdk21.tar.gz -C /opt \
+    && mv /opt/jdk-21.* ${JDK21_INSTALL_DIR} \
+    && rm /tmp/jdk21.tar.gz
+
+# 复制提取脚本到 Ghidra 脚本目录
+COPY ExtractInfo.py ${GHIDRA_INSTALL_DIR}/Ghidra/Features/Decompiler/ghidra_scripts/ExtractInfo.py
+
+# 用 JDK 21(Ghidra 11.3.2 最低要求)
+ENV GHIDRA_INSTALL_DIR=${GHIDRA_INSTALL_DIR}
+ENV JAVA_HOME=${JDK21_INSTALL_DIR}
+ENV PATH="${JDK21_INSTALL_DIR}/bin:${GHIDRA_INSTALL_DIR}/support:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+WORKDIR /work
+
+# 默认入口: 由 step4_decompile.py 通过 entrypoint 覆盖调用 analyzeHeadless
+ENTRYPOINT ["analyzeHeadless"]

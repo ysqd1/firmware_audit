@@ -1,0 +1,99 @@
+"""cve_bin_tool_scan:沙箱容器内 cve-bin-tool,按产品版本特征匹配已知 CVE。
+
+CVE 数据库不烘镜像:宿主 process/.cve_cache volume 挂载进容器复用,
+首跑下载 NVD 数据(无 key 限速,可能数分钟),超时降级报错不崩。
+退出码约定(cve-bin-tool v3):0=无发现, 1=有 CVE 命中, ≥2=错误。
+"""
+from __future__ import annotations
+
+import json
+
+from .base import AgentTool, ToolResult
+from .cli_base import container_path, run_in_sandbox
+
+CVE_CACHE_MOUNT = "/home/sandbox/.cache/cvedb"
+
+
+class CveBinToolScanTool(AgentTool):
+    name = "cve_bin_tool_scan"
+    description = "对单个 ELF 或目录跑已知漏洞扫描(cve-bin-tool,按产品名+版本特征匹配 400+ 检查器)。首跑要下载 CVE 库,较慢。"
+    params_doc = 'Action Input: {"file_ref": "unitree/bin"}  —— file_ref 支持单文件或目录(相对 extracted 根)'
+
+    def _run(self, file_ref: str) -> ToolResult:
+        cpath = container_path(self.ctx, file_ref)
+        if cpath is None:
+            return ToolResult(ok=False, text="", error=f"非法路径: {file_ref}")
+        cache = self.ctx.process_dir / ".cve_cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        # 参数依据(cve-bin-tool 3.4 实测):
+        #   --disable-data-source PURL2CPE  首跑必崩(no such table: purl2cpe)
+        #   --disable-version-check  自检新版本要访问 PyPI,容器无外网时
+        #     version.py 里 None.splitlines() 直接崩(AttributeError)
+        #   --offline  跳过 NVD 增量更新(库由 .cve_cache 预热维护),
+        #     省掉每次扫描数分钟的 NVD 限速等待
+        rc, out, err = run_in_sandbox(
+            ["--quiet", "--format", "json", "--offline",
+             "--disable-version-check", "--disable-data-source", "PURL2CPE", cpath],
+            "cve-bin-tool", self.ctx, timeout=900,
+            extra_mounts=[(cache, CVE_CACHE_MOUNT)],
+        )
+        if rc >= 2 or rc == 124:
+            return ToolResult(
+                ok=False, text="",
+                error=f"cve-bin-tool 失败(码 {rc}): {(err or out).strip()[:300]}",
+            )
+        data = _extract_json(out)
+        if data is None:
+            return ToolResult(ok=False, text="", error=f"输出无 JSON: {out[:200]}")
+        hits = _flatten(data)
+        if not hits:
+            return ToolResult(ok=True, text=f"{file_ref}: 无已知 CVE 命中", data=[])
+        lines = [
+            f"{h.get('product', '?')} {h.get('version', '?')} → {h.get('cve_number', '?')}"
+            f" [{h.get('severity', '?')}]"
+            for h in hits
+        ]
+        return ToolResult(
+            ok=True,
+            text=f"{file_ref} 命中 {len(hits)} 条 CVE:\n" + "\n".join(lines),
+            data=hits,
+        )
+
+
+def _extract_json(out: str):
+    """cve-bin-tool --format json 把 JSON 打在 stdout,可能混有日志;找最长的 JSON 块。"""
+    best = None
+    buf = []
+    depth = 0
+    for line in out.splitlines():
+        s = line.strip()
+        if depth == 0 and not (s.startswith("{") or s.startswith("[")):
+            continue
+        buf.append(line)
+        depth += s.count("{") + s.count("[") - s.count("}") - s.count("]")
+        if depth <= 0:
+            try:
+                obj = json.loads("\n".join(buf))
+                text = "\n".join(buf)
+                if best is None or len(text) > len(best[1]):
+                    best = (obj, text)
+            except json.JSONDecodeError:
+                pass
+            buf, depth = [], 0
+    return best[0] if best else None
+
+
+def _flatten(data) -> list[dict]:
+    """cve-bin-tool 各版本 JSON 结构不一(list 或 {results: [...]});
+    统一压成扁平 hit 列表,字段宽容取。"""
+    if isinstance(data, list):
+        items = data
+    elif isinstance(data, dict):
+        items = data.get("results") or data.get("hits") or []
+    else:
+        return []
+    flat = []
+    for it in items:
+        if isinstance(it, dict):
+            flat.append(it)
+    return flat

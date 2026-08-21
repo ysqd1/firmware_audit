@@ -1,0 +1,6 @@
+# firmware_audit 运行时依赖。
+# 安装: pip install -r firmware_audit/requirements.txt
+# pyyaml: Step2 过滤用 profile 名单(缺失会退化为全放行,务必安装)
+# cryptography: Step4 解析证书/私钥/公钥等密码学材料
+pyyaml
+cryptography
