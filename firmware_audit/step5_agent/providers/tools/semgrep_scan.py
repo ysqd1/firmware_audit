@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from .base import AgentTool, ToolResult
-from .cli_base import EXTRACTED_MOUNT, container_path, run_in_sandbox
+from .cli_base import EXTRACTED_MOUNT, container_path, run_in_sandbox, sdk_exclude_flags
 
 # 本文件所在目录下的 rules/ 规则文件(宿主机绝对路径,挂载进容器)
 _RULES_HOST = Path(__file__).parent / "rules" / "semgrep_security.yaml"
@@ -42,7 +42,7 @@ class SemgrepScanTool(AgentTool):
 
         rc, out, err = run_in_sandbox(
             ["--config", f"{_RULES_MOUNT}/semgrep_security.yaml", "--json",
-             "--quiet", "--no-git-ignore", cpath],
+             "--quiet", "--no-git-ignore", *sdk_exclude_flags(), cpath],
             "semgrep", self.ctx, timeout=300,
             extra_mounts=[(_RULES_HOST.parent, _RULES_MOUNT)],
         )

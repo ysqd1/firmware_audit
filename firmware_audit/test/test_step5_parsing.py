@@ -109,6 +109,44 @@ def test_parse_r2_json() -> list[str]:
     # 空输出
     if _parse_r2_json("") is not None:
         fails.append("空输出应返回 None")
+    # 跨行缩进数组(2026-08-22 实发):分析 WARN 后 r2 axtj 输出多行数组,逐行找单行 `[` 会漏
+    pretty = ('WARN: Unsupported reloc type 1030 for aarch64\n'
+              '[\n  {\n    "from": "0x006409bc", "fcn_name": "main", "type": "CALL"\n  }\n]\n')
+    if _parse_r2_json(pretty) != [{"from": "0x006409bc", "fcn_name": "main", "type": "CALL"}]:
+        fails.append("跨行缩进数组应能解析")
+    # 字符串内含 [ ] 不干扰配平
+    tricky = '[\n  {"path": "a[b].c", "n": 1}\n]\n'
+    if _parse_r2_json(tricky) != [{"path": "a[b].c", "n": 1}]:
+        fails.append("字符串内方括号不应干扰配平")
+    return fails
+
+
+def test_xref_data_symbol_hint(ctx) -> list[str]:
+    """xref_query 对 r2 data 符号 Invalid argument 应给可操作指引(2026-08-22 实发)。"""
+    import firmware_audit.step5_agent.providers.tools.xref_query as xq
+    fails: list[str] = []
+    captured: dict = {}
+
+    def fake_run_in_sandbox(args, entrypoint, ctx, timeout=180, extra_mounts=None):
+        captured["args"] = list(args)
+        # 复现实测: r2 对 data 符号报 Invalid argument,stdout 无 JSON
+        return 0, "INFO: Analyze all...\nERROR: Invalid argument\n", "WARN: Relocs..."
+
+    orig = xq.run_in_sandbox
+    xq.run_in_sandbox = fake_run_in_sandbox
+    try:
+        r = xq.XrefQueryTool(ctx).execute(file_ref="bin/app", symbol="sym.video_device_path")
+        if r.ok:
+            fails.append("data 符号查询应失败")
+        elif "数据符号" not in (r.error or ""):
+            fails.append(f"错误应含 data 符号指引: {r.error}")
+        elif "strings_query" not in (r.error or ""):
+            fails.append(f"错误应指引替代工具: {r.error}")
+        # 新参数 -e bin.relocs.apply=true 应出现在命令里
+        if "bin.relocs.apply=true" not in " ".join(captured.get("args", [])):
+            fails.append(f"r2 命令应含 relocs.apply 参数: {captured.get('args')}")
+    finally:
+        xq.run_in_sandbox = orig
     return fails
 
 
@@ -445,6 +483,90 @@ def test_run_in_sandbox_absolute_mounts() -> list[str]:
     return fails
 
 
+# ---------- E. 路线一: 过滤概览注入 + semgrep SDK 排除 ----------
+
+def test_build_filtered_overview() -> list[str]:
+    """build_filtered_overview 从 fileinfo.json 产紧凑概览;缺失时回退。"""
+    import tempfile
+    from firmware_audit.step5_agent.data.prompts import build_filtered_overview
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # 缺失 → 回退提示,不抛
+        if "缺失" not in build_filtered_overview(root):
+            fails.append("fileinfo.json 缺失应回退提示")
+        # 正常清单
+        data = [
+            {"rel_path": "unitree/bin/idlc", "type": "elf_exec"},
+            {"rel_path": "unitree/module/bashrunner/run.sh", "type": "script"},
+            {"rel_path": "etc/passwd", "type": "config"},
+            {"rel_path": "etc/dhcpcd.conf", "type": "config"},
+        ]
+        (root / "fileinfo.json").write_text(json.dumps(data), encoding="utf-8")
+        ov = build_filtered_overview(root)
+        if "过滤后目录概览" not in ov:
+            fails.append("缺标题行")
+        if "unitree/" not in ov or "etc/" not in ov:
+            fails.append(f"缺顶层目录: {ov}")
+        if "elf_exec=1" not in ov or "config=2" not in ov:
+            fails.append(f"缺 type 分布: {ov}")
+        if "优先级:" not in ov:
+            fails.append("缺优先级行")
+        # 概览必须紧凑(净给全量之外的几句话),不应把每条 rel_path 单独铺开
+        if "idlc" in ov or "passwd" in ov:
+            fails.append("概览不应包含具体文件名(紧凑原则)")
+    return fails
+
+
+def test_recon_brief_appends_overview() -> list[str]:
+    """build_recon_brief 末尾追加过滤概览(analysis 索引仍保留)。"""
+    import tempfile
+    from firmware_audit.step5_agent.data.prompts import build_recon_brief
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        a = root / "analysis" / "unitree" / "bin"
+        a.mkdir(parents=True)
+        (a / "idlc.functions.json").write_text("[]", encoding="utf-8")
+        (root / "fileinfo.json").write_text(
+            json.dumps([{"rel_path": "unitree/bin/idlc", "type": "elf_exec"}]),
+            encoding="utf-8")
+        brief = build_recon_brief(root)
+        if "process/analysis/ 下共 1 个二进制" not in brief:
+            fails.append(f"analysis 索引缺失: {brief[:80]}")
+        if "过滤后目录概览" not in brief:
+            fails.append("应追加过滤概览")
+    return fails
+
+
+def test_semgrep_sdk_exclude(ctx) -> list[str]:
+    """semgrep_scan 目录扫描注入 SDK 排除参数(--exclude 容器绝对路径)。"""
+    import firmware_audit.step5_agent.providers.tools.semgrep_scan as ss
+    from firmware_audit.step5_agent.providers.tools.cli_base import EXTRACTED_MOUNT
+    fails: list[str] = []
+    captured: dict = {}
+
+    def fake_run_in_sandbox(args, entrypoint, ctx, timeout=300, extra_mounts=None):
+        captured["args"] = list(args)
+        return 0, '{"results": []}', ""
+
+    orig = ss.run_in_sandbox
+    ss.run_in_sandbox = fake_run_in_sandbox
+    try:
+        r = ss.SemgrepScanTool(ctx).execute(path=".")
+        if not r.ok:
+            fails.append(f"semgrep path=. 执行失败(应 mock 无障): {r.error}")
+        args = captured.get("args", [])
+        # sdk_exclude_flags 产出 "--exclude" + 值 两段(空格形态);断言首条 SDK 命中
+        if "--exclude" not in args:
+            fails.append("无任何 --exclude")
+        elif f"{EXTRACTED_MOUNT}/usr/local/lib" not in args:
+            fails.append(f"缺 SDK 排除目标 {EXTRACTED_MOUNT}/usr/local/lib; args={args}")
+    finally:
+        ss.run_in_sandbox = orig
+    return fails
+
+
 def test_main() -> int:
     """独立运行入口(pytest 下由 conftest 钩子接管断言)。"""
     import tempfile
@@ -465,6 +587,10 @@ def test_main() -> int:
             ("malformed_inputs", lambda: test_malformed_inputs(c)),
             ("container_path_security", lambda: test_container_path_security(c)),
             ("run_in_sandbox_absolute_mounts", test_run_in_sandbox_absolute_mounts),
+            ("build_filtered_overview", test_build_filtered_overview),
+            ("recon_brief_appends_overview", test_recon_brief_appends_overview),
+            ("semgrep_sdk_exclude", lambda: test_semgrep_sdk_exclude(c)),
+            ("xref_data_symbol_hint", lambda: test_xref_data_symbol_hint(c)),
         ]
         for name, fn in cases:
             fl = fn()

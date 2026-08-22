@@ -72,6 +72,22 @@ def test_parse_reply() -> list[str]:
         ("Final Answer: early\n然后改主意\nAction: echo\nAction Input: {}",
          ("action", "echo|{}")),
         ("我想想但没有输出任何块", ("fail", None)),
+        # XML 角括号漂移(2026-08-20 verification 实发):<Action>x</Action> 应归一化
+        ("<Thought>查</Thought>\n<Action>echo</Action>\n<Action Input>{\"a\": 1}</Action Input>",
+         ("action", 'echo|{"a": 1}')),
+        ("<Final Answer>{\"k\": 1}</Final Answer>", ("final", '{"k": 1}')),
+        # 混合:角括号 Action + 文本 Final,取后者
+        ("<Action>echo</Action>\n<Action Input>{}</Action Input>\nFinal Answer: done",
+         ("final", "done")),
+        # 无空格变体(2026-08-22 analysis step1 实发):<ActionInput> 须归一化
+        ("<Thought>t</Thought>\n<Action>read_file</Action>\n<ActionInput>{\"path\": \"x\"}</ActionInput>",
+         ("action", 'read_file|{"path": "x"}')),
+        # 闭标签不配对(2026-08-22 analysis step4 实发):<Action Input>...</Action>
+        ("<Action>read_file</Action>\n\n<Action Input>{\"path\": \"agent/a.json\"}</Action>",
+         ("action", 'read_file|{"path": "agent/a.json"}')),
+        # 大小写变体
+        ("<action>echo</action>\n<action input>{\"n\": 1}</action input>",
+         ("action", 'echo|{"n": 1}')),
     ]
     for reply, (want_kind, want_payload) in cases:
         kind, payload = parse_reply(reply)
@@ -94,6 +110,20 @@ def test_parse_action_input() -> list[str]:
         fails.append("裸字符串容错失败")
     if parse_action_input("[1,2]") != {"_raw": "[1,2]"}:
         fails.append("非 dict JSON 应包 _raw")
+    # 尾随散文宽容(2026-08-20 实发):合法 JSON 后跟思考文字 → 救回首段 JSON,
+    # 而非包成 {"value": 整串}(无工具接受 value,会 TypeError 空转)
+    trailing = ('{"path": "analysis/x.functions.json", "offset": 0, "limit": 200}\n\n'
+                "等等,read_file 的 path 相对 process/,前序工件路径格式是 process/analysis/...")
+    if parse_action_input(trailing) != {"path": "analysis/x.functions.json",
+                                        "offset": 0, "limit": 200}:
+        fails.append(f"尾随散文应救回首段 JSON: {parse_action_input(trailing)}")
+    # 字符串内花括号不干扰配平
+    tricky = '{"pattern": "re:{.+}", "n": 1} 然后是散文 { 还有花括号'
+    if parse_action_input(tricky) != {"pattern": "re:{.+}", "n": 1}:
+        fails.append(f"字符串内花括号配平失败: {parse_action_input(tricky)}")
+    # JSON 本身残缺(无法配平)→ 仍走 value 兜底
+    if parse_action_input('{"path": "x" 后面没有闭合') != {"value": '{"path": "x" 后面没有闭合'}:
+        fails.append("残缺 JSON 应回退 value 兜底")
     return fails
 
 
@@ -137,11 +167,17 @@ def test_parse_fail_recovery() -> list[str]:
 
 
 def test_persistent_fail_terminates() -> list[str]:
-    fails: list[str] = []
-    llm = ScriptedLLM(["nope", "still nope", "never", "ever"])
+    fails: list[str]
+    # 连续协议失败达 MAX_PARSE_FAILS(现为 4)次 → 强制收尾仍失败 → finished=False。
+    # 回复条数 = MAX_PARSE_FAILS + 1(第 4 次失败触发强制 Final 要求,
+    # 第 5 次仍不合规 → 终止);2026-08-22 放宽 2→4 后同步适配。
+    from firmware_audit.step5_agent.engine.protocol import MAX_PARSE_FAILS
+    llm = ScriptedLLM(["nope"] * (MAX_PARSE_FAILS + 1))
     r = run_react_agent(llm, _tools(), "sys", "init", max_iters=10)
     if r.finished:
-        fails.append("连续协议失败应终止且 finished=False")
+        fails = ["连续协议失败应终止且 finished=False"]
+    else:
+        fails = []
     return fails
 
 

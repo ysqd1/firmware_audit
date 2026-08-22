@@ -48,6 +48,11 @@ NO_TOOL_REJECT = ("Error: [系统拒绝] 你尚未调用任何工具就输出 Fi
                   "结论必须有 Observation 支撑:请先用至少一个工具查证"
                   "(如 read_file 读上游工件/目标产物),再输出 Final Answer。")
 
+# 每轮进度提示(user 消息,每轮 LLM 调用前注入):让模型每次都知道"现在第几轮/总几轮"。
+# 总数用函数实参 max_iters(由 AgentConfig 注入,不写死),模型可据此规划剩余取证深度。
+ROUND_PROGRESS = ("[进度:{step}/{total}] 当前第 {step} 轮,共 {total} 轮,剩余 {left} 轮。"
+                  "请控制取证深度,剩余预算优先投入高价值疑点(critical/high/网络入口)。")
+
 # 最后一轮提示(r4,2026-08-19):第 max_iters 轮 LLM 调用前注入,给模型自主总结的机会;
 # 若仍发 Action,由 FORCE_FINAL_PROMPT 兜底强制总结
 LAST_ROUND_NOTICE = ("[系统提示] 本轮是最后一次循环机会(共 {n} 轮,已到上限)。"
@@ -103,6 +108,11 @@ def run_react_agent(
     for step in range(1, max_iters + 1):
         result.steps = step
         cm.maybe_compact(llm)  # 每轮开跑前检查压缩
+        # 每轮进度注入:以 system 角色注入(不进 recent,不破坏 user/assistant 交替),
+        # 让 LLM 每次调用都明确"当前第几轮/总几轮"(max_iters 实参,不写死)。
+        # 与 LAST_ROUND_NOTICE(最后一轮)、FORCE_FINAL_PROMPT(收尾)构成三层预算提示。
+        cm.round_note = ROUND_PROGRESS.format(
+            step=step, total=max_iters, left=max_iters - step)
         # 最后一轮(r4):LLM 调用前注入总结要求——模型有机会自主收尾;
         # 若仍发 Action,循环结束后由 _force_final_round 强制总结兜底
         if step == max_iters:
@@ -190,7 +200,10 @@ def _protocol_fail_hint(parse_fails: int, payload: str) -> tuple[int, str]:
         hint = ("连续解析失败。不要再输出 Action。"
                 "立即输出 Final Answer(以已有信息总结)")
     else:
-        hint = f"格式错误: {payload}。严格用协议格式:Thought/Action/Action Input"
+        hint = (f"格式错误: {payload}。严格用协议格式,每轮只一个调用且分三步:"
+                "Thought:<推理> 换行 Action:<工具名> 换行 Action Input:<JSON>。"
+                "注意: 工具名与参数 JSON 必须分别在 Action:/Action Input: 两行,"
+                "不能把 JSON 直接放 Action 后,也不能用 <Action> 等标签包裹。")
     return parse_fails, hint
 
 

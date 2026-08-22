@@ -36,6 +36,11 @@ TIMEOUT = 180        # 秒:非流式长回复 + 网络抖动余量
 MAX_RETRIES = 3      # 首次失败后的最大重试次数(共 1+3=4 次尝试)
 RETRY_INTERVALS = (10, 15, 20)  # 每次重试前的等待秒数,恒在 10-20s 区间
 NON_RETRYABLE_HTTP = (400, 401, 403, 404)  # 请求/配置类错误,重试无意义
+# 输出预算(2026-08-22 实测教训:8192 会截断 Final Answer):
+# 推理模型的思考(reasoning_content)与正文共享 max_tokens,13 条 findings 的
+# JSON(约 2.5k token)+思考很容易超 8192 → 正文腰斩 → JSON 解析失败降级 .md。
+# 默认 16384,环境变量 LLM_MAX_TOKENS 可覆盖(如 API 上限更低时调回)。
+DEFAULT_MAX_TOKENS = 16_384
 
 # .env 搜索位置重定向(测试用;None = 默认:firmware_audit 包根 + CWD 上级链)
 _ENV_ANCHORS: list[Path] | None = None
@@ -108,12 +113,18 @@ class LLMClient:
         return bool(self.api_key)
 
     def chat(self, messages: list[dict], temperature: float = 0.2,
-             max_tokens: int = 8192) -> tuple[str, dict]:
+             max_tokens: int | None = None) -> tuple[str, dict]:
         """返回 (content, usage)。usage 为本次用量;累计量见 total_usage。
 
+        max_tokens 缺省取环境变量 LLM_MAX_TOKENS 或 DEFAULT_MAX_TOKENS(16384)。
         重试语义:可重试错误按 RETRY_INTERVALS 间隔自动重试至多 MAX_RETRIES 次
         (每次打点日志);不可重试 HTTP 状态码立即抛;全部失败抛 LLMError。
         """
+        if max_tokens is None:
+            try:
+                max_tokens = int(os.environ.get("LLM_MAX_TOKENS") or DEFAULT_MAX_TOKENS)
+            except ValueError:
+                max_tokens = DEFAULT_MAX_TOKENS
         if not self.available:
             raise LLMError(
                 "无 API key(环境变量 FIRMWARE_AUDIT_LLM_API_KEY / "

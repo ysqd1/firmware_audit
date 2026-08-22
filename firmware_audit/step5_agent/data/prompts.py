@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .artifacts import artifact_summary
@@ -61,8 +62,11 @@ ANALYSIS_DIR_DOC = """工作区锚点:
 - process/analysis/<rel>/<name>.strings.json  字符串 {strings: [{address, value, refs}]}
 - process/analysis/<rel>/<name>.functions.json 函数表 [{name, address, callers, callees}]
 - 工具参数里的 file 用相对路径(不含后缀),如 unitree/bin/idlc
+- **原始脚本/配置源码可读**: process/extracted/<相对路径> 下是固件原文件(.py/.sh/.conf 等),
+  用 read_file 以 "extracted/<相对路径>" 读取,如 {"path": "extracted/unitree/module/net_switcher/net_switcher.py"};
+  semgrep/gitleaks 命中的 py 文件都这样复核源码(不要传绝对路径,会被路径越界拒绝)
 - process/agent/ 下跨 agent 工件**仅有**三个(按链传递): attack_surface.json → findings.json → verified_findings.json
-  没有其他单工具原始工件(gitleaks_scan.json/semgrep_scan.json 等都不存在);扫描结果只体现在上述工件的 findings 字段里
+  没有其他单工具原始工件(secret_scan.json/semgrep_scan.json 等都不存在);扫描结果只体现在上述工件的 findings 字段里
 
 函数命名规则(工具衔接,重要——用错名必失败):
 - find_decompiled_function 只认 Ghidra 命名: 真实符号名(如 main/CallSystem)或 FUN_<8位十六进制地址>
@@ -85,7 +89,11 @@ RECON_SYSTEM = f"""你是固件安全审计的侦察 Agent(recon)。使命:对�
 建议流程(按优先级推进,每类抓大放小):
 1. 读工件索引(任务简报已给),按上述优先级圈出重点目标清单
 2. 重点二进制: checksec 看保护属性(NX 关/无 PIE/无 Canary 记为弱保护);cve_bin_tool_scan 识别组件与已知 CVE
-3. 高价值目标: strings_query 按 password/private_key/url 模式扫硬编码疑点;imports_query 查危险导入(system/execve/popen/strcpy 族)及其 call_sites 热点
+3. 高价值目标(直接消费 Step4 已提取的 Ghidra 边车,不要重新反编译):
+   - imports_query 查危险导入(system/execve/popen/strcpy 族)及其 call_sites 热点——它读 .imports.json,快且带调用点
+   - strings_query 按 password/private_key/url 模式扫硬编码疑点——它读 .strings.json,快且带引用函数
+   - 定位某个具体函数逻辑时,用 find_decompiled_function 按目标函数名取反编译片段,而非 read_file 整读 decompiled.c
+   - read_file 只用于读边车清单(如 functions.json 分页)看有哪些函数/调用,不要用 read_file 搬运整段反编译 C 到上下文
 4. 脚本目录: semgrep_scan 扫命令注入/SQL 注入/反序列化模式;gitleaks_scan 扫硬编码密钥——两者比 strings 更语义化,与 strings_query 互补
 5. 不透明 .bin: binwalk_rescan 看内部是否藏嵌套容器(squashfs/cpio/gzip);只识别签名,不解包
 6. 汇总: 弱保护二进制、危险函数热点、硬编码疑点、带 CVE 组件分类写入 findings + components
@@ -93,6 +101,7 @@ RECON_SYSTEM = f"""你是固件安全审计的侦察 Agent(recon)。使命:对�
 侦察边界(重要):
 - 同一文件最多 1-2 轮工具调用;可疑点只负责"列出来",深挖留给 analysis
 - strings/semgrep 命中不等于漏洞: 只记录"疑点+原始串",不下"可利用"结论
+- Ghidra 边车(imports/strings/functions)是"筛子"→ 本阶段可用;decompiled.c 是"全文" → 只按需取片段,别整段读入
 
 components 字段规则:
 - 只收录 cve_bin_tool_scan/strings Observation 中真实出现的组件名与版本串;版本识别不出就留空,禁止按文件名猜版本
@@ -138,6 +147,13 @@ Final Answer 的 JSON 结构:
 {AGENT_DISCIPLINE}"""
 
 VERIFY_SYSTEM = f"""你是固件安全审计的复核 Agent(verification)。使命:对 analysis 阶段(findings.json)的候选逐条复核,过滤误报,输出最终结论。你是最后一道质量闸门:放进报告的每一条都要经得起人工复验。
+
+输出纪律(先于一切,每轮回复的第一行必须是协议块):
+- 每轮回复**必须**以 "Thought: " 或 "Final Answer: " 开头——禁止以计划/说明散文开头,
+  禁止把工具调用包进 <> 标签或 ``` 围栏;开场第一轮就该是
+  "Thought: 先读 findings.json
+  Action: read_file
+  Action Input: {{"path": "agent/findings.json", "offset": 0, "limit": 200}}"
 
 {ANALYSIS_DIR_DOC}
 
@@ -188,12 +204,65 @@ def build_system_prompt(base_prompt: str, tools: dict, max_iters: int = 20) -> s
 
 # ---- 任务简报(init user 消息) ----
 
+# 文件 type → 审计价值排序(概览展示顺序用;值越小越优先)
+_OVERVIEW_TYPE_RANK = {"elf_exec": 0, "script": 1, "config": 2,
+                       "text": 3, "elf_lib": 4, "unknown": 5}
+
+
+def build_filtered_overview(process_dir: Path, max_dirs: int = 15) -> str:
+    """基于 Step2 过滤清单(process/fileinfo.json)的紧凑目录概览。
+
+    只给"顶层目录 + type 分布 + 优先级",不 dump 全量行(2047)。
+    fileinfo.json 本身已被 Step2 剔除 SDK/系统库,故概览天然干净,
+    LLM 据此知道审计目标集,不必下钻 extracted 撞 SDK 噪音。
+    缺失/解析失败/空清单时回退到一句提示(早期工作区或测试)。
+    """
+    fi = process_dir / "fileinfo.json"
+    if not fi.is_file():
+        return ("提示: process/fileinfo.json 缺失(未跑 Step2 或早期工作区)。"
+                "需要目录概览请用 read_file 列 extracted;"
+                "注意 usr/local/lib、usr/lib 等 SDK/系统库目录低价值、优先跳过。")
+    try:
+        data = json.loads(fi.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "提示: fileinfo.json 解析失败;按 extracted 直接看,SDK/系统库目录低价值。"
+    if not isinstance(data, list):
+        return "提示: fileinfo.json 结构异常;按 extracted 直接看,SDK/系统库目录低价值。"
+
+    dir_by_type: dict[str, dict[str, int]] = {}
+    for f in data:
+        rel = (f.get("rel_path") or "").strip()
+        if not rel:
+            continue
+        top = rel.split("/", 1)[0]
+        t = f.get("type") or "unknown"
+        d = dir_by_type.setdefault(top, {})
+        d[t] = d.get(t, 0) + 1
+
+    def _rank(kv) -> tuple:
+        best = min((_OVERVIEW_TYPE_RANK.get(t, 9) for t in kv[1]), default=9)
+        return (best, -sum(kv[1].values()))
+
+    lines = [f"过滤后目录概览(Step2 保留 {len(data)} 文件;SDK/系统库已剔除):"]
+    for i, (top, by_type) in enumerate(sorted(dir_by_type.items(), key=_rank)):
+        if i >= max_dirs:
+            lines.append(f"…(共 {len(dir_by_type)} 个顶层目录,余下省略,用 read_file 按相对路径下钻)")
+            break
+        types = ", ".join(
+            f"{t}={n}" for t, n in sorted(by_type.items(), key=lambda kv: _OVERVIEW_TYPE_RANK.get(kv[0], 9)))
+        lines.append(f"- {top}/  {types}")
+    rank_label = " > ".join(_OVERVIEW_TYPE_RANK)  # elf_exec > script > ...
+    lines.append(f"优先级: {rank_label}。下钻用 read_file 按相对路径;无需下钻被剔除的 SDK 目录。")
+    return "\n".join(lines)
+
+
 def build_recon_brief(process_dir: Path, max_entries: int = 120) -> str:
     """Step4 工件索引:按二进制归组列出可用 sidecar,超量截断。
     供 recon 划重点,不塞全部内容。"""
     analysis = process_dir / "analysis"
     if not analysis.is_dir():
-        return "任务:侦察固件攻击面。\n(process/analysis/ 不存在——先确认 Step1-4 已跑完。)"
+        return (f"任务:侦察固件攻击面。\n(process/analysis/ 不存在——先确认 Step1-4 已跑完。)\n\n"
+                + build_filtered_overview(process_dir))
 
     groups: dict[str, list[str]] = {}
     for p in analysis.rglob("*.functions.json"):
@@ -217,7 +286,7 @@ def build_recon_brief(process_dir: Path, max_entries: int = 120) -> str:
         kept, dropped = lines[: max_entries + 1], len(lines) - max_entries - 1
         lines = kept + [f"...(还有 {dropped} 个省略,可用工具按路径查询)"]
     lines.append("优先:自研程序/网络服务;SDK 库(lib/python)靠后。")
-    return "\n".join(lines)
+    return "\n".join(lines) + "\n\n" + build_filtered_overview(process_dir)
 
 
 def build_downstream_brief(agent_name: str, mission: str, upstream_path: Path) -> str:

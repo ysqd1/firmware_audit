@@ -196,10 +196,15 @@ def test_observation_prefix_and_alternation_in_loop() -> list[str]:
         for i, m in enumerate(cm.recent):
             if m["role"] == "user" and not m["content"].startswith("Observation: "):
                 fails.append(f"recent[{i}] user 消息缺 Observation 前缀: {m['content'][:60]}")
-        # 完整消息链给 LLM 的形态:system+init+交替 recent
+        # 完整消息链给 LLM 的形态:system+init+[round_note 进度 system]+交替 recent
         full = cm.build_messages()
-        if len(full) != 2 + len(cm.recent):
-            fails.append("build_messages 应为 system+init+recent 全量")
+        if len(full) != 2 + (1 if cm.round_note else 0) + len(cm.recent):
+            fails.append("build_messages 应为 system+init+[进度]+recent 全量")
+        # 每轮进度提示:非空且含总轮数(总数由 max_iters 实参注入,不硬编码)
+        if not cm.round_note:
+            fails.append("round_note 应为每轮注入的非空进度提示")
+        elif "共 5 轮" not in cm.round_note:
+            fails.append(f"round_note 应含总轮数(max_iters), got: {cm.round_note[:60]}")
         # 第 2 次 LLM 调用能看到第 1 次 Observation(echo 结果在上下文)
         if not any("echo:" in m["content"] for m in llm.calls[1]):
             fails.append("工具结果未进入第 2 轮上下文")

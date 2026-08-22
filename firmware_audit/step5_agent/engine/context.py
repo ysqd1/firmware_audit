@@ -38,6 +38,8 @@ class ContextManager:
         self.init = {"role": "user", "content": init_user}
         self.summaries: list[str] = []   # 概括区(可能压缩多次)
         self.recent: list[dict] = []     # 保留区
+        self.round_note: str = ""        # 每轮动态进度提示(以 system 角色注入,不进 recent,
+                                         # 避免破坏 user/assistant 交替契约;空则省略)
         self.max_est_tokens = max_est_tokens
         self.trigger_ratio = trigger_ratio
         self.compactions = 0
@@ -46,6 +48,8 @@ class ContextManager:
 
     def build_messages(self) -> list[dict]:
         msgs = [self.system, self.init]
+        if self.round_note:
+            msgs.append({"role": "system", "content": self.round_note})
         if self.summaries:
             msgs.append({"role": "user",
                          "content": "[前情摘要(早期轮次已压缩)]\n" + "\n---\n".join(self.summaries)})
