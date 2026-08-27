@@ -82,9 +82,9 @@ def step5_agent(ctx):
 
 | Agent | 职责 | 工具 | 输入 | 输出工件 |
 |-------|------|------|------|---------|
-| **recon** | 广度侦察:铺开攻击面 | checksec, sca_scan(可选), strings_query, imports_query, read_file, semgrep_scan, secret_scan, binwalk_rescan | Step4 工件清单 | `attack_surface.json`(组件+CVE、危险函数热点、硬编码疑点、弱保护二进制) |
-| **analysis** | 深度分析:对疑点逐个取证 | decompile_func, xref_query, strings_query, imports_query, read_file, cve_lookup, checksec, semgrep_scan, secret_scan, web_search | attack_surface.json | `findings.json`(候选漏洞,含证据链:路径+地址+代码片段+严重度) |
-| **verification** | 复核过滤误报,出报告 | decompile_func, xref_query, cve_lookup, checksec, read_file, strings_query, imports_query, sandbox_verify | findings.json | `verified_findings.json` + `report.md` |
+| **recon** | 广度侦察:铺开攻击面 | checksec, cve_bin_tool_scan(可选), strings_query, imports_query, read_file, semgrep_scan, gitleaks_scan, binwalk_rescan | Step4 工件清单 | `attack_surface.json`(组件+CVE、危险函数热点、硬编码疑点、弱保护二进制) |
+| **analysis** | 深度分析:对疑点逐个取证 | find_decompiled_function, xref_query, strings_query, imports_query, read_file, cve_lookup, checksec, semgrep_scan, gitleaks_scan, web_search | attack_surface.json | `findings.json`(候选漏洞,含证据链:路径+地址+代码片段+严重度) |
+| **verification** | 复核过滤误报,出报告 | find_decompiled_function, xref_query, cve_lookup, checksec, read_file, strings_query, imports_query, sandbox_verify | findings.json | `verified_findings.json` + `report.md` |
 
 ### ReAct 循环约定
 
@@ -141,11 +141,11 @@ step5_agent/
       __init__.py          ← make_tools 装配(exclude 参数 + STEP5_EXCLUDE_TOOLS 环境变量)
       base.py              ← AgentTool 基类 + ToolResult(含 raw 原文)
       cli_base.py          ← 沙箱容器挂载与路径换算
-      checksec.py / sca_scan.py / xref_query.py      ← CLI 类
-      strings_query.py / imports_query.py / decompile_func.py / read_file.py  ← 读盘类
+      checksec.py / cve_bin_tool_scan.py / xref_query.py      ← CLI 类
+      strings_query.py / imports_query.py / find_decompiled_function.py / read_file.py  ← 读盘类
       cve_lookup.py        ← API 类(NVD)
       semgrep_scan.py      ← CLI 类(semgrep 本地规则,2026-08-18)
-      secret_scan.py       ← CLI 类(gitleaks,2026-08-18)
+      gitleaks_scan.py     ← CLI 类(gitleaks,2026-08-18)
       sandbox_verify.py    ← CLI 类(verification 沙箱复核,2026-08-18)
       binwalk_rescan.py    ← CLI 类(binwalk 签名复扫+专用镜像回退,2026-08-18)
       web_search.py        ← API 类(DDG 免 key,2026-08-18)
@@ -178,11 +178,11 @@ class AgentTool(ABC):
 
 | 类型 | 工具 | 数据来源 | `ok` 判据 | `text` | `data` |
 |------|------|---------|----------|--------|--------|
-| CLI 工具 | checksec, sca_scan, xref_query, semgrep_scan | `subprocess` 调 Docker 沙箱 | 退出码 0 | stdout 截断 | JSON 解析(有 `--json` 就 `json.loads`) |
-| 读盘工具 | strings_query, imports_query, decompile_func | Step4 产出的 `analysis/*.json` / `*.c` | 文件存在且读成功 | 文件内容截断 | None(文本即内容) |
+| CLI 工具 | checksec, cve_bin_tool_scan, xref_query, semgrep_scan | `subprocess` 调 Docker 沙箱 | 退出码 0 | stdout 截断 | JSON 解析(有 `--json` 就 `json.loads`) |
+| 读盘工具 | strings_query, imports_query, find_decompiled_function | Step4 产出的 `analysis/*.json` / `*.c` | 文件存在且读成功 | 文件内容截断 | None(文本即内容) |
 | API 工具 | cve_lookup | `urllib` 调 NVD REST API | HTTP 200 | 格式化摘要 | 原始 JSON |
 
-**关键:decompile_func 不重新调 Ghidra。** Step4 已经把反编译 C 代码落到 `analysis/<rel>.c`,decompile_func 的 `execute(func_name, file_path)` 只需要:
+**关键:find_decompiled_function 不重新调 Ghidra。** Step4 已经把反编译 C 代码落到 `analysis/<rel>.c`,find_decompiled_function 的 `execute(file_ref, func_name)` 只需要:
 1. 根据 `file_path` 定位 `analysis/<rel>.c`
 2. 用行号范围或函数签名正则切出目标函数片段
 3. 填进 `ToolResult(text=func_body, ok=True)` —— 和 checksec 填袋子的方式一模一样
@@ -193,24 +193,35 @@ ReAct 循环不感知数据来源。它对 LLM 说的永远是:"给你一个 Obs
 
 | 层 | 工具 | 运行位置 | 镜像 |
 |----|------|---------|------|
-| 读盘层 | strings_query, imports_query, decompile_func | 宿主机 Python(读 `analysis/*.json` / `*.c`) | 无 |
+| 读盘层 | strings_query, imports_query, find_decompiled_function | 宿主机 Python(读 `analysis/*.json` / `*.c`) | 无 |
 | API 层 | cve_lookup, web_search | 宿主机 Python(`urllib`) | 无 |
-| CLI 层 | checksec, sca_scan, xref_query, semgrep_scan, secret_scan, sandbox_verify | `firm_audit/sandbox` 容器 | sandbox(已装 checksec/cve-bin-tool/r2/semgrep 1.100.0/gitleaks 8.18.2) |
+| CLI 层 | checksec, cve_bin_tool_scan, xref_query, semgrep_scan, gitleaks_scan, sandbox_verify | `firm_audit/sandbox` 容器 | sandbox(已装 checksec/cve-bin-tool/r2/semgrep 1.100.0/gitleaks 8.18.2) |
 | CLI 层 | binwalk_rescan | `binwalk` 容器(extracted 只读挂载扫签名) | binwalk(专用,保留不动) |
 
-沙箱安全基线(2026-08-18 落实):`run_docker` 支持挂载第三段 `ro/rw` 与 `network` 参数;Step5 全部 Agent 工具调用统一 **extracted `:ro` 挂载 + `--network none` 断网**(run_in_sandbox/binwalk_rescan 已接线;extra_mounts 保持 rw——sca_scan CVE 缓存卷需写锁)。Step3/Step4 调用不受影响(默认 rw + 默认网络)。
+沙箱安全基线(2026-08-18 落实):`run_docker` 支持挂载第三段 `ro/rw` 与 `network` 参数;Step5 全部 Agent 工具调用统一 **extracted `:ro` 挂载 + `--network none` 断网**(run_in_sandbox/binwalk_rescan 已接线;extra_mounts 保持 rw——cve_bin_tool_scan 的 CVE 缓存卷需写锁)。Step3/Step4 调用不受影响(默认 rw + 默认网络)。
 
-### cve-bin-tool 3.4 参数坑(2026-08-17 实测)
+### cve-bin-tool 3.4 参数坑(2026-08-17 实测,08-22 预热实测补全)
 
-sca_scan 与 CVE 库预热都必须带齐三个禁用参数,缺一即崩:
+cve_bin_tool_scan 与 CVE 库预热都必须带齐三个禁用参数,缺一即崩:
 
 - `--disable-data-source PURL2CPE`:建库时 `populate_purl2cpe` 报 `no such table: purl2cpe`(3.4 bug)
 - `--disable-version-check`:自检新版本访问 PyPI,无外网时 `version.py` 里 `None.splitlines()` 直接 AttributeError
-- `--offline`(仅 sca_scan):跳过 NVD 增量更新,省每次扫描数分钟的限速等待;库由 `.cve_cache` 卷预热维护
+- `--offline`(仅扫描):跳过 NVD 增量更新,省每次扫描数分钟的限速等待;库由 `.cve_cache` 卷预热维护
 
-预热命令:`cve-bin-tool --disable-version-check --disable-data-source PURL2CPE -u now`
-(不带这三个参数的预热必失败:首跑只下 1 个 NVD 分片就崩,cve.db 不会生成,
-后续 --offline 扫描报 "Database does not exist" 码 40)。NVD 无 key 全量下载约 15-40 分钟。
+预热命令 + 三个已踩实测坑(2026-08-22,缺一即失败,详见 tools_summary.md):
+
+```powershell
+docker run --rm --entrypoint cve-bin-tool `
+  -v "target\<N>\process\.cve_cache:/home/sandbox/.cache" `
+  firm_audit/sandbox:latest -l info `
+  --disable-version-check --disable-data-source PURL2CPE -u now /tmp
+```
+
+1. **必须带目录参数(`/tmp`)** — 仅 `-u now` 缺目录会报 `InsufficientArgs`(码 24),更新完不建库即退出
+2. **挂到 `$HOME/.cache`(父目录),不是 `~/.cache/cvedb`** — 3.4 的 `CVEDB.CACHEDIR = ~/.cache/cve-bin-tool`,挂 cvedb(旧约定)会让库永远找不到(码 40 `Database does not exist`);cve_bin_tool_scan 的 `CVE_CACHE_MOUNT` 已是 `/home/sandbox/.cache`
+3. **别把 `cve-bin-tool` 目录本身当挂载根** — `-u now` 首步 `clear_cached_data` 要 `rmtree` 挂载根,报 `Device or resource busy`
+
+> 工具参数:扫描用 `--format json -o -`(3.4 默认把 JSON 写文件而非 stdout,`-o -` 让 JSON 到 stdout 供解析);`-o -` 下 0 命中时 stdout 为空,工具视作"无 CVE"而非错误。
 
 sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁镜像(四工具 + Ghidra 实跑全检 ALL-PASS,见 verify_agent_tools.sh),旧 9.53GB 层与 `:flat` 中间 tag 已清理,工具层统一引用 `latest`。ENTRYPOINT 仍是 `analyzeHeadless`,调工具必须 `run_docker(..., entrypoint="checksec")` 覆盖。**binwalk 刻意不进 sandbox**(2026-08-18 实测:pip 版是停更的 2.1.0,py3.11 import 即崩;v3 Rust 二进制需 GLIBC 2.39 而 bullseye 只有 2.31),binwalk_rescan 走专用镜像。另外:全量重建主 Dockerfile 会重编译 radare2 且其构建要 git clone vector35-arch-*(GitHub 被掐断 Error 128)——增量改动用 `Dockerfile.binwalk` 式派生层(见文件头注释)。
 
@@ -219,20 +230,22 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 | 工具 | 类型 | 底层 | 输出 | 归属 Agent |
 |------|------|------|------|-----------|
 | `checksec` | CLI | slimm609/checksec `--format=json` | RELRO/NX/PIE/Canary JSON | recon, verification |
-| `sca_scan` | CLI | cve-bin-tool `--format json` | 已知 CVE 清单 | recon(**可选**,见下) |
+| `cve_bin_tool_scan` | CLI | cve-bin-tool `--format json -o -` | 已知 CVE 清单 | recon(**可选**,见下) |
 | `strings_query` | 读盘 | 读 `analysis/*.strings.json` + 正则 | URL/IP/密钥/口令命中 | recon, analysis |
 | `imports_query` | 读盘 | 读 `analysis/*.imports.json` | 危险函数及 call_sites | recon, analysis |
-| `decompile_func` | 读盘 | 读 `analysis/*.c`,切函数片段 | 单个函数 C 代码 | analysis, verification |
+| `find_decompiled_function` | 读盘 | 读 `analysis/*.c`,切函数片段 | 单个函数 C 代码 | analysis, verification |
 | `xref_query` | CLI | radare2 `axtj`(JSON 输出) | 交叉引用链 | analysis, verification |
 | `cve_lookup` | API | NVD REST API 2.0 | CVSS/POC 可用性 | analysis, verification |
 | `read_file` | 读盘 | pathlib 读 `process/` 下文件(路径白名单) | 工件细节片段 ≤8KB | 全部(跨 Agent 回查机制) |
 | `semgrep_scan` | CLI | semgrep 1.100.0 + 本地规则 `tools/rules/semgrep_security.yaml`(离线,不用 p/ 网络规则) | 脚本语义漏洞(命令注入/SQLi/反序列化) | recon, analysis |
-| `secret_scan` | CLI | gitleaks 8.18.2 `detect --no-git`(单容器 detect+cat 报告) | 硬编码密钥/凭据 | recon, analysis |
+| `gitleaks_scan` | CLI | gitleaks 8.18.2 `detect --no-git`(单容器 detect+cat 报告) | 硬编码密钥/凭据 | recon, analysis |
 | `sandbox_verify` | CLI | 沙箱跑复核脚本(仅 python3/node/php 白名单解释器,网络隔离,extracted 只读) | Fuzzing Harness/PoC 动态验证输出 | verification |
 | `binwalk_rescan` | CLI | binwalk 专用镜像签名复扫(只识别不落盘解包) | 嵌套容器签名表 | recon |
 | `web_search` | API | DuckDuckGo HTML(免 key;复用 NVD 无 key 节流) | 公开漏洞/公告检索结果 | analysis |
 
-工具可选化(2026-08-18):`make_tools(ctx, exclude={"sca_scan", ...})` 按 name 排除;未显式传 exclude 时读环境变量 `STEP5_EXCLUDE_TOOLS`(逗号分隔)。sca_scan 对嵌入式交叉编译库误报偏多,可运行时关闭不删代码。
+> 工具重命名(2026-08-19 错误研究 E1/E6 落地,与 OBS-ERRORS-RESEARCH 一致):`sca_scan`→`cve_bin_tool_scan`、`decompile_func`→`find_decompiled_function`(强调"检索已反编译产物"而非反编译)、`secret_scan`→`gitleaks_scan`(与底层工具同名)。旧名在旧文档/旧测试引用出现时均指代新名。
+
+工具可选化(2026-08-18):`make_tools(ctx, exclude={"cve_bin_tool_scan", ...})` 按 name 排除;未显式传 exclude 时读环境变量 `STEP5_EXCLUDE_TOOLS`(逗号分隔)。cve_bin_tool_scan 对嵌入式交叉编译库误报偏多,可运行时关闭不删代码。
 
 ### 实测踩坑(2026-08-18)
 

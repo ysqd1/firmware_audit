@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from firmware_audit.step5_agent.providers.tools import make_tools
 from firmware_audit.step5_agent.providers.tools.base import ToolContext
 from firmware_audit.step5_agent.providers.tools.find_decompiled_function import extract_function
+from firmware_audit.step5_agent.providers.tools.imports_query import format_hits
 
 # 真实工件目录(target/1/process)
 _CANDIDATE_ROOTS = [
@@ -92,6 +93,49 @@ def test_imports_query(tools) -> list[str]:
         fails.append(f"imports 全表失败: {r2.error}")
     elif not isinstance(r2.data, list):
         fails.append("危险导入应为 list")
+    return fails
+
+
+def test_format_hits_trigger() -> list[str]:
+    """format_hits 触发层指引(2026-08-23,三层策略第 2 层):
+
+    call_sites 为空 → 附加"用 xref_query 补查,勿判未调用"指引;
+    全部有调用点 → 无指引。构造数据,不依赖真实工件。
+    """
+    fails: list[str] = []
+    hint = "请用 xref_query"
+
+    # 1. call_sites 全空 → 必须带指引
+    all_empty = [
+        {"name": "system", "level": "high", "ref_count": 1, "call_sites": []},
+        {"name": "strcpy", "level": "high", "ref_count": 1, "call_sites": None},
+    ]
+    out1 = format_hits(all_empty)
+    if hint not in out1:
+        fails.append(f"call_sites 全空时应附 xref 指引:\n{out1}")
+
+    # 2. 全部有调用点 → 不带指引
+    all_filled = [
+        {"name": "system", "level": "high", "ref_count": 1,
+         "call_sites": ["0x8996", "0x28864"]},
+    ]
+    out2 = format_hits(all_filled)
+    if hint in out2:
+        fails.append(f"call_sites 齐全时不应附 xref 指引:\n{out2}")
+
+    # 3. 混合(部分空部分有)→ 带指引
+    mixed = [
+        {"name": "system", "level": "high", "ref_count": 1, "call_sites": ["0x8996"]},
+        {"name": "dlopen", "level": "medium", "ref_count": 1, "call_sites": []},
+    ]
+    out3 = format_hits(mixed)
+    if hint not in out3:
+        fails.append(f"混合场景应附 xref 指引:\n{out3}")
+
+    # 4. hits 为空 → 不崩、无指引
+    out4 = format_hits([])
+    if hint in out4 or out4 != "":
+        fails.append(f"空 hits 应输出空串且无指引:\n{out4!r}")
     return fails
 
 
@@ -186,6 +230,7 @@ def test_main() -> int:
         ("resolve_and_decompile", lambda: test_resolve_and_decompile(tools)),
         ("extract_function_edge_cases", test_extract_function_edge_cases),
         ("imports_query", lambda: test_imports_query(tools)),
+        ("format_hits_trigger", test_format_hits_trigger),
         ("strings_query", lambda: test_strings_query(tools)),
         ("read_file", lambda: test_read_file(tools, process_dir)),
         ("make_tools_exclude", test_make_tools_exclude),

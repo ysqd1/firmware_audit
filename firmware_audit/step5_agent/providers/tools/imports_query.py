@@ -32,10 +32,25 @@ def load_imports(imports_path) -> list[dict]:
 
 
 def format_hits(hits: list[dict]) -> str:
+    """危险导入命中列表 → 文本;call_sites 全空的场景附加触发层指引。
+
+    触发层(2026-08-23,三层策略第 2 层):call_sites 为空只代表 Ghidra 未
+    提取到调用位置,不等于该导入未被调用。实测 webrtc_bridge 案例 Agent 曾
+    据此误判"死导入"并放弃追查,而 videohub 同场景下 r2 xref 却挖出真实
+    system 调用点。此处仅在**存在调用点缺失的命中**时附一句指引,引导 Agent
+    用 xref_query 补查,避免跳成"未调用"的早熟结论。
+    """
     lines = []
+    has_empty = False
     for h in hits:
         sites = ", ".join(h.get("call_sites") or []) or "无调用点记录"
+        if not h.get("call_sites"):
+            has_empty = True
         lines.append(f"{h['name']} [{h.get('level', '?')}] ref_count={h.get('ref_count', 0)} 调用点: {sites}")
+    if has_empty:
+        lines.append("提示: 部分导入调用点记录为空——这仅代表 Ghidra 未提取到调用位置,"
+                     "**不等于该导入未被调用**;请用 xref_query 查该符号(sym.imp.<name>)"
+                     "定位真实调用者,勿直接判定为未调用/死导入。")
     return "\n".join(lines)
 
 

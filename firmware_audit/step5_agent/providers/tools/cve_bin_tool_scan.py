@@ -3,6 +3,11 @@
 CVE 数据库不烘镜像:宿主 process/.cve_cache volume 挂载进容器复用,
 首跑下载 NVD 数据(无 key 限速,可能数分钟),超时降级报错不崩。
 退出码约定(cve-bin-tool v3):0=无发现, 1=有 CVE 命中, ≥2=错误。
+
+挂载路径修正(2026-08-22 实测):cve-bin-tool 3.4 的缓存根是 $HOME/.cache/cve-bin-tool/
+(CVEDB.CACHEDIR = ~/.cache/cve-bin-tool),不是老约定的 ~/.cache/cvedb。
+-> 挂整块宿主的 .cve_cache 到容器 $HOME/.cache(即 /home/sandbox/.cache),
+让工具自己管理子目录;若仍挂到 ~/.cache/cvedb,后者不存在导致库永远找不到(码 40)。
 """
 from __future__ import annotations
 
@@ -11,7 +16,7 @@ import json
 from .base import AgentTool, ToolResult
 from .cli_base import container_path, run_in_sandbox
 
-CVE_CACHE_MOUNT = "/home/sandbox/.cache/cvedb"
+CVE_CACHE_MOUNT = "/home/sandbox/.cache"
 
 
 class CveBinToolScanTool(AgentTool):
@@ -31,8 +36,11 @@ class CveBinToolScanTool(AgentTool):
         #     version.py 里 None.splitlines() 直接崩(AttributeError)
         #   --offline  跳过 NVD 增量更新(库由 .cve_cache 预热维护),
         #     省掉每次扫描数分钟的 NVD 限速等待
+        #   -o -       3.4 的 --format json 默认把 JSON 写到文件而非 stdout
+        #     (output.cve-bin-tool.<ts>.json,在 CWD);工具从 stdout 解析,
+        #     必须加 -o - 让 JSON 打到 stdout(2026-08-22 实测只跑通全部 CVE 库)
         rc, out, err = run_in_sandbox(
-            ["--quiet", "--format", "json", "--offline",
+            ["--quiet", "--format", "json", "-o", "-", "--offline",
              "--disable-version-check", "--disable-data-source", "PURL2CPE", cpath],
             "cve-bin-tool", self.ctx, timeout=900,
             extra_mounts=[(cache, CVE_CACHE_MOUNT)],
@@ -44,6 +52,11 @@ class CveBinToolScanTool(AgentTool):
             )
         data = _extract_json(out)
         if data is None:
+            # -o - 下 0 命中时 stdout 为空(实测 2026-08-22),属合法"无 CVE",
+            # 而非错误;只有输出非空却解析失败才算真正问题。
+            stripped = out.strip()
+            if not stripped:
+                return ToolResult(ok=True, text=f"{file_ref}: 无已知 CVE 命中", data=[])
             return ToolResult(ok=False, text="", error=f"输出无 JSON: {out[:200]}")
         hits = _flatten(data)
         if not hits:

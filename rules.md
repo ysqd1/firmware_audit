@@ -15,7 +15,7 @@
 
 ## Agent 层约定(2026-08-16 新增,08-17 随工具层定稿更新)
 
-- **工具统一 ToolResult 接口**(2026-08-17 定稿)— 三类实现:CLI 类 subprocess 调容器内 CLI(checksec/cve-bin-tool/radare2 等)、读盘类直读 Step4 工件(decompile_func/strings/imports/read_file)、API 类 urllib(cve_lookup);返回 `{ok, text, data, error, elapsed}`,text ≤8KB 截断
+- **工具统一 ToolResult 接口**(2026-08-17 定稿)— 三类实现:CLI 类 subprocess 调容器内 CLI(checksec/cve-bin-tool/radare2 等)、读盘类直读 Step4 工件(find_decompiled_function/strings/imports/read_file)、API 类 urllib(cve_lookup);返回 `{ok, text, data, error, elapsed}`,text ≤8KB 截断
 - **幂等与超时** — 同参同果(cve_lookup 以缓存快照为准);每工具可配超时
 - **分析一次、多次查询** — 复用 Step4 工件(functions/imports/strings),不重复反编译
 - **漏斗式调用** — 廉价工具批量跑(读盘类毫秒级),昂贵操作(Ghidra 重分析/仿真)按触发条件深挖;单函数反编译是读盘切片,不再昂贵
@@ -45,7 +45,7 @@
 ## 已知坑
 
 - **deepseek-v4-flash 是推理模型**(2026-08-17 冒烟实测):回复分两个字段,思考在 `reasoning_content`、正文在 `content`;思考耗尽 max_tokens 时 content 为空(finish_reason=length)。LLMClient 必须合并两个字段再给 ReAct 解析器;max_tokens 默认 8192(思考计入预算)。冒烟结论:协议遵循良好,5 步自主完成 imports→xref→decompile 链,单任务 ~10k token。
-- **cve-bin-tool 3.4 的 PURL2CPE 源首跑必崩**:populate_purl2cpe 时 purl2cpe.db 未初始化,报 `OperationalError: no such table: purl2cpe`。必须 `--disable-data-source PURL2CPE`(sca_scan.py 已内置)。CVE 库首跑下载 NVD 数据较慢(无 key 限速),降级返回错误不崩。
+- **cve-bin-tool 3.4 的 PURL2CPE 源首跑必崩**:populate_purl2cpe 时 purl2cpe.db 未初始化,报 `OperationalError: no such table: purl2cpe`。必须 `--disable-data-source PURL2CPE`(cve_bin_tool_scan.py 已内置)。CVE 库首跑下载 NVD 数据较慢(无 key 限速),降级返回错误不崩。**预热 + 库挂载的坑**(2026-08-22 实测):库挂在宿主 `process/.cve_cache`,工具挂到容器 `$HOME/.cache`(父目录,非旧约定 `~/.cache/cvedb`——那是 3.4 找不到库报码 40 的根因);预热命令必须带目录参数(`-u now /tmp`,缺则 InsufficientArgs 码 24)且别把 `cve-bin-tool` 目录本身当挂载根(clear_cached_data 报 Device or resource busy)。详见 agents.md / tools_summary.md。
 
 - **radare2 源码安装是"软链安装"(symstall)**:bullseye apt 无 radare2 包,源码 `sys/install.sh` 后 /usr/local 下的 bin/lib/pkgconfig 全是指向构建目录(/tmp/radare2)的符号链接;删构建目录前必须把软链解引用成真实文件,否则 449 个软链全部悬空、r2 报 command not found。安装全程见 docker/sandbox/Dockerfile,r2 固定 5.9.8 tag,capstone 下载用 `CS_COMMIT_ARCHIVE=1` 走 wget(直连 git clone 会被网络掐断)。
 - **sandbox 镜像 ENTRYPOINT 是 Ghidra AnalyzeHeadless**:`firm_audit/sandbox` 调任何非 Ghidra 工具(checksec/radare2/cve-bin-tool/semgrep)必须用 `run_docker()` 的 `entrypoint` 参数覆盖,否则命令参数全部被 Ghidra 吃掉报 InvalidInputException(step0 调 sfdisk 同款模式)。镜像内 PATH 也被 Ghidra 覆盖过,Dockerfile 已显式补全,但 login shell(`bash -l`)会再次触发覆盖,容器内跑脚本用显式 `export PATH`。

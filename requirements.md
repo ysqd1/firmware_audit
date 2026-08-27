@@ -45,7 +45,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 - **输出**:JSON,含各安全属性布尔值 + 原始输出
 - **规则**:NX 关闭 + 无 PIE → 可利用性评级上调;结果并入 FileInfo
 
-#### F2 sca_scan — 已知漏洞扫描
+#### F2 cve_bin_tool_scan — 已知漏洞扫描(原 sca_scan)
 
 - **触发**:审计开始时,对提取出的二进制/库批量扫描
 - **处理**:cve-bin-tool 按文件名/版本特征匹配 400+ 检查器,输出已知 CVE
@@ -66,7 +66,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 - **输出**:JSON,含危险导入、call_sites(在哪被调)
 - **规则**:危险函数表集中配置;命中即生成可疑点
 
-#### F5 decompile_func — 单函数反编译(读盘)
+#### F5 find_decompiled_function — 单函数反编译(读盘)(原 decompile_func)
 
 - **触发**:危险函数/可疑字符串命中后,深挖取证
 - **处理**:读 Step4 已产出的 `analysis/<rel>.c`,按函数签名/行号切出目标函数片段——**不重新调 Ghidra**(Step4 已全量反编译,复用产物,毫秒级)
@@ -82,7 +82,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 
 #### F7 cve_lookup — CVE 严重度富化
 
-- **触发**:sca_scan 命中后,评估严重度与可利用性
+- **触发**:cve_bin_tool_scan 命中后,评估严重度与可利用性
 - **处理**:NVD REST API 2.0 查询 CVE 详情
 - **输出**:JSON,含 CVSS 分数、POC 可用性、修复版本
 - **规则**:无 key 限 5 次/30s,工具层做节流与缓存;网络失败降级返回基础信息
@@ -108,9 +108,9 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 
 | Agent | 职责 | 工具 |
 |-------|------|------|
-| recon | 广度侦察,铺开攻击面 | checksec / sca_scan / strings_query / imports_query / binwalk_rescan(二期) |
-| analysis | 对疑点逐个深挖取证 | decompile_func / xref_query / strings_query / imports_query / cve_lookup |
-| verification | 复核发现,过滤误报,出报告 | decompile_func / xref_query / cve_lookup / checksec / read_file |
+| recon | 广度侦察,铺开攻击面 | checksec / cve_bin_tool_scan / strings_query / imports_query / binwalk_rescan(二期) |
+| analysis | 对疑点逐个深挖取证 | find_decompiled_function / xref_query / strings_query / imports_query / cve_lookup |
+| verification | 复核发现,过滤误报,出报告 | find_decompiled_function / xref_query / cve_lookup / checksec / read_file |
 
 - Agent 间只通过工件文件交接(`attack_surface.json` → `findings.json` → `report.md`),不传对话历史
 - 每 Agent 内部 ReAct 循环:Thought/Action → 工具 → Observation → Final Answer;设迭代上限(15-25)与 Observation 截断(≤8KB 入上下文,全文落盘)
@@ -125,13 +125,13 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 | N2 | 超时控制 | 每个工具可配超时,超时返回部分结果 + 超时标记,不中断流程 |
 | N3 | 降级 | 无 API key / 断网 / Docker 不可用时,降级纯规则仍出报告 |
 | N4 | 可复现 | 同输入同输出;binwalk 偶发不稳定需按 rules.md 已知坑对策 |
-| N5 | 性能 | 读盘类工具(decompile_func/strings/imports)毫秒级;SCA 批量分钟级可接受;昂贵操作(Ghidra 重分析/仿真)按需触发 |
+| N5 | 性能 | 读盘类工具(find_decompiled_function/strings/imports)毫秒级;SCA 批量分钟级可接受;昂贵操作(Ghidra 重分析/仿真)按需触发 |
 | N6 | 可追溯 | 每步日志打印进度与统计,失败可追溯 |
 
 ## 6. 验收标准
 
 1. 8 个 MVP 工具全部可用,统一 ToolResult 接口,单测覆盖(输入→输出→超时→幂等)
-2. 对 `target/1` 全量跑通:sca_scan 出 CVE 清单,imports_query 圈出危险函数,decompile_func 对 12 个检出硬编码 ELF 逐个取证
+2. 对 `target/1` 全量跑通:cve_bin_tool_scan 出 CVE 清单,imports_query 圈出危险函数,find_decompiled_function 对 12 个检出硬编码 ELF 逐个取证
 3. 无 API key 环境跑通纯规则报告,标注"未经 LLM 复核"
 4. 报告为 Markdown,证据含文件路径 + 行号 + 代码片段
 5. 编排层:`ScriptedLLM` 全链路单测跑通 ReAct 循环(Thought/Action/Observation/Final Answer 解析、解析失败回喂重试 ≤2、迭代上限强制收尾)
@@ -139,8 +139,8 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 
 ## 7. 实施顺序(建议,相对顺序非日历排期)
 
-1. `tools/base.py`(AgentTool + ToolResult)+ 读盘三件套(decompile_func / imports_query / strings_query)——最短路径出第一批可测单元
-2. 其余 MVP 工具:read_file、checksec、sca_scan、xref_query(CLI 类,走沙箱容器);cve_lookup(网络类)最后
+1. `tools/base.py`(AgentTool + ToolResult)+ 读盘三件套(find_decompiled_function / imports_query / strings_query)——最短路径出第一批可测单元
+2. 其余 MVP 工具:read_file、checksec、cve_bin_tool_scan、xref_query(CLI 类,走沙箱容器);cve_lookup(网络类)最后
 3. `llm_client.py`(非流式 + 重试退避)+ `react_loop.py`(纯文本 ReAct 解析 + ScriptedLLM 单测)
 4. `context.py` 四分区 + 压缩;`artifacts.py` 工件 schema
 5. 三 AgentConfig 串联 + transcript 落盘 + 断点续跑;端到端跑 `target/1`
