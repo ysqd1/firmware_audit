@@ -677,6 +677,79 @@ def test_ingest_merge_dedup() -> list[str]:
     return fails
 
 
+def test_aggregator_module() -> list[str]:
+    """FindingAggregator 独立模块契约(不经 Orchestrator 壳):聚合/去重/
+    重合计分/recon 跳过,纯逻辑可直接单测。"""
+    fails: list[str] = []
+    from firmware_audit.step5_agent.aggregator import FindingAggregator
+    from firmware_audit.step5_agent.orchestrator import SubAgentResult
+
+    # 1. 聚合 + 同键去重合并
+    agg = FindingAggregator()
+    f1 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
+          "addr": "0x1000", "evidence": "system(cmd)", "severity": "high"}
+    f2 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
+          "addr": "0x1000", "confidence": "high", "verified": True}
+    agg.ingest(SubAgentResult(seq=0, agent_name="analysis", status="success",
+                              findings=[f1], request={}))
+    agg.ingest(SubAgentResult(seq=1, agent_name="analysis", status="success",
+                              findings=[f2], request={}))
+    if len(agg.all_findings) != 1:
+        fails.append(f"同键应合并为 1 条: {len(agg.all_findings)}")
+    else:
+        m = agg.all_findings[0]
+        if m.get("evidence") != "system(cmd)":
+            fails.append(f"已有 evidence 不应被覆盖: {m.get('evidence')}")
+        if m.get("instance_seq") != 0 or m.get("source_agent") != "analysis":
+            fails.append(f"溯源应保留首次产出: {m.get('instance_seq')}/{m.get('source_agent')}")
+
+    # 2. verification 复核权威覆盖
+    agg2 = FindingAggregator()
+    agg2.ingest(SubAgentResult(seq=0, agent_name="analysis", status="success",
+                               findings=[dict(f1)], request={}))
+    fv = dict(f1)
+    fv["verified"], fv["rationale"] = True, "证据链完整"
+    agg2.ingest(SubAgentResult(seq=1, agent_name="verification", status="success",
+                               findings=[fv], request={}))
+    m2 = agg2.all_findings[0]
+    if m2.get("verified") is not True or m2.get("rationale") != "证据链完整":
+        fails.append(f"verification 应覆盖 verified/rationale: {m2}")
+
+    # 3. recon v3 跳过(不聚合 finding)
+    agg3 = FindingAggregator()
+    agg3.ingest(SubAgentResult(seq=0, agent_name="recon", status="success",
+                               findings=[dict(f1)], request={}))
+    if agg3.all_findings:
+        fails.append(f"recon v3 不应聚合任何 finding: {agg3.all_findings}")
+
+    # 4. overlap_ratio:标题+文件归一化匹配
+    agg4 = FindingAggregator(all_findings=[dict(f1)])
+    same = [dict(f1)]                       # 完全重复
+    diff = [{"title": "别的", "file": "unitree/bin/other", "func": "x"}]
+    if agg4.overlap_ratio(same) != 1.0:
+        fails.append(f"完全重复 overlap 应 1.0: {agg4.overlap_ratio(same)}")
+    if agg4.overlap_ratio(diff) != 0.0:
+        fails.append(f"无关 overlap 应 0.0: {agg4.overlap_ratio(diff)}")
+    if agg4.overlap_ratio([]) != 0.0:
+        fails.append("空输入 overlap 应 0.0")
+
+    # 5. dedup_key:规范化(压空白 + 小写)
+    k1 = FindingAggregator.dedup_key({"title": "  A B ", "file": "x", "func": "y", "addr": "z"})
+    k2 = FindingAggregator.dedup_key({"title": "a b", "file": "x", "func": "y", "addr": "z"})
+    if k1 != k2:
+        fails.append(f"dedup_key 应规范化标题: {k1} != {k2}")
+
+    # 6. norm_text:路径分隔符归一化(反斜杠 → 正斜杠)+ 压空白 + 小写
+    n1 = FindingAggregator.norm_text(r"unitree\bin\idlc")
+    n2 = FindingAggregator.norm_text("unitree/bin/idlc")
+    if n1 != n2:
+        fails.append(f"norm_text 应归一化路径分隔符: {n1!r} != {n2!r}")
+    if FindingAggregator.norm_text("  A  B ") != "a b":
+        fails.append(f"norm_text 应压空白 + 小写: {FindingAggregator.norm_text('  A  B ')!r}")
+
+    return fails
+
+
 def test_pipeline_mode() -> list[str]:
     """planner=pipeline:无 orchestrator LLM 轮次,三 Agent 顺序产出工件;
     result.json 与 auto 模式对称落盘(聚合 findings+阶段统计)。"""
@@ -1254,6 +1327,7 @@ def test_main() -> int:
         ("handoff_snapshot_file", test_handoff_snapshot_file),
         ("status_enum_closed", test_status_enum_closed),
         ("ingest_merge_dedup", test_ingest_merge_dedup),
+        ("aggregator_module", test_aggregator_module),
         ("ingest_verification_overrides", test_ingest_verification_overrides),
         ("pipeline_mode", test_pipeline_mode),
         ("pipeline_stages_cover_rejected", test_pipeline_stages_cover_rejected),

@@ -102,7 +102,7 @@ def _run_pipeline(process_dir: Path, base, force: bool):
     返回 Orchestrator 实例(不 run()),调用方取 dispatches/_agent_results。
     """
     orch = Orchestrator(process_dir, base, force=force)  # 只用其守卫与落盘,不 run()
-    from .orchestrator import DispatchAgentTool, SubAgentResult as _SAR
+    from .orchestrator import DispatchAgentTool
     from .providers.tools import ToolContext
 
     tool = DispatchAgentTool(ToolContext(process_dir=process_dir), orch)
@@ -116,15 +116,15 @@ def _run_pipeline(process_dir: Path, base, force: bool):
             errors[agent] = res.error or "pipeline 阶段未完成"
             print(f"[step5:pipeline] {agent} 未完成: {res.error}", flush=True)
     # 被拒/未执行阶段也进 stages(调用方可区分"未规划"与"被拒")
+    planned_task = dict(planned)
     for agent, err in errors.items():
-        if agent not in orch._agent_results:
-            orch._agent_results[agent] = _SAR(
-                seq=-1, agent_name=agent, status="failed", error=err,
-                request={"agent": agent, "task": dict(planned).get(agent, "")})
-    orch._success = not errors and all(
-        sub.ok for sub in orch.dispatches) and len(orch.dispatches) == len(planned)
-    orch._error = "; ".join(f"{a}: {e}" for a, e in errors.items())
-    orch._write_result(None)  # type: ignore[arg-type]  # transcript: pipeline 模式无
+        if agent not in orch.agent_results:
+            orch.record_failed(agent, err, task=planned_task.get(agent, ""))
+    orch.finish(
+        success=(not errors and all(sub.ok for sub in orch.dispatches)
+                 and len(orch.dispatches) == len(planned)),
+        error="; ".join(f"{a}: {e}" for a, e in errors.items()))
+    orch.write_result()  # transcript: pipeline 模式无,走公开 API
     return orch
 
 

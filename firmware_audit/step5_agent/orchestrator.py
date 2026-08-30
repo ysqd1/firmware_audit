@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from .aggregator import FindingAggregator
 from .data.artifacts import load_artifact, load_survey
 from .data.prompts import build_system_prompt, save_system_prompt
 from .engine.display import make_display
@@ -464,10 +465,10 @@ class SummarizeTool(AgentTool):
             parts.append("- " + orch._budget_state_text(name))
 
         # ---- findings 分级清单(决策辅助) ----
-        parts.append(f"\n### 累计 findings({len(orch._all_findings)} 条,已去重合并)")
-        if orch._all_findings:
+        parts.append(f"\n### 累计 findings({len(orch.all_findings)} 条,已去重合并)")
+        if orch.all_findings:
             sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-            for f in sorted(orch._all_findings,
+            for f in sorted(orch.all_findings,
                             key=lambda x: sev_rank.get(x.get("severity", "info"), 9)):
                 loc = f.get("file", "") + (f"::{f.get('func')}" if f.get("func") else "")
                 mark = "✓" if f.get("verified") else ("✗" if f.get("verified") is False else "?")
@@ -534,7 +535,7 @@ class Orchestrator:
         self._agent_results: dict[str, SubAgentResult] = {}
         self._dispatches: list[SubAgentResult] = []   # 全部实际执行的调度(时序)
         self._dispatch_log: list[dict] = []           # 全量调度尝试(含拒绝/重复)
-        self._all_findings: list[dict] = []
+        self._agg = FindingAggregator()               # findings 聚合(去重/合并/重合计分)
         self._success = False
         self._final_answer = ""
         self._error = ""
@@ -551,71 +552,21 @@ class Orchestrator:
     def _register(self, sub: SubAgentResult) -> None:
         """登记一次实际执行:调度史 + 同类型取最新 + findings 聚合。
 
-        聚合(_ingest)前先计重合比例(Task6.5):新实例 findings 与既有
-        _all_findings 按(title+file 归一化)匹配的重复比例,存入实例供
+        聚合(委托 self._agg.ingest)前先计重合比例(Task6.5):新实例 findings
+        与既有 all_findings 按(title+file 归一化)匹配的重复比例,存入实例供
         budget_state 与调度日志上报;recon 跳过(v3 无 findings,聚合层同跳)。
         """
         if sub.agent_name != "recon":
-            sub.overlap_ratio = self._overlap_ratio(sub.findings)
+            sub.overlap_ratio = self._agg.overlap_ratio(sub.findings)
         self._dispatches.append(sub)
         self._agent_results[sub.agent_name] = sub
-        self._ingest(sub)
-
-    @staticmethod
-    def _dedup_key(f: dict) -> tuple:
-        """去重键:file+func+addr+标题规范化(比 v2 的 (title,file) 更细)。"""
-        title_norm = " ".join(str(f.get("title", "")).split()).lower()
-        return (str(f.get("file", "")).strip(), str(f.get("func", "")).strip(),
-                str(f.get("addr", "")).strip(), title_norm)
-
-    def _ingest(self, sub: SubAgentResult) -> None:
-        """把子 Agent findings 并入聚合;命中重复键时**合并**而非丢弃(深化版本
-        保留:已有 evidence 保留,新实例补 confidence/evidence 空位;
-        verification 是复核权威,其 verified/rationale 直接覆盖)。
-        recon(recon v3 survey)跳过:recon 只铺面不判级、无 findings;
-        即便磁盘遗留旧 findings 残留也显式忽略不聚合(recon 判级移交 analysis)。"""
-        if sub.agent_name == "recon":
-            return
-        for f in sub.findings:
-            if not isinstance(f, dict):
-                continue
-            key = self._dedup_key(f)
-            for i, existing in enumerate(self._all_findings):
-                if self._dedup_key(existing) != key:
-                    continue
-                merged = dict(existing)
-                for k, v in f.items():
-                    if v in (None, "", [], {}):
-                        continue
-                    if not merged.get(k):
-                        merged[k] = v      # 新实例有值且已有为空 → 补
-                # 复核权威字段:verification 实例直接覆盖(后段修正前段)
-                if sub.agent_name == "verification":
-                    for k in ("verified", "rationale"):
-                        if k in f:
-                            merged[k] = f[k]
-                if merged.get("instance_seq") is None:
-                    merged["instance_seq"] = sub.seq
-                merged.setdefault("source_agent", sub.agent_name)
-                self._all_findings[i] = merged
-                break
-            else:
-                g = dict(f)
-                if g.get("instance_seq") is None:
-                    g["instance_seq"] = sub.seq
-                g.setdefault("source_agent", sub.agent_name)
-                self._all_findings.append(g)
+        self._agg.ingest(sub)
 
     # ---- Task6: 动态分配与重合检测(budget_state / pending_focuses / overlap_ratio) ----
 
-    @staticmethod
-    def _norm_text(s) -> str:
-        """差分比对归一化:统一路径分隔符 + 压空白 + 小写(simple contains 用)。"""
-        return " ".join(str(s or "").replace("\\", "/").split()).lower()
-
     def _pending_focuses(self) -> list[str]:
         """未覆盖疑点清单(Task6.4):recon survey 的 recommended_actions
-        (priority=high/medium)∩ 未出现在已聚合 _all_findings 的项。
+        (priority=high/medium)∩ 未出现在已聚合 all_findings 的项。
 
         差分规则(simple contains/normalize):action 文本(含文件名/疑点描述)
         归一化后包含某条 finding 的 file 或 title(均归一化)即视为已覆盖;
@@ -640,51 +591,31 @@ class Orchestrator:
         if not actions:
             return []
         covered = set()
-        for f in self._all_findings:
+        for f in self._agg.all_findings:
             if not isinstance(f, dict):
                 continue
             for k in ("title", "file"):
-                n = self._norm_text(f.get(k, ""))
+                n = self._agg.norm_text(f.get(k, ""))
                 if n:
                     covered.add(n)
         pending = [a for a in actions
-                   if not any(c in self._norm_text(a) for c in covered)]
+                   if not any(c in self._agg.norm_text(a) for c in covered)]
         # 排序锚点:high_risk_areas 的 file 出现顺序(去重保序)
         order: list[str] = []
         for h in survey.get("high_risk_areas") or []:
             if isinstance(h, dict):
-                f = self._norm_text(h.get("file", ""))
+                f = self._agg.norm_text(h.get("file", ""))
                 if f and f not in order:
                     order.append(f)
 
         def _rank(action: str) -> int:
-            n = self._norm_text(action)
+            n = self._agg.norm_text(action)
             for i, f in enumerate(order):
                 if f and f in n:
                     return i
             return len(order)   # 未命中排最后,稳定排序保序
 
         return sorted(pending, key=_rank)
-
-    def _overlap_ratio(self, new_findings: list) -> float:
-        """重合计分(Task6.5):新实例 findings 与既有 _all_findings(本实例
-        ingest 前)按(title 归一化 + file 归一化)二元组匹配的重复比例;
-        空输入或无既有聚合时返回 0.0。"""
-        if not new_findings:
-            return 0.0
-        existing = set()
-        for f in self._all_findings:
-            if not isinstance(f, dict):
-                continue
-            existing.add((self._norm_text(f.get("title", "")),
-                          self._norm_text(f.get("file", ""))))
-        if not existing:
-            return 0.0
-        hit = sum(
-            1 for f in new_findings
-            if isinstance(f, dict) and (self._norm_text(f.get("title", "")),
-                                        self._norm_text(f.get("file", ""))) in existing)
-        return hit / len(new_findings)
 
     def _budget_state(self, agent: str) -> dict:
         """结构化预算状态(Task6.3):该类型最新实例的 exhausted/steps/
@@ -735,18 +666,18 @@ class Orchestrator:
 
     def _build_rerun_brief(self, agent: str, handoff: str,
                            max_findings: int = 30) -> str:
-        """补跑简报增补(Task6.7):既有交接块 + 已覆盖清单(_all_findings 的
+        """补跑简报增补(Task6.7):既有交接块 + 已覆盖清单(all_findings 的
         title/file,前 30 条)+ 差分 task 提示;经 extra_brief 注入子 Agent
         简报尾部(run_agent 透传),配合 ANALYSIS_SYSTEM 补跑红线食用。"""
         round_no = sum(1 for d in self._dispatches
                        if d.agent_name == agent) + 1
         lines = [handoff, "",
                  f"--- 已覆盖清单(前 {max_findings} 条,编排器注入) ---"]
-        if self._all_findings:
-            for f in self._all_findings[:max_findings]:
+        if self._agg.all_findings:
+            for f in self._agg.all_findings[:max_findings]:
                 lines.append(f"- {f.get('title', '?')} @ {f.get('file', '')}")
-            if len(self._all_findings) > max_findings:
-                lines.append(f"...(共 {len(self._all_findings)} 条,余下省略)")
+            if len(self._agg.all_findings) > max_findings:
+                lines.append(f"...(共 {len(self._agg.all_findings)} 条,余下省略)")
         else:
             lines.append("(暂无已覆盖 findings)")
         lines.append(f"本实例为第 {round_no} 轮补跑,聚焦未覆盖疑点,"
@@ -842,8 +773,8 @@ class Orchestrator:
             lines.append(f"本次为 {agent} 的第 {len(prev) + 1} 次调用:上一次输出 {art}"
                          f"({len(last.findings or [])} findings);请在既有结果基础上"
                          "补充推进,不要重复已完成的工作")
-        if self._all_findings:
-            lines.append(f"全链路累计 findings: {len(self._all_findings)} 条"
+        if self._agg.all_findings:
+            lines.append(f"全链路累计 findings: {len(self._agg.all_findings)} 条"
                          "(细节可用 read_file 读取上列工件)")
         if context:
             lines.append(f"本次任务补充上下文: {context}")
@@ -872,7 +803,7 @@ class Orchestrator:
                 "last_summary": next(
                     (d.summary for d in reversed(done) if d.agent_name == agent), ""),
             },
-            "cumulative_findings": len(self._all_findings),
+            "cumulative_findings": len(self._agg.all_findings),
             "ts": _now(),
         }
         try:
@@ -985,7 +916,8 @@ class Orchestrator:
 
     @property
     def all_findings(self) -> list[dict]:
-        return list(self._all_findings)
+        """全链路累计 findings(经聚合器去重合并后的只读视图)。"""
+        return list(self._agg.all_findings)
 
     @property
     def success(self) -> bool:
@@ -1038,7 +970,7 @@ class Orchestrator:
         self._write_report()
         if disp.enabled:
             disp.done("orchestrator", self._report_path.name if self._report_path
-                      else "result.json", len(self._all_findings),
+                      else "result.json", len(self._agg.all_findings),
                       react.steps, dict(getattr(self.base_llm, "total_usage", {})))
         self._write_result(transcript)
         return self
@@ -1095,7 +1027,7 @@ class Orchestrator:
             "report_path": str(self._report_path) if self._report_path else None,
             "summarize_called": self._summarize_called,
             "steps": self._seq,
-            "findings": self._all_findings,
+            "findings": self.all_findings,
             # Task6.8:各类型最新实例的 budget_state 汇总(动态分配决策留档)
             "budget": {name: self._budget_state(name)
                        for name in self._sub_cfgs},
@@ -1104,6 +1036,27 @@ class Orchestrator:
             "transcript": str(transcript),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         return out
+
+    # ---- 公开 API(pipeline 等外部调用方用,不再伸手改私有状态) ----
+
+    def record_failed(self, agent: str, error: str, task: str = "") -> None:
+        """登记一个被拒/未执行的阶段为 failed 实例(不占调度史)。
+
+        pipeline 模式被拒阶段用它占位 _agent_results,使调用方可区分
+        "未规划"与"被拒"。seq=-1 标记非真实调度。
+        """
+        self._agent_results[agent] = SubAgentResult(
+            seq=-1, agent_name=agent, status=DispatchStatus.FAILED,
+            error=error, request={"agent": agent, "task": task})
+
+    def finish(self, success: bool, error: str = "") -> None:
+        """设置编排终态(success/error),供 pipeline 等外部路径收敛。"""
+        self._success = success
+        self._error = error
+
+    def write_result(self) -> Path:
+        """落盘编排终态 result.json(transcript 缺省;pipeline 模式无 transcript)。"""
+        return self._write_result(None)
 
 
 __all__ = ["Orchestrator", "SubAgentResult", "DispatchAgentTool",
