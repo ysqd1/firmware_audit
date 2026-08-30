@@ -1,8 +1,10 @@
 """Agent 间工件契约:Finding 数据类 + 宽容解析 + 落盘。
 
-工件链:agent/attack_surface.json → findings.json → verified_findings.json
-统一容器 {agent, summary, findings: [...]};LLM 输出天然不稳,解析层
-只降级不崩溃(缺字段给默认值,多余字段保留在 extras)。
+工件链(2026-08-29):agent/survey.json → findings.json → verified_findings.json
+- findings 类工件(analysis/verification):统一容器 {agent, summary, findings: [...]}
+- 侦察(recon v3)工件为 survey.json:见 parse_survey_artifact(无 findings/判级字段;
+  旧 attack_surface.json 命名于 2026-08-29 移除 v2 兼容层,不再回退读取)。
+LLM 输出天然不稳,解析层只降级不崩溃(缺字段给默认值,多余字段保留在 extras)。
 """
 from __future__ import annotations
 
@@ -28,6 +30,8 @@ class Finding:
     confidence: str = ""            # high/medium/low
     verified: bool | None = None    # None=未复核;verification 填
     rationale: str = ""             # 复核结论(verification 填)
+    source_agent: str = ""          # 溯源:产出该 finding 的 Agent(schema v2)
+    instance_seq: int | None = None  # 溯源:产出实例序号(schema v2;0_recon → 0)
     extras: dict = field(default_factory=dict)  # LLM 多给的字段原样保留
 
     def to_dict(self) -> dict:
@@ -89,11 +93,15 @@ def parse_artifact(final_answer: str) -> dict | None:
     return None
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2(2026-08-28):finding 增 source_agent/instance_seq 溯源字段
 
 
 def save_artifact(path: Path, agent: str, parsed: dict | None, raw: str) -> Path:
-    """工件落盘:能解析存 JSON,否则原文本存 .md(降级但信息不丢)。"""
+    """工件落盘:能解析存 JSON,否则原文本存 .md(降级但信息不丢)。
+
+    落盘时给每条 finding 补 source_agent=agent(schema v2 溯源);
+    instance_seq 由 orchestrator 聚合时再补(run_agent 不知道 seq)。
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     if parsed is not None:
         out = {
@@ -105,6 +113,10 @@ def save_artifact(path: Path, agent: str, parsed: dict | None, raw: str) -> Path
         for k, v in parsed.items():  # LLM 多给的顶层字段保留(components 等)
             if k not in out:
                 out[k] = v
+        # 溯源补齐:该工件产出的 finding 标记 source_agent(不覆盖已有值)
+        for f in out["findings"]:
+            if isinstance(f, dict) and not f.get("source_agent"):
+                f["source_agent"] = agent
         path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
         return path
     md = path.with_suffix(".md")
@@ -113,7 +125,8 @@ def save_artifact(path: Path, agent: str, parsed: dict | None, raw: str) -> Path
 
 
 def load_artifact(path: Path) -> dict | None:
-    """读回工件(断点续跑喂下游)。宽容:失败返回 None。"""
+    """读回工件(断点续跑喂下游)。宽容:失败返回 None。
+    v1 工件(无 source_agent/instance_seq)读到时补默认值,消费方无感。"""
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -122,6 +135,12 @@ def load_artifact(path: Path) -> dict | None:
         return None
     obj.setdefault("summary", "")
     obj.setdefault("findings", [])
+    if obj.get("schema", 1) < 2:
+        obj["schema"] = obj.get("schema", 1)   # 保留原版本号,聚合层补溯源
+        for f in obj["findings"]:
+            if isinstance(f, dict):
+                f.setdefault("source_agent", obj.get("agent", ""))
+                f.setdefault("instance_seq", None)
     return obj
 
 
@@ -148,3 +167,179 @@ def artifact_summary(path: Path, max_chars: int = 1500) -> str:
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n...(截断,全文用 read_file 读 {path.name})"
     return text
+
+
+# ---------------------------------------------------------------------------
+# recon v3 工件:survey.json(2026-08-29,对齐 DeepAudit recon 语义)
+# ---------------------------------------------------------------------------
+# 禁止字段:findings 数组 + 任意层级的判级/证据链键(severity/confidence/
+# verified/evidence/rationale)。recon 只铺面不判级,判级与证据链移交 analysis。
+SURVEY_VERSION = 3
+SURVEY_FORBIDDEN_KEYS = ("severity", "confidence", "verified", "evidence", "rationale")
+# role 推断必需证据(见 prompt:禁止裸 role)
+_SURVEY_OBS_METRIC_FORBIDDEN = "违规判级/证据链键降级(recon 禁止)"
+
+
+def _tostr(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    try:
+        return json.dumps(v, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(v)
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """从文本中宽容取出一个 dict JSON(首个 { 到最后一个 })。"""
+    if not text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+_REMOVE = object()
+
+
+def _sanitize_survey(value, degraded: list):
+    """递归清洗:含禁止键(findings 数组或判级键)的 dict 整条降级入 degraded。
+
+    返回清洗后的值;被降级处返回 _REMOVE(调用方移除并补空占位)。
+    只降级不崩溃:数组内坏项剔除,层的其他健康项保留。
+    """
+    if isinstance(value, dict):
+        keys = set(value)
+        if keys & set(SURVEY_FORBIDDEN_KEYS) or "findings" in keys:
+            degraded.append(_obs_from_forbidden(value, _SURVEY_OBS_METRIC_FORBIDDEN))
+            return _REMOVE
+        cleaned = {}
+        for k, v in value.items():
+            r = _sanitize_survey(v, degraded)
+            if r is not _REMOVE:
+                cleaned[k] = r
+        return cleaned
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            r = _sanitize_survey(item, degraded)
+            if r is not _REMOVE:
+                out.append(r)
+        return out
+    return value
+
+
+def _obs_from_forbidden(value, metric: str) -> dict:
+    """违规 dict/条目 → high_risk_areas 观察点(只保留可观测字段,套用给定 metric)。"""
+    if isinstance(value, dict):
+        f = value.get("file")
+        if not isinstance(f, str):
+            f = ""
+        title = _tostr(value.get("title") or value.get("name")
+                       or value.get("action") or value)
+        return {"file": f, "metric": metric, "detail": title}
+    return {"file": "", "metric": metric, "detail": _tostr(value)}
+
+
+def _normalize_survey(obj: dict) -> dict:
+    """把 LLM 原始 dict 归一为 v3 survey 结构(含防幻觉降级)。
+    v2 兼容层 2026-08-29 已移除:findings/判级键一律按违规处理,不再"宽容转换"。"""
+    notes: list[str] = []
+    high = list(obj.get("high_risk_areas") or [])
+
+    # 1) recon 禁止字段:顶层 findings 数组或判级/证据链键出现即拒绝并注明
+    #    (findings 无健康可观测对象,不产观察点;判级键在子树层面按步骤 3 降级)
+    top_forbidden = [k for k in obj if k == "findings" or k in SURVEY_FORBIDDEN_KEYS]
+    if top_forbidden:
+        notes.append(f"顶层禁止键 {','.join(top_forbidden)} 已被拒绝(recon 不判级、不产 findings)")
+
+    # 2) 其余子树清洗:任意层级 forbidden 键 → 剔除并降级为观察点
+    degraded: list[dict] = []
+    cleaned: dict = {}
+    for k, v in obj.items():
+        if k == "findings" or k in SURVEY_FORBIDDEN_KEYS:
+            continue  # findings/判级键已在步骤1拒绝
+        r = _sanitize_survey(v, degraded)
+        if r is _REMOVE:
+            # 整个子树全被降级丢失 → 按类型补空占位,保 schema 不断裂
+            r = {} if k == "arch_snapshot" else [] if isinstance(v, list) else {}
+        cleaned[k] = r
+    if degraded:
+        high.extend(degraded)
+        notes.append(f"剔除 {len(degraded)} 处违规判级/证据链字段,已降级为 high_risk_areas 观察点")
+
+    summary = _tostr(cleaned.get("summary") or "")
+    if notes:
+        summary = (summary + "\n\n[recon schema 守护] " + "；".join(notes)).strip()
+
+    return {
+        "schema_version": SURVEY_VERSION,
+        "arch_snapshot": cleaned.get("arch_snapshot", {}),
+        "components": cleaned.get("components") or [],
+        "entry_points": cleaned.get("entry_points") or [],
+        "high_risk_areas": high,
+        "recommended_actions": cleaned.get("recommended_actions") or [],
+        "summary": summary,
+    }
+
+
+def parse_survey_artifact(final_answer: str) -> dict | None:
+    """recon Final Answer → v3 survey 工件 dict(schema_version=3)。
+
+    防幻觉守护:findings 数组(任意层级)与 severity/confidence/verified/evidence/
+    rationale(任意层级)出现即拒绝并降级为 high_risk_areas 观察点 + summary 注明
+    (v2 兼容层已移除,旧 attack_surface 结构不再宽容转换)。解析彻底失败返回 None(调用方降级存 .md)。
+    """
+    obj = _extract_json_object(strip_fence(final_answer.strip()))
+    if obj is None:
+        return None
+    return _normalize_survey(obj)
+
+
+def save_survey(path: Path, agent: str, parsed: dict | None, raw: str) -> Path:
+    """recon v3 工件落盘:能解析按 survey 结构存 JSON,否则原文本存 .md 降级。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if parsed is not None:
+        out = dict(parsed)
+        out["schema_version"] = SURVEY_VERSION
+        out.setdefault("agent", agent)
+        for k, v in parsed.items():  # LLM 额外的健康顶层字段原样保留
+            out.setdefault(k, v)
+        path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        return path
+    md = path.with_suffix(".md")
+    md.write_text(f"# {agent} 原始输出(JSON 解析失败降级)\n\n{raw}\n", encoding="utf-8")
+    return md
+
+
+def load_survey(path: Path) -> dict | None:
+    """读回 survey 工件(宽容:失败/结构异常返回 None)。数组字段给默认空值。"""
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    obj.setdefault("schema_version", SURVEY_VERSION)
+    for k in ("components", "entry_points", "high_risk_areas", "recommended_actions"):
+        if not isinstance(obj.get(k), list):
+            obj[k] = []
+    if not isinstance(obj.get("arch_snapshot"), dict):
+        obj["arch_snapshot"] = {}
+    obj.setdefault("summary", "")
+    return obj
+
+
+def _resolve_survey_path(name_dir: Path) -> Path | None:
+    """定位实例目录下 recon 的 survey.json(v3 唯一命名,不回退旧 attack_surface.json)。
+
+    供 brief/聚合复用:读 sidecar 时统一经此定位。
+    """
+    p = name_dir / "survey.json"
+    return p if p.is_file() else None

@@ -80,7 +80,10 @@ class TerminalDisplay:
         return f"{code}{text}{_RESET}" if self.color else text
 
     def _emit(self, line: str) -> None:
-        print(line, file=self.out)
+        # flush=True:stdout 接管道/重定向/后台运行时 Python 走块缓冲,
+        # 不刷会把实时反馈积压到缓冲满才可见(2026-08-27 后台运行实测:
+        # STEP5_DISPLAY=1 但捕获输出零显示行,仅 stderr 的 llm-retry 可见)。
+        print(line, file=self.out, flush=True)
 
     def _clip(self, text: str, limit: int) -> str:
         """压成单行并截断;超长以省略号结尾(全文已由 obs/ 与 transcript 兜底)。"""

@@ -1,7 +1,7 @@
 """read_file:读 process/ 下工件文件(路径白名单防越界)。
 
 Agent 间"工件是唯一契约"的回查机制:下游 Agent 用它按需拉取
-attack_surface.json / findings.json / 反编译产物细节,不把整个工件塞进对话。
+survey.json / findings.json / 反编译产物细节,不把整个工件塞进对话。
 """
 from __future__ import annotations
 

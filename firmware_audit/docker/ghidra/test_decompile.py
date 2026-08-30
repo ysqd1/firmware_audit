@@ -59,18 +59,18 @@ def main():
             GHIDRA_IMAGE,
         ] + args
 
-        print(f"[测试] 运行: docker run --rm -v ... ghidra analyzeHeadless ...")
+        print("[测试] 运行: docker run --rm -v ... ghidra analyzeHeadless ...")
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         print(f"[测试] 退出码: {proc.returncode}")
         if proc.returncode != 0:
-            print(f"[测试] 失败!")
+            print("[测试] 失败!")
             print(f"[测试] stdout (最后500字符):\n{proc.stdout[-500:]}")
             print(f"[测试] stderr (最后500字符):\n{proc.stderr[-500:]}")
             sys.exit(1)
 
         # 验证产出
-        print(f"\n[验证] 检查产出文件...")
+        print("\n[验证] 检查产出文件...")
         expected = ["decompiled.c", "functions.json", "imports.json", "symbols.json"]
         all_ok = True
 

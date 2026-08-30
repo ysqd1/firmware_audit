@@ -1,14 +1,26 @@
-"""Step5 入口:三 Agent 串行控制流 + 断点续跑 + 无 key/API 失败立即终止。
+"""Step5 入口:Orchestrator 统一编排三 Agent + 断点续跑 + 无 key/API 失败立即终止。
 
-控制流(agents.md §二,Python 硬编码不用 LLM 调度):
-    recon → attack_surface.json → analysis → findings.json → verification
-          → verified_findings.json → report.md
+控制流(v3,2026-08-28,参考 deepaudit OrchestratorAgent 精简版):
+    Orchestrator(轻量 LLM 驱动,ReAct 循环)
+      → dispatch recon → survey.json(v3) → dispatch analysis
+      → findings.json → dispatch verification → verified_findings.json
+      → summarize(取报告素材)→ Final Answer = 最终报告 → orchestrator/report.md
 
-断点续跑:工件存在(.json 成功或 .md 降级均算)即跳过该 Agent;
-上游失败则中止链条(下游没输入,跑了也是空转)。
+编排痕迹:
+    process/agent/orchestrator/  {transcript, dispatch_log, handoff_*, report.md, result.json}
+    process/agent/<seq>_<type>/   子 Agent 的 transcript/obs/工件(如 0_recon/)
+
+最终报告: 由 orchestrator 的 summarize 动作产出(orchestrator/report.md);
+未产出时明确告警,不静默降级(原 render_report 已删除)。
+
+断点续跑:某子 Agent .json 工件存在即跳过;仅 .md 降级工件 → degraded(默认重跑,
+STEP5_RESUME_DEGRADED=0 关闭);上游缺件时下游被链路守卫拒绝(不空转)。
+
+planner="pipeline"(确定性快速模式):跳过 orchestrator LLM 循环,Python 按
+顺序门直接调度三 Agent(无编排轮次消耗);此模式不产 LLM 报告。
 
 用法:
-    python -m firmware_audit.step5_agent.run_step5 <dir> [--force]
+    python -m firmware_audit.step5_agent.run_step5 <dir> [--force] [--planner auto|pipeline]
     <dir> 可以是 target/<N>(内含 process/)或工作区本身(process/ 等价目录)
 环境变量:见 llm_client(FIRMWARE_AUDIT_LLM_API_KEY 等;无 key 或 API 调用失败均立即终止,不做降级)。
 密钥文件:firmware_audit/.env(LLMClient 构造时自动加载,环境变量优先于文件)。
@@ -19,8 +31,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from .orchestrator import Orchestrator, SubAgentResult
 from .providers.llm_client import LLMClient, LLMError
-from .runner import ALL_CONFIGS, AgentRunResult, render_report, run_agent
 
 
 def resolve_workspace(path: Path) -> Path:
@@ -32,19 +44,6 @@ def resolve_workspace(path: Path) -> Path:
     create <path>: invalid characters → exit 125(2026-08-19 实发)。"""
     process = path / "process"
     return (process if process.is_dir() else path).resolve()
-
-
-def artifact_done(path: Path) -> bool:
-    """工件已产出:.json(可解析)或 .md(降级)均算完成。"""
-    return path.is_file() or path.with_suffix(".md").is_file()
-
-
-def _tool_stats(r: AgentRunResult) -> dict[str, int]:
-    """阶段工具调用统计:{工具名: 次数}(无 react 的跳过阶段给空表)。"""
-    counts: dict[str, int] = {}
-    for c in (r.react.tool_calls if r.react else []):
-        counts[c["tool"]] = counts.get(c["tool"], 0) + 1
-    return counts
 
 
 def _no_key_error() -> LLMError:
@@ -71,10 +70,70 @@ def _no_key_error() -> LLMError:
         f"保存后直接重跑即可(自动加载,无需手动导出环境变量)")
 
 
-def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
-    """跑完整 Step5。返回摘要 dict(mode/stages/report)。
+def _tool_counts(tool_calls: list) -> dict[str, int]:
+    """子 Agent 工具调用统计:{工具名: 次数}(无工具给空表)。"""
+    counts: dict[str, int] = {}
+    for c in tool_calls:
+        counts[c.get("tool", "?")] = counts.get(c.get("tool", "?"), 0) + 1
+    return counts
+
+
+def _stages_summary(subs: list[SubAgentResult]) -> dict:
+    """SubAgentResult 列表 → step5_run 返回用的 stages 摘要。"""
+    stages = {}
+    for sub in subs:
+        rec = stages.setdefault(sub.agent_name, {
+            "ok": True, "error": "", "steps": 0, "tool_calls": {}})
+        rec["ok"] = rec["ok"] and sub.ok
+        rec["error"] = rec["error"] or sub.error
+        rec["steps"] += sub.steps
+        for tool, n in _tool_counts(sub.tool_calls).items():
+            rec["tool_calls"][tool] = rec["tool_calls"].get(tool, 0) + n
+    return stages
+
+
+def _run_pipeline(process_dir: Path, base, force: bool):
+    """确定性快速模式:Python 按顺序调度三 Agent(无 orchestrator LLM 轮次)。
+
+    沿用断点续跑/上游缺件拒绝语义(复用 DispatchAgentTool 守卫,留痕齐全),
+    但不跑协调器 ReAct 循环;不产 LLM 报告(缺失由 step5_run 告警)。
+    终态与 auto 模式对称落盘 orchestrator/result.json:聚合 findings 与各
+    阶段统计完整保留(与 summarize 缺失语义一致,供补跑/再编排)。
+    返回 Orchestrator 实例(不 run()),调用方取 dispatches/_agent_results。
+    """
+    orch = Orchestrator(process_dir, base, force=force)  # 只用其守卫与落盘,不 run()
+    from .orchestrator import DispatchAgentTool, SubAgentResult as _SAR
+    from .providers.tools import ToolContext
+
+    tool = DispatchAgentTool(ToolContext(process_dir=process_dir), orch)
+    planned = [("recon", "对解包固件做广度侦察,产出攻击面清单"),
+               ("analysis", "对攻击面疑点逐个取证,输出候选漏洞 findings"),
+               ("verification", "复核候选漏洞,过滤误报,输出 verified_findings")]
+    errors: dict[str, str] = {}
+    for agent, task in planned:
+        res = tool.execute(agent=agent, task=task, context="")
+        if not res.ok:
+            errors[agent] = res.error or "pipeline 阶段未完成"
+            print(f"[step5:pipeline] {agent} 未完成: {res.error}", flush=True)
+    # 被拒/未执行阶段也进 stages(调用方可区分"未规划"与"被拒")
+    for agent, err in errors.items():
+        if agent not in orch._agent_results:
+            orch._agent_results[agent] = _SAR(
+                seq=-1, agent_name=agent, status="failed", error=err,
+                request={"agent": agent, "task": dict(planned).get(agent, "")})
+    orch._success = not errors and all(
+        sub.ok for sub in orch.dispatches) and len(orch.dispatches) == len(planned)
+    orch._error = "; ".join(f"{a}: {e}" for a, e in errors.items())
+    orch._write_result(None)  # type: ignore[arg-type]  # transcript: pipeline 模式无
+    return orch
+
+
+def step5_run(target_dir: Path, force: bool = False, llm=None,
+              planner: str = "auto") -> dict:
+    """跑完整 Step5(Orchestrator 统一编排)。返回摘要 dict(mode/stages/report)。
     无 API key 或 API 调用失败时抛 LLMError(立即终止,不做降级)。
-    llm 用于测试注入(ScriptedLLM);None 时按环境变量建 LLMClient。"""
+    llm 用于测试注入(ScriptedLLM);None 时按环境变量建 LLMClient。
+    planner: "auto"=LLM 编排(默认,含 summarize 报告);"pipeline"=确定性快速模式。"""
     process_dir = resolve_workspace(Path(target_dir))
     if not (process_dir / "analysis").is_dir() and not (process_dir / "agent").is_dir():
         raise FileNotFoundError(f"工作区无 analysis/ 工件: {process_dir}(先跑 Step1-4)")
@@ -83,54 +142,63 @@ def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
     if not base.available:
         raise _no_key_error()
 
-    agent_dir = process_dir / "agent"
-    stages: dict[str, AgentRunResult] = {}
-    upstream_path: Path | None = None
+    if planner == "pipeline":
+        orch = _run_pipeline(process_dir, base, force)
+        report: Path | None = None  # pipeline 无 LLM 报告
+        subs = orch.dispatches
+        # stages 覆盖全部规划阶段(被拒阶段以 failed+error 呈现,与 result.json 对称)
+        stages = _stages_summary(list(orch._agent_results.values()))
+        usage_total = dict(getattr(base, "total_usage", {}))  # 与 auto 模式对称
+        tool_total: dict[str, int] = {}
+        for sub in subs:
+            for tool, n in _tool_counts(sub.tool_calls).items():
+                tool_total[tool] = tool_total.get(tool, 0) + n
+        print("[step5] 警告: pipeline 模式不产 LLM 总结报告"
+              "(verified_findings.json 已产出,详见 process/agent/)", file=sys.stderr)
+        return {
+            "mode": "pipeline",
+            "stages": stages,
+            "usage": usage_total,
+            "tool_calls": tool_total,
+            "report": None,
+        }
 
-    for cfg in ALL_CONFIGS:
-        out_path = agent_dir / cfg.output_name
-        if not force and artifact_done(out_path):
-            print(f"[step5:{cfg.name}] 工件已存在,跳过({out_path.name})")
-            stages[cfg.name] = AgentRunResult(cfg=cfg, artifact_path=out_path, skipped=True)
-            upstream_path = out_path
-            continue
+    orch = Orchestrator(process_dir, base, force=force)
+    orch.run()
 
-        if upstream_path is not None and not artifact_done(upstream_path):
-            # 前序失败且无降级产物:链条中止
-            stages[cfg.name] = AgentRunResult(
-                cfg=cfg, error=f"上游工件缺失({upstream_path.name}),中止")
-            break
+    stages = {
+        name: {
+            "ok": sub.ok,
+            "error": sub.error,
+            "steps": sub.steps,
+            "tool_calls": _tool_counts(sub.tool_calls),
+        } for name, sub in orch.agent_results.items()
+    }
 
-        result = run_agent(cfg, process_dir, base, upstream_path)
-        stages[cfg.name] = result
-        if result.artifact_path is None and not result.skipped:
-            break  # 该阶段彻底失败,下游无输入
-        upstream_path = result.artifact_path or out_path
-
-    note = "" if all(r.ok for r in stages.values()) else "部分阶段失败/降级,结论可能不完整"
-    report = render_report(process_dir, agent_note=note)
-
-    usage_total = {"prompt_tokens": 0, "completion_tokens": 0}
+    # LLM 用量:编排器与子 Agent 共享 base_llm,total_usage 已累计全部调用
+    # (2026-08-29 B2:此前仅按 sub.usage 累加,skipped/degraded 实例 usage 为空,
+    # 且 orchestrator 自身轮次从不计入——打印误导为 0)
+    usage_total = dict(getattr(base, "total_usage", {}))
     tool_total: dict[str, int] = {}
-    for r in stages.values():
-        for k in usage_total:
-            usage_total[k] += r.usage.get(k, 0)
-        for tool, n in _tool_stats(r).items():
+    for sub in orch.dispatches:  # 全部实际执行的调度(含同类型多次调用)均计入
+        for tool, n in _tool_counts(sub.tool_calls).items():
             tool_total[tool] = tool_total.get(tool, 0) + n
-    print(f"[step5] 完成,报告: {report}(LLM 用量: {usage_total},工具调用: {tool_total})")
+
+    report = orch.report_path
+    if report is None:
+        print("[step5] 警告: 编排未产出总结报告(orchestrator 未调用 summarize "
+              "或 Final Answer 为空);报告生成不完整。findings 与各阶段统计已完整"
+              "保留在 process/agent/orchestrator/result.json,可补跑再编排",
+              file=sys.stderr)
+    else:
+        print(f"[step5] 完成,报告: {report}"
+              f"(LLM 用量: {usage_total},工具调用: {tool_total})")
     return {
         "mode": "llm",
-        "stages": {
-            name: {
-                "ok": r.ok,
-                "error": r.error,
-                "steps": r.react.steps if r.react else 0,
-                "tool_calls": _tool_stats(r),
-            } for name, r in stages.items()
-        },
+        "stages": stages,
         "usage": usage_total,
         "tool_calls": tool_total,
-        "report": str(report),
+        "report": str(report) if report else None,
     }
 
 
@@ -139,10 +207,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("target_dir", type=Path,
                     help="target/<N> 目录或工作区目录(含 process/ 或本身即 process 等价)")
     ap.add_argument("--force", action="store_true", help="忽略已有工件,全部重跑")
+    ap.add_argument("--planner", choices=["auto", "pipeline"], default="auto",
+                    help="auto=LLM 编排+summarize 报告(默认);pipeline=确定性快速模式(无 LLM 报告)")
     args = ap.parse_args(argv)
 
     try:
-        summary = step5_run(args.target_dir, force=args.force)
+        summary = step5_run(args.target_dir, force=args.force, planner=args.planner)
     except LLMError as e:
         print(f"[step5] 终止: {e}", file=sys.stderr)
         return 2

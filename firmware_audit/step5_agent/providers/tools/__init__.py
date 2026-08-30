@@ -18,8 +18,10 @@ from .cve_lookup import CveLookupTool
 from .find_decompiled_function import FindDecompiledFunctionTool
 from .gitleaks_scan import GitleaksScanTool
 from .imports_query import ImportsQueryTool
+from .list_files import ListFilesTool
 from .read_file import ReadFileTool
 from .sandbox_verify import SandboxVerifyTool
+from .search_code import SearchCodeTool
 from .semgrep_scan import SemgrepScanTool
 from .strings_query import StringsQueryTool
 from .web_search import WebSearchTool
@@ -31,6 +33,8 @@ _DEFAULT_TOOLS: tuple[type[AgentTool], ...] = (
     ImportsQueryTool,
     StringsQueryTool,
     ReadFileTool,
+    ListFilesTool,
+    SearchCodeTool,
     ChecksecTool,
     XrefQueryTool,
     CveBinToolScanTool,
@@ -65,6 +69,7 @@ def make_tools(ctx: ToolContext, exclude: set[str] | None = None) -> dict[str, A
 
 __all__ = ["AgentTool", "ToolContext", "ToolResult", "make_tools",
            "FindDecompiledFunctionTool", "ImportsQueryTool", "StringsQueryTool",
-           "ReadFileTool", "ChecksecTool", "XrefQueryTool", "CveBinToolScanTool",
-           "CveLookupTool", "SemgrepScanTool", "GitleaksScanTool",
-           "SandboxVerifyTool", "BinwalkRescanTool", "WebSearchTool"]
+           "ReadFileTool", "ListFilesTool", "SearchCodeTool", "ChecksecTool",
+           "XrefQueryTool", "CveBinToolScanTool", "CveLookupTool",
+           "SemgrepScanTool", "GitleaksScanTool", "SandboxVerifyTool",
+           "BinwalkRescanTool", "WebSearchTool"]

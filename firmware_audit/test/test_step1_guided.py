@@ -22,6 +22,7 @@ from ..step1.step1_guided_extract import (
     _save_manifest,
     _MANIFEST_NAME,
 )
+import contextlib
 
 
 # --- M1: sniff_magic ---
@@ -150,10 +151,8 @@ class FakeExtractor:
 
     def __call__(self, path: Path, seq: int, parent: Path) -> tuple[list[Path], str]:
         head = b""
-        try:
+        with contextlib.suppress(OSError):
             head = path.read_bytes()[:4]
-        except OSError:
-            pass
         self.calls.append((path.name, seq, head))
 
         d = parent / f"{seq:06d}_{path.name}.extracted"

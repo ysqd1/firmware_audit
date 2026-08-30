@@ -86,9 +86,7 @@ def _is_decompiled_ok(fi: FileInfo, analysis_dir: Path) -> bool:
     if _extractinfo_version(c_path) != _EXTRACTINFO_VERSION:
         return False
     funcs_path = analysis_dir / f"{fi.rel_path}.functions.json"
-    if not funcs_path.exists() or funcs_path.stat().st_size <= 0:
-        return False
-    return True
+    return not (not funcs_path.exists() or funcs_path.stat().st_size <= 0)
 
 
 # analysis/ 下产物按"逻辑 rel_path 末尾后缀"反查归属。后缀互斥,一个文件只命中一种。
@@ -351,6 +349,7 @@ def decompile(
 
 # --- 文本类扫描 ---
 import re as _re
+import contextlib
 
 _TEXT_SCAN_MAX_FINDINGS = 50
 _TEXT_SCAN_MAX_BYTES = 1024 * 1024  # 超过 1MB 当二进制,不扫
@@ -399,10 +398,7 @@ _ELF_SCAN_MAX_FINDINGS = 200
 
 def _in_system_std(logical: str) -> bool:
     """逻辑路径是否落在系统标准配置目录下。"""
-    for d in _SYSTEM_STD_DIRS:
-        if logical == d or logical.startswith(d + "/"):
-            return True
-    return False
+    return any(logical == d or logical.startswith(d + "/") for d in _SYSTEM_STD_DIRS)
 
 
 def _scan_text(fi: FileInfo, analysis_dir: Path) -> None:
@@ -815,18 +811,14 @@ def _parse_ssh(fi: FileInfo) -> dict:
                 key = load_ssh_private_key(data, password=None)
                 info["parse_status"] = "ok"
                 info["algorithm"] = _key_algorithm(key)
-                try:
+                with contextlib.suppress(AttributeError):
                     info["key_size"] = key.key_size
-                except AttributeError:
-                    pass
             else:
                 key = load_ssh_public_key(data)
                 info["parse_status"] = "ok"
                 info["algorithm"] = _key_algorithm(key)
-                try:
+                with contextlib.suppress(AttributeError):
                     info["key_size"] = key.key_size
-                except AttributeError:
-                    pass
         except Exception as e:
             info["parse_status"] = "parse_error"
             info["message"] = str(e)[:200]
@@ -929,10 +921,8 @@ def _parse_private_key(fi: FileInfo) -> dict:
             info["format"] = "PEM"
             # 统一 _key_algorithm,避免 type().__name__ 产出 "rsaprivatekey" 非标准名
             info["algorithm"] = _key_algorithm(key)
-            try:
+            with contextlib.suppress(AttributeError):
                 info["key_size"] = key.key_size
-            except AttributeError:
-                pass
         except ValueError:
             # 可能是 DER 私钥或厂商格式
             info["parse_status"] = "unsupported"
@@ -966,10 +956,8 @@ def _parse_public_key(fi: FileInfo) -> dict:
                 info["parse_status"] = "ok"
                 info["format"] = fmt
                 info["algorithm"] = _key_algorithm(key)
-                try:
+                with contextlib.suppress(AttributeError):
                     info["key_size"] = key.key_size
-                except AttributeError:
-                    pass
                 break
             except ValueError:
                 continue
@@ -1030,10 +1018,8 @@ def _parse_legacy_cert(fi: FileInfo) -> dict:
                     info["issuer"] = obj.issuer.rfc4514_string()
                 else:  # 密钥
                     info["algorithm"] = _key_algorithm(obj)
-                    try:
+                    with contextlib.suppress(AttributeError):
                         info["key_size"] = obj.key_size
-                    except AttributeError:
-                        pass
                 return info
             except ValueError:
                 continue

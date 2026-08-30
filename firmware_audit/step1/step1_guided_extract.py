@@ -20,6 +20,7 @@ from pathlib import Path
 
 from ..docker.docker_utils import run_docker, docker_available
 from .file_magic import sniff_magic, preclassify, rule_decision
+import contextlib
 
 BINWALK_IMAGE = "binwalk"
 CONTAINER_WS = "/work/ws"
@@ -50,11 +51,9 @@ def _load_manifest(output_dir: Path) -> dict:
 
 def _save_manifest(output_dir: Path, manifest: dict) -> None:
     """写 manifest;失败不崩。"""
-    try:
+    with contextlib.suppress(OSError):
         (output_dir / _MANIFEST_NAME).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
-    except OSError:
-        pass
 
 
 def _binwalk_extract_one(path: Path, seq: int, parent: Path) -> tuple[list[Path], str]:

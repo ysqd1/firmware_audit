@@ -236,6 +236,34 @@ def test_display_none_no_regression() -> list[str]:
     return fails
 
 
+class _FlushCounting(io.StringIO):
+    """统计 flush 次数的输出流:验证 _emit 每行都刷(管道/后台不积压)。"""
+
+    def __init__(self):
+        super().__init__()
+        self.flushes = 0
+
+    def flush(self) -> None:
+        self.flushes += 1
+        super().flush()
+
+
+def test_emit_flushes_stream() -> list[str]:
+    """实时反馈守护(2026-08-27):stdout 被管道/重定向时 Python 走块缓冲,
+    _emit 必须 flush——否则后台运行/CI 日志要等缓冲满才可见(实测踩坑)。"""
+    fails: list[str] = []
+    out = _FlushCounting()
+    d = TerminalDisplay(mode="compact", use_color=False, width=100, out=out)
+    d.stage("recon", "侦察", 8, "m", 20)
+    d.assistant(1, "Thought: x\nAction: echo\nAction Input: {}")
+    d.observation(1, "echo", "ok", True, 0.1)
+    d.final(2, '{"findings": []}')
+    d.done("recon", "a.json", 0, 2, {})
+    if out.flushes < 5:
+        fails.append(f"每个事件都应 flush(实时性,至少 5 行),got {out.flushes} 次")
+    return fails
+
+
 # ---- runner 端到端(真实编排层走 make_display) ----
 
 def test_runner_banner_end_to_end(capsys) -> list[str]:
@@ -253,19 +281,25 @@ def test_runner_banner_end_to_end(capsys) -> list[str]:
         os.environ["STEP5_DISPLAY"] = "compact"
         with tempfile.TemporaryDirectory() as td:
             target = _make_process(Path(td))
+            D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
             llm = ScriptedLLM([
+                D % "recon",
                 'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5}',
                 RECON_FINAL,
+                D % "analysis",
                 'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 5}',
                 ANALYSIS_FINAL,
+                D % "verification",
                 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}',
                 VERIFY_FINAL,
+                'Final Answer: {"summary": "完成", "conclusion": ""}',
             ])
             step5_run(target, llm=llm)
         out = capsys.readouterr().out
         for want in ("── recon · 侦察", "── analysis · 深度分析",
-                     "── verification · 复核",
-                     "调用  read_file", "recon 完成 · attack_surface.json"):
+                     "── verification · 复核", "── orchestrator · 编排",
+                     "调用  read_file", "调用  dispatch_agent",
+                     "recon 完成 · survey.json"):
             if want not in out:
                 fails.append(f"runner 端到端缺: {want!r}")
     finally:

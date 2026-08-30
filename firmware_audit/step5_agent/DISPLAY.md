@@ -44,12 +44,12 @@ STEP5_DISPLAY=0 python -m firmware_audit.main target/1
 
 ```
 ── recon · 侦察 ──────────────────────────
-   工具 8 · 模型 deepseek-v4-flash · 迭代上限 20
+   工具 6 · 模型 deepseek-v4-flash · 迭代上限 20
 [01] 思考  先看工件
 [01] 调用  read_file({"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5})
 [01] 结果  OK 0.02s · [analysis/unitree/bin/idlc.imports.json 第 1-1 行,共 1 行]
 [02] 结论  1 findings(详见工件)
-── recon 完成 · attack_surface.json · 1 findings · 2 轮 · 0.0s · 0 tokens
+── recon 完成 · survey.json · 1 findings · 2 轮 · 0.0s · 0 tokens
 
 ── analysis · 深度分析 ──────────────────────────
 [01] 思考  取证

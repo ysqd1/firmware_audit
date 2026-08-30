@@ -1,7 +1,8 @@
 """transcript 落盘与 Observation 全文持久化(L3 持久化层)。
 
 Transcript 封装一个 Agent 运行的全部磁盘痕迹:
-  - <name>/transcript.jsonl  逐轮事件流(assistant/tool/observation/协议错误)
+  - <name>/transcript.jsonl  逐轮事件流(assistant/tool/observation/协议错误),
+    每条带 ts 时间戳;assistant 事件带 in_chars/usage/elapsed(LLM 调用留痕)
   - <name>/obs/step<N>_<tool>.txt  每次工具结果的未截断全文(回读通道)
 
 路径约定:transcript.jsonl 位于 process/agent/<name>/ 下,obs/ 与其同层;
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 
@@ -35,11 +37,13 @@ class Transcript:
         self.path = path
 
     def log(self, step: int, phase: str, content: str, **extra) -> None:
-        """追加一条 JSONL 事件。content 截 4000 字符防单条爆文件。"""
+        """追加一条 JSONL 事件(带 ts 时间戳;content 截 4000 字符防单条爆文件)。"""
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)  # 独立调用无 runner 预建
-        entry = {"step": step, "phase": phase, "content": content[:4000], **extra}
+        entry = {"step": step, "phase": phase,
+                 "ts": datetime.now().isoformat(timespec="seconds"),
+                 "content": content[:4000], **extra}
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# ruff: noqa: F821  # getScriptArgs/currentProgram/basestring/unicode 由 Ghidra Jython 环境注入/为 py2 兼容,勿改
 # ExtractInfo.py - Ghidra Headless program info extraction script
 #
 # Purpose: extract decompiled C / functions.json / imports.json / symbols.json

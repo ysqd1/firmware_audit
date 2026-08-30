@@ -30,6 +30,7 @@ import struct
 import sys
 import zlib
 from pathlib import Path
+import contextlib
 
 # 分区签名扫描上限:ext4 superblock(0x438)、squashfs/FAT/ELF 头都在分区前 64KB,
 # 不必读 64MB(老实现 15 分区 × 64MB = ~1GB IO,对几百 GB 镜像浪费在无意义读盘)。
@@ -306,12 +307,8 @@ def should_extract(kind, size, max_size_gb):
     if kind in ("bootloader", "kernel", "esp", "small", "medium"):
         return True
 
-    # rootfs 如果不超过限制就提取
-    if kind == "rootfs" and size <= max_size_bytes:
-        return True
-
-    # recovery 通常较大但有价值，如果不超过限制就提取
-    if kind == "recovery" and size <= max_size_bytes:
+    # rootfs/recovery 价值高但体积大,不超过限制才提取
+    if kind in ("rootfs", "recovery") and size <= max_size_bytes:  # noqa: SIM103 —— 多守卫提前 return 结构,直返会丢可读性
         return True
 
     # userdata 和超大分区跳过
@@ -394,57 +391,48 @@ def scan_partition_signatures(f, partition, max_scan=_MAX_SIGNATURE_SCAN):
             signatures.append("squashfs (big-endian)")
 
     # gzip
-    if len(data) >= 2:
-        if data[0:2] == b"\x1f\x8b":
-            signatures.append("gzip compressed")
+    if len(data) >= 2 and data[0:2] == b"\x1f\x8b":
+        signatures.append("gzip compressed")
 
     # xz
-    if len(data) >= 6:
-        if data[0:6] == b"\xfd7zXZ\x00":
-            signatures.append("xz compressed")
+    if len(data) >= 6 and data[0:6] == b"\xfd7zXZ\x00":
+        signatures.append("xz compressed")
 
     # lzma
-    if len(data) >= 4:
-        if data[0:1] == b"\x5d":
-            signatures.append("lzma (possible)")
+    if len(data) >= 4 and data[0:1] == b"\x5d":
+        signatures.append("lzma (possible)")
 
     # Android bootimg(内核 + ramdisk + dtb,头部魔数 "ANDROID!")
     # 实测 g1 镜像 recovery 分区即此格式(file 输出 "Android bootimg")
-    if len(data) >= 8:
-        if data[0:8] == b"ANDROID!":
-            signatures.append("Android bootimg")
+    if len(data) >= 8 and data[0:8] == b"ANDROID!":
+        signatures.append("Android bootimg")
 
     # U-Boot uImage
-    if len(data) >= 4:
-        if data[0:4] == b"\x27\x05\x19\x56":
-            signatures.append("U-Boot uImage")
+    if len(data) >= 4 and data[0:4] == b"\x27\x05\x19\x56":
+        signatures.append("U-Boot uImage")
 
     # FAT(FAT12/16: 0x36 处 "FAT";FAT32: 0x52 处 "FAT32" 8 字节字段,
     # "FAT32" 后跟空格填充——实测 esp 分区 0x52 为 b"FAT32   \x0e\x1f",
     # 精确匹配会失败,必须用 in)
     # 注意: 跳转指令首字节是 0xEB/0xE9(不是 ASCII "EB" 0x45 0x42),
     # 且不能用 data[0:3] in (b"\xeb",) —— 3 字节切片永远不等于 1 字节。
-    if len(data) >= 3:
-        if data[0] in (0xEB, 0xE9):
-            if len(data) > 0x52 and b"FAT32" in data[0x52:0x5A]:
-                signatures.append("FAT32 filesystem")
-            elif len(data) > 0x36 and b"FAT" in data[0x36:0x3F]:
-                signatures.append("FAT filesystem")
+    if len(data) >= 3 and data[0] in (0xEB, 0xE9):
+        if len(data) > 0x52 and b"FAT32" in data[0x52:0x5A]:
+            signatures.append("FAT32 filesystem")
+        elif len(data) > 0x36 and b"FAT" in data[0x36:0x3F]:
+            signatures.append("FAT filesystem")
 
     # NTFS
-    if len(data) >= 8:
-        if data[3:11] == b"NTFS    ":
-            signatures.append("NTFS filesystem")
+    if len(data) >= 8 and data[3:11] == b"NTFS    ":
+        signatures.append("NTFS filesystem")
 
     # ELF
-    if len(data) >= 4:
-        if data[0:4] == b"\x7fELF":
-            signatures.append("ELF executable")
+    if len(data) >= 4 and data[0:4] == b"\x7fELF":
+        signatures.append("ELF executable")
 
     # cpio
-    if len(data) >= 6:
-        if data[0:6] == b"070701":
-            signatures.append("cpio archive")
+    if len(data) >= 6 and data[0:6] == b"070701":
+        signatures.append("cpio archive")
 
     # 如果没识别到，标记为 unknown
     if not signatures:
@@ -642,10 +630,8 @@ def extract_partitions_from_image(
             if not _verify_extracted(img_path, p["offset"], p["size"], out_file):
                 print(f"[Step0] 错误: 分区 {out_file.name} 提取后回读校验失败,"
                       "删除(内容不可信)")
-                try:
+                with contextlib.suppress(OSError):
                     out_file.unlink()
-                except OSError:
-                    pass
                 continue
             extracted.append({
                 "file": str(out_file),

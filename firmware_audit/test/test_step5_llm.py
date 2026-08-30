@@ -1,4 +1,4 @@
-﻿"""Step5 LLMClient 重试机制单测(打桩 urlopen 与 sleep,零真实等待/零真实 API)。
+"""Step5 LLMClient 重试机制单测(打桩 urlopen 与 sleep,零真实等待/零真实 API)。
 
 覆盖:不可重试 HTTP 立即终止不重试 / 可重试错误按 10-20s 间隔自动重试且可恢复 /
 全部重试耗尽后抛含最终详情的 LLMError / 空回复属可重试 / 间隔常量合法性 /
@@ -31,6 +31,14 @@ def _empty_body() -> bytes:
     return json.dumps({
         "choices": [{"message": {"content": "", "reasoning_content": ""}}],
         "usage": {},
+    }).encode("utf-8")
+
+
+def _reasoning_body(reasoning: str, content: str = "") -> bytes:
+    return json.dumps({
+        "choices": [{"message": {"content": content,
+                                 "reasoning_content": reasoning}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
     }).encode("utf-8")
 
 
@@ -149,6 +157,35 @@ def test_empty_reply_is_retryable() -> list[str]:
     return fails
 
 
+def test_reasoning_split_return() -> list[str]:
+    """2026-08-30 拆分语义:chat 只返回正文,思考随 usage.reasoning_content 携带。
+
+    防止推理段的"草稿 Action"被 ReAct 解析器当真实调用执行。"""
+    fails: list[str] = []
+    with _stub_net([_reasoning_body(
+        "内部思考草稿 Action: echo", "Thought: 查\nAction: echo\nAction Input: {}")], []) as net:
+        content, usage = _client().chat([{"role": "user", "content": "hi"}])
+        if "草稿" in content or content.strip() != "Thought: 查\nAction: echo\nAction Input: {}":
+            fails.append(f"chat 应只返回正文: {content!r}")
+        if usage.get("reasoning_content") != "内部思考草稿 Action: echo":
+            fails.append(f"思考应随 usage.reasoning_content 提供: {usage}")
+    return fails
+
+
+def test_empty_content_with_reasoning_retries() -> list[str]:
+    """2026-08-30:content 空但思考非空 → 不得拿思考顶替当回复,应走空回复重试。"""
+    fails: list[str] = []
+    sleeps: list[float] = []
+    with _stub_net([_reasoning_body("想了很多但没写正文"), _ok_body("second")],
+                   sleeps) as net:
+        content, _ = _client().chat([{"role": "user", "content": "hi"}])
+        if content != "second" or net.calls != 2:
+            fails.append(f"正文为空应重试: calls={net.calls} content={content!r}")
+        if sleeps != [lc.RETRY_INTERVALS[0]]:
+            fails.append(f"应触发一次重试等待: {sleeps}")
+    return fails
+
+
 def test_intervals_in_range_and_logs() -> list[str]:
     fails: list[str] = []
     if len(lc.RETRY_INTERVALS) != lc.MAX_RETRIES:
@@ -160,12 +197,9 @@ def test_intervals_in_range_and_logs() -> list[str]:
     sleeps: list[float] = []
     buf = io.StringIO()
     behaviors = [urllib.error.HTTPError("u", 503, "NA", None, io.BytesIO(b"down"))]
-    with _stub_net(behaviors, sleeps):
-        with contextlib.redirect_stderr(buf):
-            try:
-                _client().chat([{"role": "user", "content": "hi"}])
-            except LLMError:
-                pass
+    with _stub_net(behaviors, sleeps), contextlib.redirect_stderr(buf), \
+        contextlib.suppress(LLMError):
+        _client().chat([{"role": "user", "content": "hi"}])
     log = buf.getvalue()
     for needle in ("[llm-retry]", "HTTP 503", "1/3", "10s 后重试"):
         if needle not in log:
@@ -182,6 +216,8 @@ def test_main() -> int:
         ("retry_then_success", test_retry_then_success),
         ("exhaust_all_retries", test_exhaust_all_retries),
         ("empty_reply_is_retryable", test_empty_reply_is_retryable),
+        ("reasoning_split_return", test_reasoning_split_return),
+        ("empty_content_with_reasoning_retries", test_empty_content_with_reasoning_retries),
         ("intervals_in_range_and_logs", test_intervals_in_range_and_logs),
     ]:
         fl = fn()

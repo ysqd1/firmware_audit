@@ -22,6 +22,8 @@ from firmware_audit.step5_agent.data.artifacts import (
     save_artifact,
 )
 from firmware_audit.step5_agent.engine.context import ContextManager, est_tokens
+from firmware_audit.step5_agent.orchestrator import DispatchAgentTool, Orchestrator
+from firmware_audit.step5_agent.providers.tools import ToolContext
 from firmware_audit.test.scripted_llm import ScriptedLLM
 from firmware_audit.step5_agent.run_step5 import step5_run
 
@@ -47,6 +49,23 @@ def _make_process(td: Path) -> Path:
 
 
 RECON_FINAL = 'Final Answer: {"summary": "攻击面:1 个自研二进制,导入 system", "findings": [{"title": "危险函数导入 system", "severity": "high", "file": "unitree/bin/idlc", "evidence": "imports ref_count=2"}], "components": [{"name": "idlc", "version": "", "cve": [], "source": "strings"}]}'
+
+# recon v3 正统输出:无 findings/判级字段,结构 = survey schema v3
+RECON_FINAL_V3 = ('Final Answer: {"schema_version": 3, '
+                  '"summary": "自研二进制 idlc + web 入口,存在注入模式命中", '
+                  '"arch_snapshot": {"top_level_dirs": ["unitree", "etc"], '
+                  '"components_grouped": [{"name": "idlc", "size": 40960, '
+                  '"role": "web server", "role_evidence": ["binds TCP/80 (imports)"]}], '
+                  '"os_or_runtime": "busybox-linux"}, '
+                  '"components": [{"name": "busybox", "version": "1.34", "cve": [], '
+                  '"source": "cve_bin_tool_scan"}], '
+                  '"entry_points": [{"file": "etc/init.d/lighttpd", "reason": "web/cgi 入口"}], '
+                  '"high_risk_areas": [{"file": "unitree/bin/idlc", "metric": "注入模式命中", '
+                  '"detail": "semgrep R2 @ unitree/bin/idlc:42"}], '
+                  '"recommended_actions": [{"priority": "high", '
+                  '"action": "对 unitree/bin/idlc 用 find_decompiled_function 取证,关注 system 拼接"}]}')
+
+ANALYSIS_EXTRA_FINAL = 'Final Answer: {"summary": "补跑取证", "findings": [{"title": "fb2", "severity": "medium", "file": "unitree/bin/idlc", "evidence": "strings 命中", "confidence": "low"}]}'
 
 ANALYSIS_FINAL = 'Final Answer: {"summary": "取证完成", "findings": [{"title": "main 经 system 执行拼接命令", "severity": "high", "file": "unitree/bin/idlc", "func": "main", "addr": "0010d000", "evidence": "decompile: system(cmd)", "confidence": "medium"}, {"title": "硬编码口令", "severity": "high", "file": "unitree/bin/idlc", "evidence": "password=unitree2018", "confidence": "low"}]}'
 
@@ -102,13 +121,15 @@ def test_save_load_summary() -> list[str]:
         parsed = parse_artifact('{"summary": "摘要X", "findings": [{"title": "标题Y", "severity": "high", "zzz": 1}]}')
         save_artifact(p, "recon", parsed, "raw")
         obj = load_artifact(p)
-        if obj is None or obj.get("schema") != 1:
-            fails.append(f"回读缺 schema: {obj and obj.get('schema')}")
+        if obj is None or obj.get("schema") != 2:
+            fails.append(f"回读缺 schema: 2, got {obj and obj.get('schema')}")
         if obj["agent"] != "recon" or obj["summary"] != "摘要X":
             fails.append("agent/summary 回读不符")
         f0 = obj["findings"][0]
         if f0["title"] != "标题Y" or f0.get("extras") != {"zzz": 1}:
             fails.append(f"finding 回读不符: {f0}")
+        if f0.get("source_agent") != "recon":
+            fails.append(f"finding 应带 source_agent 溯源(schema v2): {f0.get('source_agent')}")
         text = artifact_summary(p)
         if "摘要X" not in text or "[high] 标题Y" not in text:
             fails.append(f"摘要应含 summary 与 finding 行: {text[:80]}")
@@ -173,7 +194,7 @@ def test_compaction_boundary_and_failure() -> list[str]:
     n_before = len(cm2.recent)
     if cm2.maybe_compact(BoomLLM([])):
         fails.append("LLM 失败时 compact 应返回 False")
-    if len(cm2.recent) != n_before or not cm2.summaries == []:
+    if len(cm2.recent) != n_before or cm2.summaries != []:
         fails.append("压缩失败必须还原保留区")
     return fails
 
@@ -181,112 +202,246 @@ def test_compaction_boundary_and_failure() -> list[str]:
 # ---- pipeline 全链路 ----
 
 def test_full_chain_and_resume() -> list[str]:
+    """Orchestrator 全链路(recon→analysis→verification)→finish,含断点续跑(子 Agent 跳过)。"""
     fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
     with tempfile.TemporaryDirectory() as td:
         target = _make_process(Path(td))
-        # 2026-08-18 工具先行守卫:零工具 Final 会被拒绝退回,故每 Agent 先调一次
-        # read_file(真实工具)再收尾——脚本顺序 = recon工具,recon终,analysis工具,
-        # analysis终,verify工具,verify终;chat 索引据此为 0/1,2/3,4/5。
-        llm = ScriptedLLM([
+        # 脚本顺序(共享一个 ScriptedLLM):orchestrator 决策 + 子 Agent(工具+终)交错。
+        # orchestrator 每轮一次调用,dispatch 同步跑子 Agent(各 2 次调用)。
+        # v3: 收尾前加 summarize(取报告素材)→ Final Answer 即报告正文。
+        S = 'Thought: 收尾\nAction: summarize\nAction Input: {"conclusion": "全链路完成"}'
+        REPORT_MD = ('Final Answer: # 固件安全审计报告\n## 发现清单\n'
+                     '- [high] ✓ main 经 system 注入(unitree/bin/idlc)\n'
+                     '## 误报剔除\n- 实为默认文档示例\n复核完成')
+        h = [
+            D % "recon",        # 0 orchestrator 调度 recon
             'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}',
-            RECON_FINAL,
+            RECON_FINAL,        # 2 recon 终
+            D % "analysis",     # 3 orchestrator 调度 analysis
             'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 10}',
-            ANALYSIS_FINAL,
+            ANALYSIS_FINAL,     # 5 analysis 终
+            D % "verification",  # 6 orchestrator 调度 verification
             'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 10}',
-            VERIFY_FINAL,
-        ])
+            VERIFY_FINAL,       # 8 verification 终
+            S,                  # 9 orchestrator summarize(取素材)
+            REPORT_MD,          # 10 Final Answer = 报告正文
+        ]
+        llm = ScriptedLLM(h)
         summary = step5_run(target, llm=llm)
         if summary["mode"] != "llm":
             fails.append(f"应走 LLM 模式: {summary['mode']}")
+        if not summary.get("report"):
+            fails.append("summarize 后应产出报告路径")
         agent = target / "process" / "agent"
 
-        surf = load_artifact(agent / "attack_surface.json")
+        # 规范化目录:子 Agent 按 <seq>_<type> 落盘;recon v3 工件名 survey.json
+        surf = load_artifact(agent / "0_recon" / "survey.json")
         if surf is None or surf.get("components") != [{"name": "idlc", "version": "", "cve": [], "source": "strings"}]:
-            fails.append(f"attack_surface 缺 components 或内容不符: {surf and surf.get('components')}")
-        find = load_artifact(agent / "findings.json")
+            fails.append(f"0_recon survey 缺 components 或内容不符: {surf and surf.get('components')}")
+        find = load_artifact(agent / "1_analysis" / "findings.json")
         if find is None or len(find["findings"]) != 2:
-            fails.append(f"findings 应有 2 条: {find and len(find['findings'])}")
-        ver = load_artifact(agent / "verified_findings.json")
+            fails.append(f"1_analysis findings 应有 2 条: {find and len(find['findings'])}")
+        ver = load_artifact(agent / "2_verification" / "verified_findings.json")
         if ver is None:
-            fails.append("verified_findings 缺失")
+            fails.append("2_verification verified_findings 缺失")
         else:
             v_counts = [f.get("verified") for f in ver["findings"]]
             if v_counts != [True, False]:
                 fails.append(f"verified 标记应 1 真 1 假: {v_counts}")
 
-        # 下游简报注入:analysis 首轮 init 应含上游摘要与工件名
-        analysis_init = llm.calls[2][1]["content"]
-        if "attack_surface.json" not in analysis_init or "攻击面" not in analysis_init:
-            fails.append(f"analysis 简报应含上游摘要: {analysis_init[:100]}")
-        verify_init = llm.calls[4][1]["content"]
+        # orchestrator 目录三件套
+        for fn in ("transcript.jsonl", "dispatch_log.json", "result.json"):
+            if not (agent / "orchestrator" / fn).is_file():
+                fails.append(f"orchestrator/{fn} 缺失")
+
+        # 下游简报注入:analysis 首轮 init 应含上游摘要与工件名(recon v3 = survey.json)
+        analysis_init = llm.calls[4][1]["content"]
+        if "survey.json" not in analysis_init or "攻击面" not in analysis_init:
+            fails.append(f"analysis 简报应含上游 survey 摘要: {analysis_init[:100]}")
+        verify_init = llm.calls[7][1]["content"]
         if "findings.json" not in verify_init or "取证完成" not in verify_init:
             fails.append("verification 简报应含 findings 摘要")
 
-        # 每阶段各 1 次 read_file,全局合计 3(工具先行守卫的副作用验证)
-        for stage in ("recon", "analysis", "verification"):
-            st = summary["stages"][stage]["tool_calls"]
-            if st.get("read_file") != 1:
-                fails.append(f"{stage} 应各 1 次 read_file, got {st}")
-        if summary["tool_calls"].get("read_file") != 3:
-            fails.append(f"全局 read_file 合计应为 3, got {summary['tool_calls']}")
-
-        # 三 Agent transcript 落盘
-        for name in ("recon", "analysis", "verification"):
-            tr = agent / name / "transcript.jsonl"
+        # 子 Agent transcript 落盘(编号目录) + orchestrator transcript
+        for base in ("0_recon", "1_analysis", "2_verification"):
+            tr = agent / base / "transcript.jsonl"
             if not tr.is_file():
-                fails.append(f"{name} transcript 缺失")
+                fails.append(f"{base} transcript 缺失")
                 continue
             phases = [json.loads(l)["phase"] for l in tr.read_text(encoding="utf-8").splitlines()]
             if "assistant" not in phases:
-                fails.append(f"{name} transcript 无 assistant 记录: {phases}")
+                fails.append(f"{base} transcript 无 assistant 记录: {phases}")
 
-        # 报告:成立节 + 误报分节
-        report = (agent / "report.md").read_text(encoding="utf-8")
+        # 报告(v3):orchestrator summarize 产出,位于 orchestrator/report.md
+        report = (agent / "orchestrator" / "report.md").read_text(encoding="utf-8")
         if "✓" not in report or "main 经 system" not in report:
             fails.append("报告应含已证实发现(✓)")
         if "误报剔除" not in report or "实为默认文档示例" not in report:
-            fails.append("报告应含误报分节与 rationale")
+            fails.append("报告应含误报分节")
         if "复核完成" not in report:
-            fails.append("报告概要应含 verification summary")
+            fails.append("报告正文应含 verification summary 字样")
+        if summary["report"] != str(agent / "orchestrator" / "report.md"):
+            fails.append(f"summary['report'] 应指向 orchestrator/report.md: {summary['report']}")
+        # 续跑后旧 report.md 不冒充新报告:本轮未删旧文件,但 result.json 记录 report_path
+        res = json.loads((agent / "orchestrator" / "result.json").read_text(encoding="utf-8"))
+        if not res.get("summarize_called") or not res.get("report_path"):
+            fails.append("result.json 应记录 summarize_called 与 report_path")
 
-        # 断点续跑:三工件齐 → 全跳过,LLM 零调用
-        llm2 = ScriptedLLM([])
+        # 断点续跑:三编号工件齐 → 子 Agent 全跳过,仅 orchestrator 消耗 5 次决策
+        llm2 = ScriptedLLM([D % "recon", D % "analysis", D % "verification",
+                            S, REPORT_MD])
         s2 = step5_run(target, llm=llm2)
-        if llm2.calls:
-            fails.append("工件齐备时续跑不应调 LLM")
+        if len(llm2.calls) != 5:
+            fails.append(f"续跑 orchestrator 应 5 次调用(子 Agent 全跳过+summarize), got {len(llm2.calls)}")
         stages = s2.get("stages", {})
         if not stages or not all(v.get("ok") for v in stages.values()):
             fails.append(f"续跑各阶段应 ok: {stages}")
     return fails
 
 
-def test_fresh_run_with_tool_call() -> list[str]:
-    """recon 先调一次 read_file(真实工具)再收尾,验证工具分发在编排层也通。
-    2026-08-18 工具先行守卫:三 Agent 均需先调工具再 Final,脚本同步升级。"""
+def test_recon_v3_orchestration_boundary() -> list[str]:
+    """Task4/5 集成:recon v3 + analysis 编排后 _all_findings 仅含 analysis/verification
+    条目(recon 只铺面不判级,聚合唯一来源 = analysis/verification);磁盘 survey.json
+    不含 findings 键——orchestrator dispatch 后的 instance_seq 回填对 recon 跳过,
+    load_artifact 注入的空 findings:[] 不会被写回工件。
+    Task8.1 补维度:判级/证据链字段(severity/confidence/verified/evidence/rationale)
+    任意层级不出现(递归扫键);analysis 能消费(ScriptedLLM 跑 analysis 的首轮
+    简报非空且含 recon v3 摘要关键词)。"""
     fails: list[str] = []
+    TOOL = ('Thought: 先看工件\nAction: read_file\nAction Input: '
+            '{"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}')
+    with tempfile.TemporaryDirectory() as td:
+        target = _make_process(Path(td))
+        process = target / "process"
+        llm = ScriptedLLM([TOOL, RECON_FINAL_V3, TOOL, ANALYSIS_FINAL])
+        orch = Orchestrator(process, llm)
+        tool = DispatchAgentTool(ToolContext(process_dir=process), orch)
+        tool.execute(agent="recon", task="广度侦察")
+        tool.execute(agent="analysis", task="逐点取证")
+        # findings 唯一来源 = analysis/verification:recon v3(含 v2 残留)不进聚合
+        expect = {"main 经 system 执行拼接命令", "硬编码口令"}
+        titles = {f.get("title") for f in orch.all_findings}
+        if titles != expect:
+            fails.append(f"_all_findings 应仅含 analysis 条目 {sorted(expect)}, got {sorted(titles)}")
+        for f in orch.all_findings:
+            if f.get("source_agent") != "analysis" or f.get("instance_seq") != 1:
+                fails.append(f"聚合条目应溯源 analysis/实例1: {f.get('title')}")
+                break
+        # 磁盘 survey.json:v3 无 findings 键(即便 orchestrator 跑过回填逻辑)
+        surf_file = process / "agent" / "0_recon" / "survey.json"
+        if not surf_file.is_file():
+            fails.append("recon v3 应产出 0_recon/survey.json")
+        else:
+            surf = json.loads(surf_file.read_text(encoding="utf-8"))
+            if "findings" in surf:
+                fails.append(f"survey.json 磁盘工件不得被塞入 findings 键: {sorted(surf)}")
+            if surf.get("schema_version") != 3:
+                fails.append(f"survey 应为 schema_version=3: {surf.get('schema_version')}")
+            for k in ("entry_points", "high_risk_areas", "recommended_actions", "components"):
+                if not surf.get(k):
+                    fails.append(f"survey 工件缺 v3 结构键内容 {k}")
+
+            # Task8.1:判级/证据链字段任意层级不出现(递归扫全部键;role_evidence
+            # 是 v3 合法键,不在禁止集——按精确键名比对,不做子串匹配)
+            def _walk_keys(node):
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        yield k
+                        yield from _walk_keys(v)
+                elif isinstance(node, list):
+                    for item in node:
+                        yield from _walk_keys(item)
+
+            banned = ({"findings", "severity", "confidence", "verified",
+                       "evidence", "rationale"} & set(_walk_keys(surf)))
+            if banned:
+                fails.append(f"survey 工件任意层级不得出现判级/证据链键: {sorted(banned)}")
+        # Task8.1:analysis 能消费——首轮简报非空且含 recon v3 摘要关键词
+        # (调用序:0/1=recon 工具+终;2=analysis 首轮,init = calls[2][1])
+        a1_brief = llm.calls[2][1]["content"]
+        if not a1_brief.strip():
+            fails.append("analysis 首轮简报不应为空(recon v3 工件可被消费)")
+        for needle in ("entry_points", "high_risk_areas", "recommended_actions",
+                       "etc/init.d/lighttpd"):
+            if needle not in a1_brief:
+                fails.append(f"analysis 简报应含 recon v3 摘要关键词 '{needle}': {a1_brief[:160]}")
+                break
+    return fails
+
+
+def test_redispatch_analysis_brief_carries_recon_summary() -> list[str]:
+    """Task4 上下文流转契约:补跑 analysis(第 2 次调度,上游为前次 findings.json)的
+    init 简报仍携带同一份 recon 摘要(entry_points/high_risk_areas/recommended_actions/
+    components),不依赖首个实例的私有上下文;首次简报与补跑简报同源。"""
+    fails: list[str] = []
+    TOOL = ('Thought: 先看工件\nAction: read_file\nAction Input: '
+            '{"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}')
+    with tempfile.TemporaryDirectory() as td:
+        target = _make_process(Path(td))
+        process = target / "process"
+        llm = ScriptedLLM([TOOL, RECON_FINAL_V3, TOOL, ANALYSIS_FINAL,
+                           TOOL, ANALYSIS_EXTRA_FINAL])
+        orch = Orchestrator(process, llm)
+        tool = DispatchAgentTool(ToolContext(process_dir=process), orch)
+        tool.execute(agent="recon", task="t0")
+        tool.execute(agent="analysis", task="t1")
+        tool.execute(agent="analysis", task="t2-补跑")   # 不同任务 → 允许第 2 次调度
+        # 调用序:0/1=recon,2/3=analysis#1,4/5=analysis#2(补跑);init = calls[N][1]
+        a1_init = llm.calls[2][1]["content"]
+        a2_init = llm.calls[4][1]["content"]
+        for needle in ("entry_points", "etc/init.d/lighttpd", "high_risk_areas",
+                       "unitree/bin/idlc", "recommended_actions", "busybox v1.34"):
+            if needle not in a2_init:
+                fails.append(f"补跑 analysis 简报应含 recon 摘要 '{needle}': {a2_init[:200]}")
+                break
+        # 首次简报同样携带 v3 结构摘要(同一来源)
+        for needle in ("etc/init.d/lighttpd", "high_risk_areas", "recommended_actions"):
+            if needle not in a1_init:
+                fails.append(f"首次 analysis 简报应含 v3 recon 摘要 '{needle}': {a1_init[:200]}")
+                break
+        # 补跑简报两类信息并存:前次 findings 摘要(上游)+ recon 摘要(附加)
+        if "取证完成" not in a2_init:
+            fails.append(f"补跑简报应含前次 analysis findings 摘要: {a2_init[:200]}")
+        # 同源:两实例携带的 recon 摘要特征行一致(同一份,而非各自拼凑)
+        for line in ("etc/init.d/lighttpd(web/cgi 入口)",
+                     "unitree/bin/idlc — 注入模式命中"):
+            if line not in a1_init or line not in a2_init:
+                fails.append(f"两实例简报应含同一条 recon 摘要行 '{line}'")
+    return fails
+
+
+def test_fresh_run_with_tool_call() -> list[str]:
+    """recon 先调一次 read_file(真实工具)再收尾,验证工具分发在 orchestrator 编排下也通。"""
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
     with tempfile.TemporaryDirectory() as td:
         target = _make_process(Path(td))
         llm = ScriptedLLM([
+            D % "recon",        # 0
             'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 10}',
-            RECON_FINAL,
+            RECON_FINAL,        # 2
+            D % "analysis",     # 3
             'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}',
-            ANALYSIS_FINAL,
+            ANALYSIS_FINAL,     # 5
+            D % "verification",  # 6
             'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.functions.json", "limit": 10}',
-            VERIFY_FINAL,
+            VERIFY_FINAL,       # 8
+            'Final Answer: {"summary": "完成", "conclusion": ""}',  # 9
         ])
         summary = step5_run(target, llm=llm)
-        obs = llm.calls[1][-1]["content"]
+        # recon 末轮 chat 的最后一条消息 = read_file 的 Observation
+        obs = llm.calls[2][-1]["content"]
         if "password=unitree2018" not in obs:
             fails.append(f"read_file Observation 应含字符串值: {obs[:120]}")
-        surf = load_artifact(target / "process" / "agent" / "attack_surface.json")
+        surf = load_artifact(target / "process" / "agent" / "0_recon" / "survey.json")
         if surf is None:
             fails.append("带工具调用的 recon 未产出工件")
-        # summary 统计:recon 阶段应记 1 次 read_file,全局合计一致
         recon_stats = summary["stages"]["recon"]["tool_calls"]
         if recon_stats.get("read_file") != 1:
             fails.append(f"recon tool_calls 应为 {{read_file: 1}}, got: {recon_stats}")
         if summary["tool_calls"].get("read_file") != 3:
-            fails.append(f"全局 tool_calls 合计错误(三 Agent 各 1 次 read_file): {summary['tool_calls']}")
+            fails.append(f"全局 tool_calls 合计错误(三子 Agent 各 1 次 read_file): {summary['tool_calls']}")
         if summary["stages"]["recon"]["steps"] < 1:
             fails.append(f"recon steps 应 ≥1, got: {summary['stages']['recon']['steps']}")
     return fails
@@ -358,7 +513,11 @@ def test_no_key_error_locates_env_file() -> list[str]:
 
 
 def test_tool_permissions_and_threshold() -> list[str]:
-    """权限矩阵与压缩阈值守护:CFG 工具 ⊆ 注册表;新增授权到位;阈值=600k。"""
+    """权限矩阵与压缩阈值守护:CFG 工具 ⊆ 注册表;新增授权到位;阈值=600k。
+
+    v3(2026-08-28)权限收敛:recon 移除 strings_query/imports_query/checksec
+    (深挖归 analysis/verification),list_files 三 Agent 全授权。
+    """
     fails: list[str] = []
     from firmware_audit.step5_agent.runner import ALL_CONFIGS
     from firmware_audit.step5_agent.providers.tools import make_tools
@@ -370,16 +529,110 @@ def test_tool_permissions_and_threshold() -> list[str]:
         unregistered = tools - registry
         if unregistered:
             fails.append(f"{name} 引用未注册工具: {sorted(unregistered)}")
+    # recon 收敛:三个深挖工具不得在 recon 手里
+    for t in ("strings_query", "imports_query", "checksec"):
+        if t in perms.get("recon", set()):
+            fails.append(f"recon 不应再持有 {t}(v3 收敛,深挖归 analysis/verification)")
+    # list_files: 三 Agent 全授权
+    for name in ("recon", "analysis", "verification"):
+        if "list_files" not in perms.get(name, set()):
+            fails.append(f"{name} 应授权 list_files(全 Agent 开放)")
     if "checksec" not in perms.get("analysis", set()):
         fails.append("analysis 应授权 checksec")
     if not {"strings_query", "imports_query"} <= perms.get("verification", set()):
         fails.append("verification 应授权 strings_query/imports_query")
+
+    # recon 工具集精确匹配(spec v3)
+    if perms.get("recon") != {"list_files", "read_file", "cve_bin_tool_scan",
+                              "semgrep_scan", "gitleaks_scan", "binwalk_rescan"}:
+        fails.append(f"recon 工具集应为 6 件套: {sorted(perms.get('recon', set()))}")
+
+    # search_code:analysis/verification 授权,recon 不授权(铺面不正文检索)
+    if "search_code" not in perms.get("analysis", set()):
+        fails.append("analysis 应授权 search_code")
+    if "search_code" not in perms.get("verification", set()):
+        fails.append("verification 应授权 search_code")
+    if "search_code" in perms.get("recon", set()):
+        fails.append("recon 不应授权 search_code(铺面枚举阶段不做正文检索)")
+
+    # v3 守护:recon max_iters 保持 20(spec 明确不变)
+    from firmware_audit.step5_agent.runner import RECON_CFG
+    if RECON_CFG.max_iters != 20:
+        fails.append(f"RECON_CFG.max_iters 应保持 20, got {RECON_CFG.max_iters}")
 
     cm = ContextManager("s", "i")
     threshold = int(cm.max_est_tokens * cm.trigger_ratio)
     if threshold != 600_000:
         fails.append(f"压缩阈值应为 600k, got {threshold}"
                      f"(window={cm.max_est_tokens}, ratio={cm.trigger_ratio})")
+    return fails
+
+
+def test_recon_system_prompt_needles() -> list[str]:
+    """v3 recon 提示词重构守护:首动 list_files/防幻觉红线/components 规则齐备。"""
+    fails: list[str] = []
+    from firmware_audit.step5_agent.data.prompts import RECON_SYSTEM
+    for needle in ("list_files", "枚举", "防幻觉红线", "禁止猜测", "cve_bin_tool_scan",
+                   "components", "禁止凭记忆补 CVE"):
+        if needle not in RECON_SYSTEM:
+            fails.append(f"RECON_SYSTEM 应含 '{needle}'")
+    # 深挖工具不得再出现在 recon 提示词的流程指引里(已移出工具集)
+    for banned_tool_call in ("imports_query 查", "strings_query 按", "checksec 看"):
+        if banned_tool_call in RECON_SYSTEM:
+            fails.append(f"RECON_SYSTEM 不应再指引 '{banned_tool_call}'(v3 收敛)")
+    return fails
+
+
+def test_analysis_verify_prompt_examples() -> list[str]:
+    """✅/❌ 正误对照 + Harness 模板守护(2026-08-28 学 deepaudit)。
+
+    - 两 Agent 均含正误对照(❌ 形态:Markdown 加粗/角括号/散文开场/自写 Observation)
+    - VERIFY 含 Fuzzing Harness 模板(mock 危险函数+多 payload+判定读输出)
+    """
+    fails: list[str] = []
+    from firmware_audit.step5_agent.data.prompts import ANALYSIS_SYSTEM, VERIFY_SYSTEM
+    for name, prompt in (("ANALYSIS_SYSTEM", ANALYSIS_SYSTEM),
+                         ("VERIFY_SYSTEM", VERIFY_SYSTEM)):
+        if "✅ 正确" not in prompt or "❌ 错误" not in prompt:
+            fails.append(f"{name} 应含正误对照示例(✅/❌)")
+        # ❌ 反例必须列出这三类协议漂移形态
+        if "Markdown 加粗" not in prompt:
+            fails.append(f"{name} ❌ 应列出 Markdown 加粗形态")
+        if "XML 角括号" not in prompt and "<Thought>" not in prompt:
+            fails.append(f"{name} ❌ 应列出 XML 角括号形态")
+        if "散文" not in prompt:
+            fails.append(f"{name} ❌ 应列出计划散文开头形态")
+    # VERIFY 专属:Harness 模板 + Final Answer 正误
+    for needle in ("Fuzzing Harness 模板", "sandbox_verify", "subprocess.run",
+                   "[VULN]", "[DETECTED]", "; id", "$(id)",
+                   "✅ 正确 Final Answer", "围栏"):
+        if needle not in VERIFY_SYSTEM:
+            fails.append(f"VERIFY_SYSTEM 应含 '{needle}'")
+    # analysis 的 ❌ 应含自写 Observation 形态(2026-08-20 实测坑)
+    if "自写/预写 Observation" not in ANALYSIS_SYSTEM:
+        fails.append("ANALYSIS_SYSTEM ❌ 应列出自写 Observation 形态")
+    return fails
+
+
+def test_v1_artifact_compat_read() -> list[str]:
+    """v1 工件(无 source_agent/instance_seq)兼容读:补默认值,消费方无感。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "old.json"
+        # v1 形态:schema 1,finding 无溯源字段
+        p.write_text(json.dumps({
+            "schema": 1, "agent": "recon", "summary": "旧工件",
+            "findings": [{"title": "老发现", "severity": "high"}],
+        }), encoding="utf-8")
+        obj = load_artifact(p)
+        if obj is None:
+            fails.append("v1 工件应可读")
+        else:
+            f0 = obj["findings"][0]
+            if f0.get("source_agent") != "recon":
+                fails.append(f"v1 兼容读应补 source_agent=工件 agent: {f0.get('source_agent')}")
+            if "instance_seq" not in f0:
+                fails.append("v1 兼容读应补 instance_seq 键(None)")
     return fails
 
 
@@ -450,9 +703,14 @@ def test_main() -> int:
         ("build_messages_partitions", test_build_messages_partitions),
         ("compaction_boundary_and_failure", test_compaction_boundary_and_failure),
         ("full_chain_and_resume", test_full_chain_and_resume),
+        ("recon_v3_orchestration_boundary", test_recon_v3_orchestration_boundary),
+        ("redispatch_analysis_brief_carries_recon_summary", test_redispatch_analysis_brief_carries_recon_summary),
         ("fresh_run_with_tool_call", test_fresh_run_with_tool_call),
         ("no_key_error_locates_env_file", test_no_key_error_locates_env_file),
         ("tool_permissions_and_threshold", test_tool_permissions_and_threshold),
+        ("recon_system_prompt_needles", test_recon_system_prompt_needles),
+        ("analysis_verify_prompt_examples", test_analysis_verify_prompt_examples),
+        ("v1_artifact_compat_read", test_v1_artifact_compat_read),
         ("compact_at_600k_threshold", test_compact_at_600k_threshold),
         ("resolve_workspace_absolute", test_resolve_workspace_absolute),
     ]:

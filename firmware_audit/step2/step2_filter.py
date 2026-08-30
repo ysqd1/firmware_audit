@@ -166,10 +166,7 @@ CONFIG_EXTENSIONS = {
 def _is_system_trust(rel_path: str) -> bool:
     """判断逻辑路径是否落在系统信任库目录下。"""
     logical = _logical_path(rel_path)
-    for d in SYSTEM_TRUST_DIRS:
-        if logical == d or logical.startswith(d + "/"):
-            return True
-    return False
+    return any(logical == d or logical.startswith(d + "/") for d in SYSTEM_TRUST_DIRS)
 
 
 def _is_whitelisted(rel_path: str) -> bool:
@@ -183,10 +180,7 @@ def _is_whitelisted(rel_path: str) -> bool:
         if logical == w or logical.startswith(w + "/"):
             return True
     # etc 敏感配置
-    for w in WHITELIST_ETC:
-        if logical == w or logical.startswith(w + "/"):
-            return True
-    return False
+    return any(logical == w or logical.startswith(w + "/") for w in WHITELIST_ETC)
 
 
 def _is_blacklisted(rel_path: str) -> bool:
@@ -195,10 +189,7 @@ def _is_blacklisted(rel_path: str) -> bool:
     for b in BLACKLIST_DIRS:
         if logical.startswith(b + "/") or logical == b:
             return True
-    for p in BLACKLIST_PATTERNS:
-        if p in logical:
-            return True
-    return False
+    return any(p in logical for p in BLACKLIST_PATTERNS)
 
 
 def _is_build_artifact(rel_path: str) -> bool:
@@ -207,10 +198,7 @@ def _is_build_artifact(rel_path: str) -> bool:
     命中即排除,优先级高于白名单。只匹配明确构建产物,不含 .a/.o(可能有审计价值)。
     """
     logical = _logical_path(rel_path)
-    for p in BUILD_ARTIFACT_PATTERNS:
-        if p in logical:
-            return True
-    return False
+    return any(p in logical for p in BUILD_ARTIFACT_PATTERNS)
 
 
 def _is_system_std(rel_path: str) -> bool:
@@ -221,10 +209,7 @@ def _is_system_std(rel_path: str) -> bool:
     白名单(WHITELIST_ETC)优先于本名单,故必须保留的敏感配置不受影响。
     """
     logical = _logical_path(rel_path)
-    for d in SYSTEM_STD_DIRS:
-        if logical == d or logical.startswith(d + "/"):
-            return True
-    return False
+    return any(logical == d or logical.startswith(d + "/") for d in SYSTEM_STD_DIRS)
 
 
 def _has_cert_extension(name: str) -> bool:
@@ -304,9 +289,7 @@ def _is_elf_dup_candidate(name: str) -> bool:
     if n.endswith(_ELF_DUP_SUFFIXES):
         return True
     # .so.N 或 .so.N.M(如 libddsc.so.0、libglog.so.0.5.0)
-    if ".so." in n and n.rpartition(".so.")[2].replace(".", "").isdigit():
-        return True
-    return False
+    return bool(".so." in n and n.rpartition(".so.")[2].replace(".", "").isdigit())
 
 
 def _is_base_name(a: str, b: str) -> bool:

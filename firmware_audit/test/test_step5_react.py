@@ -51,6 +51,41 @@ class BigTool(AgentTool):
         return ToolResult(ok=True, text=body)
 
 
+class FakeFS(AgentTool):
+    """模拟固件目录结构的 list_files(测试用,不打真盘)。"""
+
+    name = "list_files"
+    description = "test"
+    params_doc = ""
+
+    def _run(self, **kw) -> ToolResult:
+        table = {
+            ".": "[. 列出 5 项(上限 50)]\nagent/\nanalysis/\nextracted/\nfileinfo.json",
+            "extracted": "[extracted 列出 8 项(上限 50)]\nextracted/etc/\nextracted/unitree/",
+            "extracted/unitree": "[extracted/unitree 列出 3 项(上限 50)]\nextracted/unitree/bin/",
+            "extracted/unitree/module": "[extracted/unitree/module 列出 2 项(上限 50)]\nnet_switcher/",
+        }
+        return ToolResult(ok=True, text=table.get(kw.get("directory"), "[]"))
+
+
+class ReasoningLLM(ScriptedLLM):
+    """ScriptedLLM + 思考注入:content 是正文,思考随 usage.reasoning_content 返回。
+
+    模拟 llm_client 拆分后的真实语义(2026-08-30),供循环级验证:
+    思考草稿不参与解析、不进上下文,仅 transcript 留档。"""
+
+    def __init__(self, replies: list[str], reasoning: str = ""):
+        super().__init__(replies)
+        self._reasoning = reasoning
+
+    def chat(self, messages: list[dict], **kw) -> tuple[str, dict]:
+        content, usage = super().chat(messages, **kw)
+        if self._reasoning:
+            usage = dict(usage)
+            usage["reasoning_content"] = self._reasoning
+        return content, usage
+
+
 def _tools():
     ctx = ToolContext(process_dir=Path("."))
     return {"echo": EchoTool(ctx), "boom": FailTool(ctx)}
@@ -88,6 +123,73 @@ def test_parse_reply() -> list[str]:
         # 大小写变体
         ("<action>echo</action>\n<action input>{\"n\": 1}</action input>",
          ("action", 'echo|{"n": 1}')),
+        # B1(2026-08-29 实发):行首锚定——句内 "Final Answer:" 字样不匹配
+        ("句中提到 Final Answer: 协议说明 不做\nFinal Answer: ok",
+         ("final", "ok")),
+        # B1:多个行首 Final Answer 块 → 取最后一个(模型收尾前自写草稿)
+        ("Thought: 先写\nFinal Answer: {\"summary\": \"半成品\"}\n"
+         "Final Answer: {\"summary\": \"成品\", \"findings\": []}",
+         ("final", '{"summary": "成品", "findings": []}')),
+        # B1 经典场景:超长报告散文里最终才出现 Final Answer(行首),前文垃圾不入 payload
+        ("作为开头？让我尝试严格按照协议格式输出。\n"
+         "Final Answer: # 报告\n## 正文\n- 发现1",
+         ("final", "# 报告\n## 正文\n- 发现1")),
+        # function-calling 串扰(2026-08-29 recon 实发 [03]):<tool_call> JSON 应还原为 action
+        ("Now let me look at unitree/bin.\n<tool_call>\n"
+         '{"name": "list_files", "arguments": {"directory": "extracted/unitree/bin", '
+         '"recursive": false, "max_files": 50}}\n</tool_call>',
+         ("action", 'list_files|{"directory": "extracted/unitree/bin", '
+                    '"recursive": false, "max_files": 50}')),
+        # 同一形态,多个 tool_call → 只取第一个(单轮单动作纪律由后续轮次纠正)
+        ("<tool_call>{\"name\": \"list_files\", \"arguments\": {\"directory\": \".\"}}</tool_call>\n"
+         "<tool_call>{\"name\": \"read_file\", \"arguments\": {\"path\": \"x\"}}</tool_call>",
+         ("action", 'list_files|{"directory": "."}')),
+        # arguments 为字符串形态
+        ("<tool_call>{\"name\": \"echo\", \"arguments\": \"hi\"}</tool_call>",
+         ("action", "echo|hi")),
+        # arguments 缺失 → 空参数,仍还原为 action
+        ("<tool_call>{\"name\": \"finish\"}</tool_call>",
+         ("action", "finish|{}")),
+        # ---- 2026-08-30 recon 实发 [03][07][10][14]:<reasoning>/<text> 包装 ----
+        # 包装标签独占一行 + 内部严格两行 Action → 剥标签后照常解析
+        ("<reasoning>\n先看顶层结构。\n</reasoning>\n<text>\n"
+         'Action: list_files\nAction Input: {"directory": ".", "recursive": false, "max_files": 50}\n</text>',
+         ("action", 'list_files|{"directory": ".", "recursive": false, "max_files": 50}')),
+        # <text> 包裹 Final Answer → 剥标签后仍是 final
+        ("<text>\nFinal Answer: {\"summary\": \"ok\"}\n</text>",
+         ("final", '{"summary": "ok"}')),
+        # [11] 实发布局:Thought 后直接 <text>,Action 在标签内部两行
+        ("Thought: <text>\nAction: read_file\n"
+         'Action Input: {"path": "extracted/unitree/module/net_switcher/net_switcher.py"}\n</text>',
+         ("action", 'read_file|{"path": "extracted/unitree/module/net_switcher/net_switcher.py"}')),
+        # 包装 + 单行 Action(fc 惯性):"Action: 工具({JSON})" → 兜底还原
+        ("<reasoning>unitree 是重点。</reasoning>\n<text>\n"
+         'Action: list_files({"directory": "extracted/unitree", "recursive": false, "max_files": 50})\n</text>',
+         ("action", 'list_files|{"directory": "extracted/unitree", "recursive": false, "max_files": 50}')),
+        # 裸单行 Action:JSON 与 Action 同行(无标签) → 兜底还原
+        ("Thought: 下钻 unitree。\n"
+         'Action: list_files {"directory": "extracted/unitree", "recursive": true}',
+         ("action", 'list_files|{"directory": "extracted/unitree", "recursive": true}')),
+        # 包装内只有计划散文(无协议块)→ 仍判 fail(不误吞,正确语义)
+        ("<reasoning>extracted 有 8 项,unitree 是重点。</reasoning>\n"
+         "<text>下一步应下钻 unitree/ 目录查看厂商程序。</text>",
+         ("fail", None)),
+        # 仅 "Action: 名字" 且无参数 JSON → 保持 fail(单行兜底要配平到 dict 才接受)
+        ("Action: echo", ("fail", None)),
+        # <tool_call> 缺闭标签 + arguments 内嵌套花括号 → 配平提取(旧成对正则救不了)
+        ("<tool_call>{\"name\": \"list_files\", "
+         '"arguments": {"directory": "we{rd}/x", "recursive": false}}',
+         ("action", 'list_files|{"directory": "we{rd}/x", "recursive": false}')),
+        # 重复 Action 块(模型整块自重复)→ 取首个截断,第二个块不进 raw
+        ("Action: read_file\nAction Input: {\"path\": \"a\"}\n"
+         "Action: read_file\nAction Input: {\"path\": \"a\"}",
+         ("action", 'read_file|{"path": "a"}')),
+        # JSON 字符串内联 "<text>" 字样不被剥(包装标签剥离是行锚定,防误伤)
+        ('Final Answer: {"summary": "see <text> here"}',
+         ("final", '{"summary": "see <text> here"}')),
+        # 裸 JSON(无 <tool_call> 标签)不做解码(避免误吞散文),维持 fail 语义
+        ('{"name": "list_files", "arguments": {}}',
+         ("fail", None)),
     ]
     for reply, (want_kind, want_payload) in cases:
         kind, payload = parse_reply(reply)
@@ -166,6 +268,84 @@ def test_parse_fail_recovery() -> list[str]:
     return fails
 
 
+def test_wrapper_drift_recon_flow() -> list[str]:
+    """2026-08-30 recon 实录场景端到端回归:<reasoning>/<text> 包装、
+    单行 Action(fc 惯性)与一次"纯散文"协议失败,循环都能正确走完。
+
+    对应终端 [03][07][10][14]:失败紧跟在 list_files 观察之后;修复后
+    包装+单行形态直接解析成功,仅"包装内纯散文"仍按协议失败回喂(不误吞)——
+    模型下一轮自纠,流程整体零中断收尾。
+    """
+    fails: list[str] = []
+    tools = {"list_files": FakeFS(ToolContext(process_dir=Path(".")))}
+    llm = ScriptedLLM([
+        # [01] 包装 + 严格两行 Action
+        "<reasoning>\n先枚举顶层目录结构。\n</reasoning>\n<text>\n"
+        "Action: list_files\nAction Input: {\"directory\": \".\", "
+        "\"recursive\": false, \"max_files\": 50}\n</text>",
+        # [02] 包装 + 单行 Action("Action: 工具({JSON})",fc 惯性)→ 现在能解析
+        "<reasoning>extracted 有 2 个顶层目录。</reasoning>\n<text>\n"
+        "Action: list_files({\"directory\": \"extracted\", "
+        "\"recursive\": false, \"max_files\": 50})\n</text>",
+        # [03]=复现:包装里只有计划散文、无协议块 → 协议失败回喂(修复后仍按
+        #    语义判 fail,模型自纠);此前 [03][07][10][14] 同型
+        "<reasoning>unitree 是最高优先级。</reasoning>\n"
+        "<text>下一步应下钻 unitree/ 目录,查看厂商自研二进制与模块。</text>",
+        # 受回喂纠正后的合规两行 Action
+        "Thought: 下钻 unitree。\nAction: list_files\n"
+        "Action Input: {\"directory\": \"extracted/unitree\", "
+        "\"recursive\": false, \"max_files\": 50}",
+        # 单行 Action(无标签)继续下钻 module
+        "Thought: 看模块清单。\n"
+        "Action: list_files {\"directory\": \"extracted/unitree/module\", "
+        "\"recursive\": false, \"max_files\": 50}",
+        "Final Answer: {\"summary\": \"侦察完成\", \"findings\": []}",
+    ])
+    r = run_react_agent(llm, tools, "sys", "init", max_iters=10)
+    if not r.ok:
+        fails.append(f"包装漂移流程应正常收尾: steps={r.steps} finished={r.finished}")
+    # 4 次 list_files 成功执行([01][02][04][05];[03] 判失败未调工具)
+    if len(r.tool_calls) != 4:
+        fails.append(f"应执行 4 次 list_files, got {len(r.tool_calls)}: {r.tool_calls}")
+    # 协议失败确实回喂过(第 4 次 LLM 调用:失败在第 3 次回复解析时发生,回喂后进入第 4 轮)
+    if not llm.calls[3][-1]["content"].startswith("Observation: [协议错误]"):
+        fails.append(f"纯散文应回喂协议错误: {llm.calls[3][-1]['content'][:60]!r}")
+    return fails
+
+
+def test_reasoning_kept_out_of_context() -> list[str]:
+    """2026-08-30 正文/思考拆分:思考草稿只入 transcript,不参与解析、不回喂上下文。"""
+    fails: list[str] = []
+    import json as _json
+
+    llm = ReasoningLLM([
+        "Thought: 查真参数。\nAction: echo\nAction Input: {\"q\": \"real\"}",
+        "Final Answer: 完成",
+    ], reasoning="草稿里想先试 echo q=draft。")
+    with tempfile.TemporaryDirectory() as td:
+        tr = Path(td) / "t.jsonl"
+        r = run_react_agent(llm, _tools(), "sys", "init", max_iters=5, transcript=tr)
+        if not r.ok:
+            fails.append(f"应正常收尾: steps={r.steps}")
+        # 第 2 轮 messages:思考(含草稿)不得回喂上下文
+        ctx = [m.get("content", "") for m in llm.calls[1]]
+        if any("draft" in c or "草稿" in c for c in ctx):
+            fails.append("思考不应回喂到上下文")
+        # 实际执行的是正文参数 real,草稿 draft 未被执行
+        if not any("'q', 'real'" in c for c in ctx):
+            fails.append("应执行正文参数 real")
+        if any("'q', 'draft'" in c for c in ctx):
+            fails.append("草稿参数 draft 不应出现在调用中")
+        # transcript:assistant 条目保留思考全文(留档审计)
+        entries = [_json.loads(l) for l in tr.read_text(encoding="utf-8").splitlines()]
+        first = next(e for e in entries if e.get("phase") == "assistant")
+        if "草稿" not in first.get("content", ""):
+            fails.append("transcript 应保留思考全文")
+        if first.get("usage", {}).get("reasoning_content") is not None:
+            fails.append("usage 中的 reasoning_content 应被 pop(避免 JSONL 冗余)")
+    return fails
+
+
 def test_persistent_fail_terminates() -> list[str]:
     fails: list[str]
     # 连续协议失败达 MAX_PARSE_FAILS(现为 4)次 → 强制收尾仍失败 → finished=False。
@@ -174,10 +354,7 @@ def test_persistent_fail_terminates() -> list[str]:
     from firmware_audit.step5_agent.engine.protocol import MAX_PARSE_FAILS
     llm = ScriptedLLM(["nope"] * (MAX_PARSE_FAILS + 1))
     r = run_react_agent(llm, _tools(), "sys", "init", max_iters=10)
-    if r.finished:
-        fails = ["连续协议失败应终止且 finished=False"]
-    else:
-        fails = []
+    fails = ["连续协议失败应终止且 finished=False"] if r.finished else []
     return fails
 
 
@@ -392,6 +569,44 @@ def test_last_round_notice_and_summary_force() -> list[str]:
     return fails
 
 
+def test_force_final_30_rounds() -> list[str]:
+    """r5(2026-08-29):ANALYSIS_CFG.max_iters=30 的 30 轮专项强制收尾用例。
+
+    脚本:每轮都发 Action(共 30 条,参数逐一不同以避开同参循环守卫),
+    强制收尾轮前才给 Final Answer。断言:
+    第 30 轮 LLM 调用注入 LAST_ROUND_NOTICE(最后一轮提示);
+    第 31 轮调用前由 FORCE_FINAL_PROMPT 兜底强制要求 Final Answer;
+    最终 ReactResult.steps==30 且 finished=True。
+    """
+    fails: list[str] = []
+    from firmware_audit.step5_agent.engine.react_loop import (
+        FORCE_FINAL_PROMPT, LAST_ROUND_NOTICE,
+    )
+
+    acts = [f"Action: echo\nAction Input: {{\"q\": \"x{i}\"}}" for i in range(30)]
+    acts.append("Final Answer: 30轮强制收尾结论")
+    llm = ScriptedLLM(acts)
+    r = run_react_agent(llm, _tools(), "sys", "init", max_iters=30)
+
+    # 第 30 轮(max_iters)LLM 调用前注入 LAST_ROUND_NOTICE(最后一轮提示)
+    if not any("最后一次循环机会" in m.get("content", "")
+               or "最后一轮" in m.get("content", "") for m in llm.calls[29]):
+        fails.append("第 30 轮 messages 应注入 LAST_ROUND_NOTICE(最后一轮提示)")
+    if not any("最后" in m.get("content", "") for m in llm.calls[29]):
+        fails.append("第 30 轮 messages 应含最后一轮相关提示")
+    # 第 31 轮(强制收尾)调用前由 FORCE_FINAL_PROMPT 兜底
+    if not any("已达到迭代上限" in m.get("content", "") for m in llm.calls[30]):
+        fails.append("第 31 轮调用前应注入 FORCE_FINAL_PROMPT 兜底")
+    # 强制收尾后 steps 精确停在 30,finished 为 True,产出最终结论
+    if r.steps != 30:
+        fails.append(f"steps 应为 30, got {r.steps}")
+    if not r.finished:
+        fails.append("强制收尾应让 finished=True")
+    if r.final_answer != "30轮强制收尾结论":
+        fails.append(f"应产出 30 轮强制收尾结论: {r.final_answer!r}")
+    return fails
+
+
 def test_system_prompt_budget_injection() -> list[str]:
     """r3(2026-08-19):build_system_prompt 将 max_iters 变量注入系统提示词。"""
     fails: list[str] = []
@@ -418,6 +633,8 @@ def test_main() -> int:
         ("parse_action_input", test_parse_action_input),
         ("normal_loop", test_normal_loop),
         ("parse_fail_recovery", test_parse_fail_recovery),
+        ("wrapper_drift_recon_flow", test_wrapper_drift_recon_flow),
+        ("reasoning_kept_out_of_context", test_reasoning_kept_out_of_context),
         ("persistent_fail_terminates", test_persistent_fail_terminates),
         ("iter_limit_force_final", test_iter_limit_force_final),
         ("unknown_tool_and_crash", test_unknown_tool_and_crash),
@@ -426,6 +643,7 @@ def test_main() -> int:
         ("truncate_headtail_and_obs_fulltext", test_truncate_headtail_and_obs_fulltext),
         ("obs_readback_via_read_file", test_obs_readback_via_read_file),
         ("last_round_notice_and_summary_force", test_last_round_notice_and_summary_force),
+        ("force_final_30_rounds", test_force_final_30_rounds),
         ("system_prompt_budget_injection", test_system_prompt_budget_injection),
     ]:
         fl = fn()

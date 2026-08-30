@@ -216,6 +216,152 @@ def test_make_tools_exclude() -> list[str]:
     return fails
 
 
+def test_list_files() -> list[str]:
+    """list_files(参考 deepaudit ListFiles):目录/递归/排除/截断/越界(纯离线)。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # 造树:bin(脚本)、usr/lib(应被排除)、module(脚本)
+        (root / "bin").mkdir()
+        (root / "bin" / "svc").write_text("#!/bin/sh", encoding="utf-8")
+        (root / "usr" / "lib" / "x86_64").mkdir(parents=True)
+        (root / "usr" / "lib" / "x86_64" / "libc.so").write_text("x", encoding="utf-8")
+        (root / "module").mkdir()
+        (root / "module" / "net.py").write_text("print(1)", encoding="utf-8")
+        ctx = ToolContext(process_dir=root)
+        t = ctx and make_tools(ctx)["list_files"]
+
+        # 顶层枚举:目录项带 /
+        r = t.execute(directory=".")
+        if not r.ok or "bin/" not in r.text or "usr/" not in r.text:
+            fails.append(f"顶层枚举应含目录项: {r.text[:120]}")
+
+        # 递归:usr/lib 被排除,module 下钻可见
+        r2 = t.execute(directory=".", recursive=True)
+        if "libc.so" in r2.text:
+            fails.append("recursive 应排除 usr/lib(SDK/系统库)")
+        if "module/net.py" not in r2.text or "bin/svc" not in r2.text:
+            fails.append(f"recursive 应列出非排除目录文件: {r2.text[:150]}")
+
+        # pattern 过滤
+        r3 = t.execute(directory="module", pattern="*.py")
+        if not r3.ok or "net.py" not in r3.text:
+            fails.append(f"pattern 过滤失败: {r3.text[:80]}")
+
+        # max_files 截断提示
+        r4 = t.execute(directory=".", recursive=True, max_files=2)
+        if r4.ok and "截断" not in r4.text:
+            fails.append(f"超上限应提示截断: {r4.text[-120:]}")
+
+        # 越界/不存在(失败不崩)
+        r5 = t.execute(directory="../outside")
+        if r5.ok or "越界" not in (r5.error or ""):
+            fails.append(f"越界应拒绝: {r5.error}")
+        r6 = t.execute(directory="no/such/dir")
+        if r6.ok or "不存在" not in (r6.error or ""):
+            fails.append(f"不存在目录应报错: {r6.error}")
+        # path 别名(deepaudit 兼容)
+        r7 = t.execute(path="module")
+        if not r7.ok or "net.py" not in r7.text:
+            fails.append(f"path 别名应等价 directory: {r7.error or r7.text[:60]}")
+    return fails
+
+
+def test_search_code() -> list[str]:
+    """search_code 混合检索(纯离线):边车索引 + extracted 文本 grep 双路。
+
+    - 边车: strings.json/imports.json/text.json 命中带 地址/调用点 锚点
+    - 文本: extracted/ 下的 .py/.sh 按行命中;SDK 目录排除;二进制跳过
+    - 错误: 空 keyword / 越界 directory / 非法正则 → ok=False
+    """
+    import json as _json
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # --- process/analysis 边车(两路都应命中) ---
+        ana = root / "analysis" / "unitree" / "bin"
+        ana.mkdir(parents=True)
+        (ana / "idlc.strings.json").write_text(_json.dumps({
+            "program": "idlc", "version": 2,
+            "strings": [{"address": "0010d6a1", "value": "password=unitree2018",
+                         "refs": ["main"]}],
+        }), encoding="utf-8")
+        (ana / "idlc.imports.json").write_text(_json.dumps([
+            {"name": "system", "address": "EXTERNAL:0001", "ref_count": 2,
+             "call_sites": ["main+0x10"]},
+        ]), encoding="utf-8")
+        (ana / "srv.text.json").write_text(_json.dumps({
+            "path": "etc/srv", "type": "text", "count": 1,
+            "findings": [{"type": "url", "match": "http://x", "line": 42}],
+        }), encoding="utf-8")
+        # --- process/extracted 文本源 ---
+        ext = root / "extracted" / "module"
+        ext.mkdir(parents=True)
+        (ext / "net_switcher.py").write_text(
+            "#!/usr/bin/python\nimport os\ncmd = os.system('echo '%s' % q)\n"
+            "password = 'hardcoded-pass'\n", encoding="utf-8")
+        (ext / "srv.conf").write_text("port=8080\npassword=conf-secret\n",
+                                      encoding="utf-8")
+        (root / "extracted" / "usr" / "lib" / "x").mkdir(parents=True)
+        (root / "extracted" / "usr" / "lib" / "x" / "a.py").write_text(
+            "password = 'sdk-skip-me'\n", encoding="utf-8")
+        # 二进制文件(应被嗅探跳过)
+        (ext / "blob.bin").write_bytes(b"\x00\x01password\x00")
+
+        t = make_tools(ToolContext(process_dir=root))["search_code"]
+
+        # 边车 + 文本双路命中
+        r = t.execute(keyword="password")
+        if not r.ok or "idlc.strings.json" not in r.text:
+            fails.append(f"边车路应命中 strings.json: {r.text[:200]}")
+        if "0010d6a1" not in r.text:
+            fails.append(f"strings 命中应带地址锚点: {r.text[:200]}")
+        if "net_switcher.py" not in r.text or "srv.conf" not in r.text:
+            fails.append(f"文本路应命中 extracted 脚本/配置: {r.text[:200]}")
+        if "sdk-skip-me" in r.text:
+            fails.append("SDK 目录(usr/lib)应被排除")
+        if "blob.bin" in r.text:
+            fails.append("二进制文件应被嗅探跳过")
+
+        # imports 命中(带调用点)
+        r2 = t.execute(keyword="system")
+        if "idlc.imports.json" not in r2.text or "call_sites" not in r2.text:
+            fails.append(f"imports 边车命中应有调用点: {r2.text[:200]}")
+
+        # text.json 边车(URL 关键词)
+        r3 = t.execute(keyword="http://x")
+        if "srv.text.json" not in r3.text or ":42" not in r3.text:
+            fails.append(f"text.json 边车命中应有行锚点: {r3.text[:200]}")
+
+        # 正则
+        r4 = t.execute(keyword=r"passw\w+", is_regex=True)
+        if not r4.ok or not r4.text.startswith("## search_code"):
+            fails.append(f"正则模式应工作: {r4.text[:120]}")
+
+        # file_pattern 只过滤文本路(边车路不受影响)
+        r5 = t.execute(keyword="password", file_pattern="*.py")
+        if "net_switcher.py" not in r5.text or "srv.conf" in r5.text:
+            fails.append(f"file_pattern 应过滤文本路(.py 留 .conf 去): {r5.text[:160]}")
+        if "idlc.strings.json" not in r5.text:
+            fails.append("file_pattern 不应影响边车索引路")
+
+        # 错误路径
+        if t.execute(keyword="").ok:
+            fails.append("空 keyword 应 ok=False")
+        if t.execute(keyword="zzz_no_hit_outer", directory="../../etc").ok:
+            fails.append("越界 directory 应 ok=False")
+        if t.execute(keyword="[", is_regex=True).ok:
+            fails.append("非法正则应 ok=False")
+
+        # 无命中返回 ok=True 且带搜索统计
+        r6 = t.execute(keyword="zzz_none")
+        if not r6.ok or "未找到匹配" not in r6.text:
+            fails.append(f"无命中应 ok=True: {r6.text[:120]}")
+        if "边车" not in r6.text or "文本" not in r6.text:
+            fails.append(f"无命中应报搜索统计: {r6.text[:120]}")
+    return fails
+
+
 def test_main() -> int:
     process_dir = _find_process_dir()
     if process_dir is None:
@@ -234,6 +380,8 @@ def test_main() -> int:
         ("strings_query", lambda: test_strings_query(tools)),
         ("read_file", lambda: test_read_file(tools, process_dir)),
         ("make_tools_exclude", test_make_tools_exclude),
+        ("list_files", test_list_files),
+        ("search_code", test_search_code),
     ]:
         fl = fn()
         if fl:

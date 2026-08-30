@@ -31,6 +31,7 @@ from .step0_split_img import (
     _verify_extracted,
     SKIP_AUDIT_KINDS,
 )
+import contextlib
 
 # 归档类:解出文件系统,跳过 binwalk
 _ARCHIVE_EXTS = (".zip", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")
@@ -42,15 +43,60 @@ _SINGLE_COMPRESS_EXTS = (".gz", ".bz2", ".xz")
 _PARTITION_MAX_SIZE_GB = 50.0
 
 
+def _safe_extract_zip(src: Path, dest: Path) -> None:
+    """安全解压 zip:拒绝 zip-slip(../ 越界)与符号链接,且不覆盖已有文件。"""
+    with zipfile.ZipFile(src) as z:
+        for info in z.infolist():
+            name = info.filename
+            if name.startswith("/") or ".." in name.split("/"):
+                print(f"[Step0] 安全拦截: 跳过 zip 越界项 {name!r}")
+                continue
+            target = dest / name
+            if not target.resolve().is_relative_to(dest.resolve()):
+                print(f"[Step0] 安全拦截: 跳过 zip 越界项 {name!r}")
+                continue
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if info.create_system == 3:  # Unix symlink
+                print(f"[Step0] 安全拦截: 跳过 zip 符号链接 {name!r}")
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as src_f, open(target, "wb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f)
+
+
+def _safe_extract_tar(src: Path, dest: Path) -> None:
+    """安全解压 tar:拒绝 tar-slip(../)与绝对路径,拒绝符号链接,不覆盖已有文件。"""
+    with tarfile.open(src) as t:
+        for member in t.getmembers():
+            name = member.name
+            if name.startswith("/") or ".." in name.split("/"):
+                print(f"[Step0] 安全拦截: 跳过 tar 越界项 {name!r}")
+                continue
+            target = dest / name
+            if not target.resolve().is_relative_to(dest.resolve()):
+                print(f"[Step0] 安全拦截: 跳过 tar 越界项 {name!r}")
+                continue
+            if member.issym() or member.islnk():
+                print(f"[Step0] 安全拦截: 跳过 tar 符号链接 {name!r}")
+                continue
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with t.extractfile(member) as src_f, open(target, "wb") as dst_f:
+                if src_f is not None:
+                    shutil.copyfileobj(src_f, dst_f)
+
+
 def _decompress_archive(src: Path, dest: Path) -> Path:
-    """解归档到 dest,返回解压根目录(== dest)。tarfile 自动识别 .tar.gz/.bz2/.xz。"""
+    """解归档到 dest,返回解压根目录(== dest)。安全提取,拒绝 zip-slip/tar-slip。"""
     dest.mkdir(parents=True, exist_ok=True)
     if src.suffix.lower() == ".zip":
-        with zipfile.ZipFile(src) as z:
-            z.extractall(dest)
+        _safe_extract_zip(src, dest)
     else:
-        with tarfile.open(src) as t:
-            t.extractall(dest)
+        _safe_extract_tar(src, dest)
     return dest
 
 
@@ -163,18 +209,14 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path]:
                         files.append(existing)
                         continue
                     print(f"[Step0] 已存在分区 {existing.name} 回读校验失败,重新提取")
-                    try:
+                    with contextlib.suppress(OSError):
                         existing.unlink()
-                    except OSError:
-                        pass
                 extract_partition(f, p, part_file)
                 if not _verify_extracted(img, p["offset"], p["size"], part_file):
                     print(f"[Step0] 错误: 分区 {part_file.name} 提取后回读校验失败,"
                           "删除(内容不可信)")
-                    try:
+                    with contextlib.suppress(OSError):
                         part_file.unlink()
-                    except OSError:
-                        pass
                     continue
                 files.append(part_file)
     except Exception as e:

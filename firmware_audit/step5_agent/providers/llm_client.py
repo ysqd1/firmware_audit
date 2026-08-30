@@ -154,21 +154,26 @@ class LLMClient:
                 with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                     body = json.loads(resp.read().decode("utf-8"))
                 msg = (body.get("choices") or [{}])[0].get("message", {})
-                content = msg.get("content") or ""
-                # 推理模型(deepseek-v4-flash 实测):思考在 reasoning_content,
-                # 正文在 content;思考耗尽 max_tokens 时 content 为空(瞬时,可重试)。
-                # 拼接给 ReAct 解析器(取最后出现的协议块,天然兼容)
+                # 推理模型(deepseek-v4-flash/mimo 实测):思考在 reasoning_content,
+                # 正文在 content;思考与正文共享 max_tokens,思考耗尽时 content 为空
+                # (瞬时,可重试)。**只把正文当回复**:思考是模型内部草稿,不参与
+                # ReAct 协议解析(防"草稿 Action"被当成真实调用执行)、不进回喂
+                # 上下文;思考单独随 usage.reasoning_content 返回,由调用方在
+                # transcript 留档审计(content 为空即视为空回复,走重试)。
                 reasoning = msg.get("reasoning_content") or ""
-                full = (reasoning + "\n" + content).strip() if content else reasoning.strip()
-                if not full:
+                content = (msg.get("content") or "").strip()
+                if not content:
                     raise _RetryableError(
-                        f"空回复: {json.dumps(body, ensure_ascii=False)[:300]}")
-                usage = body.get("usage") or {}
+                        f"空回复(思考耗尽或响应异常,reasoning {len(reasoning)} 字符): "
+                        f"{json.dumps(body, ensure_ascii=False)[:300]}")
+                usage = dict(body.get("usage") or {})
+                if reasoning:
+                    usage["reasoning_content"] = reasoning
                 for k in self._total_usage:
                     self._total_usage[k] += usage.get(k, 0)
                 if attempt > 0:
                     _log_retry(f"第 {attempt + 1} 次尝试成功(经 {attempt} 次重试)", "")
-                return full, usage
+                return content, usage
             except urllib.error.HTTPError as e:
                 detail = f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"
                 if e.code in NON_RETRYABLE_HTTP:
