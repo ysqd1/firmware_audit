@@ -19,8 +19,8 @@ import re
 from fnmatch import fnmatch
 from pathlib import Path
 
+from ....file_rules import is_search_excluded
 from .base import AgentTool, ToolResult
-from .list_files import DEFAULT_EXCLUDE_DIRS as _SDK_DIRS
 
 MAX_RESULTS_DEFAULT = 50
 MAX_RESULTS_CAP = 100
@@ -41,13 +41,13 @@ def _path_excluded(rel: str) -> bool:
 
     rel 是相对 process/ 的路径(默认 grep scope=extracted/ 时带 extracted/
     前缀),排除集条目不带该前缀——同时匹配两种形态(剥前缀后再判)。
+    名单来自 file_rules(profile SEARCH_EXCLUDE_DIRS,2026-08-30 收敛)。
     """
     r = rel.rstrip("/")
-    if r in _SDK_DIRS or any(r.startswith(e + "/") for e in _SDK_DIRS):
+    if is_search_excluded(r):
         return True
     r2 = r.removeprefix("extracted/")
-    return (r2 in _SDK_DIRS
-            or any(r2.startswith(e + "/") for e in _SDK_DIRS))
+    return is_search_excluded(r2)
 
 
 def _is_text(path: Path) -> bool:

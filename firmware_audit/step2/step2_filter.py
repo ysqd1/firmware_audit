@@ -9,16 +9,6 @@ import re
 import time
 from pathlib import Path
 
-# binwalk 递归解包产生的嵌套前缀形如:
-#   nano14-backup-SANITIZED.tar.xz.extracted/0/decompressed.bin.extracted/0/etc/passwd
-# 名单(usr/share, etc/passwd, home/unitree ...)是针对"逻辑固件路径"定义的,
-# 直接对 rel_path 做 startswith 永不命中。先剥掉所有 <name>.extracted/<N>/ 前缀。
-# 偏移子目录:旧 binwalk 是数字(0/1/...),3.1.1 是 hex(13DE7F0、2919000)。
-# 只剥数字会卡在 hex 树 → 白名单全 miss(实测 part05_B_kernel 61 万条目树)。
-# 7z 兜底(引导解包器 binwalk 无 extractor 的容器走 7z 扁平解包)无偏移段:
-#   <seq>_x.cpio.extracted/etc/passwd —— 偏移目录可缺省。
-_EXTRACTED_PREFIX_RE = re.compile(r"^[^/]+\.extracted/(?:[0-9A-Fa-f]+/)?")
-
 # DTB 节点分解噪声:binwalk 对设备树(fdt)递归分解,每个节点/属性一个文件,
 # 路径段形如 <节点名>@<hex地址>(bus@0、aconnect@2a41000、rail@vdd_soc、bin@1599)。
 # 属性文件平均 16B 纯硬件描述,无审计价值,数量可达数十万(实测 part05 树中
@@ -31,33 +21,9 @@ def _is_dtb_node(rel_path: str) -> bool:
     """路径含 <名>@<地址> 段(设备树分解节点)→ 应排除。"""
     return bool(_DTB_NODE_SEGMENT_RE.search(rel_path))
 
-# binwalk 对内嵌文件系统(如 squashfs/cpio/jffs2)解出 <fstype>-root 目录:
-#   xxx.squashfs.extracted/0/squashfs-root/etc/passwd
-#   xxx.cpio.extracted/0/cpio-root/etc/passwd
-# 这些 root 目录名(带可选 -N 后缀)也剥掉,否则白名单(etc/passwd)匹配不到。
-# 用 <name>-root 通配,覆盖 squashfs-root/cpio-root/jffs2-root/cramfs-root 等。
-_ROOT_PREFIX_RE = re.compile(r"^[^/]+-root(?:-\d+)?/")
-
-
-def _logical_path(rel_path: str) -> str:
-    """剥掉 binwalk 嵌套前缀,返回固件内的逻辑路径。
-
-    反复剥 <name>.extracted/<N>/ 与 <fstype>-root/ 前缀直到不再变化。
-    例: foo.tar.xz.extracted/0/decompressed.bin.extracted/0/etc/passwd -> etc/passwd
-    例: root.squashfs.extracted/0/squashfs-root/etc/passwd -> etc/passwd
-    非解包路径(无上述段)原样返回,兼容单测与已扁平化场景。
-    """
-    rel = rel_path
-    while True:
-        new = _EXTRACTED_PREFIX_RE.sub("", rel, count=1)
-        if new != rel:
-            rel = new
-            continue
-        new = _ROOT_PREFIX_RE.sub("", rel, count=1)
-        if new != rel:
-            rel = new
-            continue
-        return rel
+# 逻辑路径 / 系统标准目录 / 系统信任库判断统一收敛到 file_rules(2026-08-30,C3)。
+# step2 只保留自己的过滤编排(白/黑名单、DTB、构建产物),这些判断委托给共享模块。
+from ..file_rules import is_system_std, logical_path
 
 
 # --- 名单从 profile 加载 ---
@@ -113,16 +79,14 @@ BLACKLIST_DIRS = _profile_list("BLACKLIST_DIRS")
 BLACKLIST_PATTERNS = _profile_list("BLACKLIST_PATTERNS")
 WHITELIST_DIRS = _profile_list("WHITELIST_DIRS")
 WHITELIST_ETC = _profile_list("WHITELIST_ETC")
-SYSTEM_TRUST_DIRS = _profile_list("SYSTEM_TRUST_DIRS")
-SYSTEM_STD_DIRS = _profile_list("SYSTEM_STD_DIRS")
 BUILD_ARTIFACT_PATTERNS = _profile_list("BUILD_ARTIFACT_PATTERNS")
 
 
 def configure(profile_name: str) -> None:
     """加载指定 profile 并更新模块级名单。
 
-    step3_classify 在函数体内查找全局 SYSTEM_TRUST_DIRS,configure 后即便已被
-    import 也立即生效(全局名在调用时解析)。
+    系统标准目录/信任库/搜索过滤名单已收敛到 file_rules(2026-08-30,C3),
+    换 profile 时这里一并调用 file_rules.configure() 同步切换。
 
     非线程安全:单进程顺序调用。同一进程多次 run_pipeline(不同 target/不同
     profile)时,必须显式传入 profile;若传了不存在的 profile,本函数保持上次
@@ -135,16 +99,17 @@ def configure(profile_name: str) -> None:
     if not new_profile:
         return
     global _PROFILE, BLACKLIST_DIRS, BLACKLIST_PATTERNS
-    global WHITELIST_DIRS, WHITELIST_ETC, SYSTEM_TRUST_DIRS, SYSTEM_STD_DIRS
-    global BUILD_ARTIFACT_PATTERNS
+    global WHITELIST_DIRS, WHITELIST_ETC, BUILD_ARTIFACT_PATTERNS
     _PROFILE = new_profile
     BLACKLIST_DIRS = _profile_list("BLACKLIST_DIRS")
     BLACKLIST_PATTERNS = _profile_list("BLACKLIST_PATTERNS")
     WHITELIST_DIRS = _profile_list("WHITELIST_DIRS")
     WHITELIST_ETC = _profile_list("WHITELIST_ETC")
-    SYSTEM_TRUST_DIRS = _profile_list("SYSTEM_TRUST_DIRS")
-    SYSTEM_STD_DIRS = _profile_list("SYSTEM_STD_DIRS")
     BUILD_ARTIFACT_PATTERNS = _profile_list("BUILD_ARTIFACT_PATTERNS")
+    # 同步切换 file_rules 的名单(SYSTEM_STD/TRUST/SEARCH_EXCLUDE)
+    from ..file_rules import configure as configure_file_rules
+
+    configure_file_rules(profile_name)
 
 
 # --- 证书/密钥/脚本/配置扩展名(通用,不随固件型号变化,故留在代码里) ---
@@ -163,18 +128,12 @@ CONFIG_EXTENSIONS = {
 }
 
 
-def _is_system_trust(rel_path: str) -> bool:
-    """判断逻辑路径是否落在系统信任库目录下。"""
-    logical = _logical_path(rel_path)
-    return any(logical == d or logical.startswith(d + "/") for d in SYSTEM_TRUST_DIRS)
-
-
 def _is_whitelisted(rel_path: str) -> bool:
     """白名单优先级最高,命中即保留。
 
     匹配基于"逻辑固件路径"(已剥掉 binwalk 的 .extracted/N/ 嵌套前缀)。
     """
-    logical = _logical_path(rel_path)
+    logical = logical_path(rel_path)
     # 宇树定制目录
     for w in WHITELIST_DIRS:
         if logical == w or logical.startswith(w + "/"):
@@ -185,7 +144,7 @@ def _is_whitelisted(rel_path: str) -> bool:
 
 def _is_blacklisted(rel_path: str) -> bool:
     """黑名单命中即排除。基于逻辑固件路径匹配。"""
-    logical = _logical_path(rel_path)
+    logical = logical_path(rel_path)
     for b in BLACKLIST_DIRS:
         if logical.startswith(b + "/") or logical == b:
             return True
@@ -197,19 +156,8 @@ def _is_build_artifact(rel_path: str) -> bool:
 
     命中即排除,优先级高于白名单。只匹配明确构建产物,不含 .a/.o(可能有审计价值)。
     """
-    logical = _logical_path(rel_path)
+    logical = logical_path(rel_path)
     return any(p in logical for p in BUILD_ARTIFACT_PATTERNS)
-
-
-def _is_system_std(rel_path: str) -> bool:
-    """逻辑路径是否落在系统标准配置目录下(发行版模板/样例,审计无价值)。
-
-    与 SYSTEM_TRUST_DIRS 不同: 信任库只"标记"不删除(证书仍可查);
-    系统标准配置直接排除,降低 Step3/Step4 无效扫描与误报。
-    白名单(WHITELIST_ETC)优先于本名单,故必须保留的敏感配置不受影响。
-    """
-    logical = _logical_path(rel_path)
-    return any(logical == d or logical.startswith(d + "/") for d in SYSTEM_STD_DIRS)
 
 
 def _has_cert_extension(name: str) -> bool:
@@ -237,7 +185,7 @@ def _dedup(kept: list[Path], extracted_root: Path) -> list[Path]:
     于是同一逻辑文件出现两份(如 etc/passwd):
       1. nano..tar.xz.extracted/0/etc/passwd
       2. nano..tar.xz.extracted/0/decompressed.bin.extracted/0/etc/passwd
-    经 _logical_path 都映射到 etc/passwd,导致 Step3/4 处理量翻倍、Step5 报告重复。
+    经 logical_path 都映射到 etc/passwd,导致 Step3/4 处理量翻倍、Step5 报告重复。
 
     key = (逻辑路径, 内容快速哈希)。同一 key 只留一份,优先保留物理路径最短
     (更接近根、非 decompressed.bin 嵌套)的那份。返回去重后的列表。
@@ -255,7 +203,7 @@ def _dedup(kept: list[Path], extracted_root: Path) -> list[Path]:
             rel = str(f.relative_to(extracted_root)).replace("\\", "/")
         except ValueError:
             rel = f.name
-        key = (_logical_path(rel), h)
+        key = (logical_path(rel), h)
         prev = seen.get(key)
         if prev is None:
             seen[key] = len(final)
@@ -354,7 +302,7 @@ def _dedup_by_content(kept: list[Path]) -> list[Path]:
 
 
 def _sanity_check_whitelist(kept: list[Path], extracted_root: Path) -> None:
-    """健全性断言:_logical_path 剥前缀失败时的静默失效兜底。
+    """健全性断言:logical_path 剥前缀失败时的静默失效兜底。
 
     若 binwalk 版本/固件结构变化导致命名一变,正则剥不掉 .extracted/N/ 前缀,
     白名单会静默全 miss → 所有文件落"默认保留"分支,过滤变空操作且无提示。
@@ -368,7 +316,7 @@ def _sanity_check_whitelist(kept: list[Path], extracted_root: Path) -> None:
             rel = str(f.relative_to(extracted_root)).replace("\\", "/")
         except ValueError:
             rel = f.name
-        logical = _logical_path(rel)
+        logical = logical_path(rel)
         for w in WHITELIST_DIRS:
             if logical == w or logical.startswith(w + "/"):
                 hit_dirs += 1
@@ -454,7 +402,7 @@ def filter_files(extracted_root: Path, profile: str | None = None) -> list[Path]
             continue
 
         # 3. 系统标准配置目录排除(发行版模板/样例,审计无价值)
-        if _is_system_std(rel):
+        if is_system_std(logical_path(rel)):
             continue
 
         # 4. 黑名单排除

@@ -10,8 +10,8 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+from ..file_rules import logical_path
 from ..step2.step2_filter import (
-    _logical_path,
     _is_dtb_node,
     _is_elf_dup_candidate,
     _is_base_name,
@@ -41,7 +41,7 @@ def test_logical_path_hex_prefix() -> list[str]:
         ("etc/passwd", "etc/passwd"),
     ]
     for rel, want in cases:
-        got = _logical_path(rel)
+        got = logical_path(rel)
         if got != want:
             fails.append(f"{rel} -> {got},期望 {want}")
     return fails

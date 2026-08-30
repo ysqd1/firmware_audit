@@ -11,8 +11,8 @@ import tempfile
 from pathlib import Path
 
 from ..docker.docker_utils import docker_available, run_docker
+from ..file_rules import is_downgrade_dir, logical_path
 from ..models import FileInfo
-from ..step2.step2_filter import _logical_path
 from .triage import triage_opaque, sniff_firmware_kind
 
 # Ghidra 镜像
@@ -378,15 +378,11 @@ _TEXT_PATTERNS = [
 # "passwd" 提示、软件源 URL)。fi.is_system_trust 只覆盖证书信任库,Text 需独立名单。
 # 对其中文件降低"低危信号"匹配,避免冲刷报告;高危信号(private_key/shadow_hash)
 # 不受影响,始终保留。
-_SYSTEM_STD_DIRS = [
-    "etc/apt", "etc/default", "etc/cron.d", "etc/cron.daily",
-    "etc/init.d", "etc/logrotate.d", "etc/pam.d", "etc/sudoers.d",
-    "etc/ssl", "etc/ca-certificates", "etc/pki", "etc/ssh",
-    "etc/mono",   # .NET runtime 配置模板(machine.config/web.config 含 password 占位符)
-    "usr/share/doc", "usr/share/man", "usr/share/zoneinfo",
-]
+# 2026-08-30(C3):降级名单收敛到 file_rules 的 SYSTEM_DOWNGRADE_DIRS(原硬编码
+# _SYSTEM_STD_DIRS)。注意与 profile SYSTEM_STD_DIRS 区分:那套是"排除送审",
+# 此目录是"活着走到 Step4、只降级不排除"。
 
-# 低危信号:在系统标准目录下不再匹配(避免误报)
+# 低危信号:在降级目录下不再匹配(避免误报)
 _LOW_RISK_KINDS = {"password_kw", "url", "ipv4"}
 
 # ExtractInfo.py 产物格式版本;旧版产物(decompile.c 无此标记)自动失效重跑
@@ -396,9 +392,9 @@ _EXTRACTINFO_VERSION = 2
 _ELF_SCAN_MAX_FINDINGS = 200
 
 
-def _in_system_std(logical: str) -> bool:
-    """逻辑路径是否落在系统标准配置目录下。"""
-    return any(logical == d or logical.startswith(d + "/") for d in _SYSTEM_STD_DIRS)
+def _in_downgrade_dir(logical: str) -> bool:
+    """逻辑路径是否落在低危信号降级目录下(file_rules 收敛)。"""
+    return is_downgrade_dir(logical)
 
 
 def _scan_text(fi: FileInfo, analysis_dir: Path) -> None:
@@ -426,8 +422,8 @@ def _scan_text(fi: FileInfo, analysis_dir: Path) -> None:
     except OSError:
         return
 
-    logical = _logical_path(fi.rel_path)
-    in_system_std = _in_system_std(logical)
+    logical = logical_path(fi.rel_path)
+    in_system_std = _in_downgrade_dir(logical)
     is_system_trust = fi.is_system_trust
 
     findings: list[dict] = []
@@ -488,8 +484,8 @@ def _scan_elf_strings(fi: FileInfo, analysis_dir: Path) -> bool:
         return False
     strings = data.get("strings", []) if isinstance(data, dict) else []
 
-    logical = _logical_path(fi.rel_path)
-    in_system_std = _in_system_std(logical)
+    logical = logical_path(fi.rel_path)
+    in_system_std = _in_downgrade_dir(logical)
     is_system_trust = fi.is_system_trust
 
     findings: list[dict] = []

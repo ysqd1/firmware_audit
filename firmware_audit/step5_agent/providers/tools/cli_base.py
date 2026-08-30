@@ -8,26 +8,23 @@ from __future__ import annotations
 from pathlib import Path
 
 from ....docker.docker_utils import run_docker
+from ....file_rules import get_search_exclude_dirs
 from .base import ToolContext
 
 SANDBOX_IMAGE = "firm_audit/sandbox:latest"
 EXTRACTED_MOUNT = "/work/extracted"
 
-# SDK/系统库目录前缀(镜像 Step2 profile BLACKLIST_DIRS):目录扫描工具应排除,
-# 避免在 stdlib python/系统库上产生海量噪音(实测 extracted/usr/local/lib 约 901 个 .py)。
-SDK_DIR_PREFIXES = ("usr/local/lib", "usr/lib", "usr/share", "usr/include",
-                    "usr/src", "lib/", "lib32/", "lib64/", "share/")
-
 
 def sdk_exclude_flags(container_root: str = EXTRACTED_MOUNT) -> list[str]:
-    """把 SDK 前缀转成工具的排除参数(当前按 semgrep --exclude 形态)。
+    """把搜索过滤名单转成工具的排除参数(当前按 semgrep --exclude 形态)。
 
-    container_root 用实际扫描根(EXTRACTED_MOUNT);以绝对容器路径排除,
-    避免误伤同名顶层(如 etc/lib)。仅对支持 --exclude 的工具使用。
+    名单来自 file_rules(profile SEARCH_EXCLUDE_DIRS,2026-08-30 收敛)。
+    container_root 用实际扫描根(EXTRACTED_MOUNT);
+    以绝对容器路径排除,避免误伤同名顶层(如 etc/lib)。仅对支持 --exclude 的工具使用。
     """
     flags: list[str] = []
     root = container_root.rstrip("/")
-    for pre in SDK_DIR_PREFIXES:
+    for pre in get_search_exclude_dirs():
         flags += ["--exclude", f"{root}/{pre.rstrip('/')}"]
     return flags
 

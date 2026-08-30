@@ -12,13 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ....file_rules import is_search_excluded
 from .base import AgentTool, ToolResult
-
-# 与 Step2/概览口径一致:这些目录下的文件已按低价值剔除,枚举时跳过
-DEFAULT_EXCLUDE_DIRS = {
-    "usr/lib", "usr/local/lib", "usr/share", "lib", "opt",
-    ".git", "__pycache__", "node_modules", ".pytest_cache",
-}
 
 DEFAULT_MAX_FILES = 100
 
@@ -72,9 +67,7 @@ class ListFilesTool(AgentTool):
         from fnmatch import fnmatch
 
         def _excluded(rel_dir: str) -> bool:
-            r = rel_dir.rstrip("/")
-            return r in DEFAULT_EXCLUDE_DIRS or any(
-                r.startswith(e + "/") for e in DEFAULT_EXCLUDE_DIRS)
+            return is_search_excluded(rel_dir.rstrip("/"))
 
         out: list[str] = []
         truncated = False

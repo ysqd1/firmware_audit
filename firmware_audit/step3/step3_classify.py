@@ -10,10 +10,10 @@ from pathlib import Path
 
 from ..docker.docker_utils import run_docker, docker_available
 from ..models import FileInfo
+from ..file_rules import is_system_trust, logical_path
 from ..step2.step2_filter import (
     SCRIPT_EXTENSIONS,
     CONFIG_EXTENSIONS,
-    _is_system_trust,
 )
 
 BINWALK_IMAGE = "binwalk"
@@ -247,7 +247,7 @@ def classify(files: list[Path], extracted_root: Path) -> list[FileInfo]:
             type=ftype,
             size=size,
             subtype=file_out,
-            is_system_trust=_is_system_trust(rel),
+            is_system_trust=is_system_trust(logical_path(rel)),
         )
         fileinfos.append(fi)
         type_counts[ftype] = type_counts.get(ftype, 0) + 1

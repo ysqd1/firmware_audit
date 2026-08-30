@@ -130,3 +130,41 @@ SYSTEM_STD_DIRS:
   - "etc/apport"
   - "etc/cracklib"
   - "etc/ld.so.conf.d"
+
+# 低危信号降级目录:Step4 文本扫描在此目录下降低"低危信号"(password_kw/url/ipv4)
+# 匹配,避免系统标配脚本的正常配置被误报。区别于 SYSTEM_STD_DIRS(排除送审):
+# 此目录下的文件是"活着走到 Step4"的(多为 WHITELIST_ETC 保留的启动脚本/系统配置),
+# 只降级不排除。原为 step4 硬编码 _SYSTEM_STD_DIRS,2026-08-30(C3)外置收敛。
+SYSTEM_DOWNGRADE_DIRS:
+  - "etc/apt"
+  - "etc/default"
+  - "etc/cron.d"
+  - "etc/cron.daily"
+  - "etc/init.d"
+  - "etc/logrotate.d"
+  - "etc/pam.d"
+  - "etc/sudoers.d"
+  - "etc/ssl"
+  - "etc/ca-certificates"
+  - "etc/pki"
+  - "etc/ssh"
+  - "etc/mono"
+  - "usr/share/doc"
+  - "usr/share/man"
+  - "usr/share/zoneinfo"
+
+# 搜索过滤目录:Step5 工具层(搜索/枚举)命中即跳过,避免 SDK 噪音刷屏。
+# 注意区分: 这是"过滤"(文件仍审,只是搜索时不主动展示),不是"排除"(不送审)。
+# 收纳原 Step5 工具层硬编码的 DEFAULT_EXCLUDE_DIRS / SDK_DIR_PREFIXES(2026-08-30)。
+# .git/__pycache__/node_modules 等是工具噪音;usr/lib 等 SDK 目录与 BLACKLIST_DIRS
+# 重叠但语义不同(黑名单=排除,此处=过滤)。
+SEARCH_EXCLUDE_DIRS:
+  - "usr/lib"
+  - "usr/local/lib"
+  - "usr/share"
+  - "lib"
+  - "opt"
+  - ".git"
+  - "__pycache__"
+  - "node_modules"
+  - ".pytest_cache"
