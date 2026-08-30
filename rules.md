@@ -3,13 +3,13 @@
 ## 铁律
 
 1. **包可跑** — `python -m firmware_audit.main <target_dir>` 一行启动,不装一堆依赖
-2. **LLM 可选** — 无 API key 降级纯规则,仍出报告(标注"未经 LLM 复审")
+2. **LLM 必需(Step5)** — Step1-4 纯代码;Step5 无 API key 或 API 调用失败时**立即终止,不降级**([ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md))
 3. **同步为主** — 不用 asyncio,顺序执行,清晰优先
 4. **失败不崩** — 任何步骤失败降级兜底,继续往下跑,记录失败原因
 5. **输入目录即工作区** — `target/<N>/` 既是输入也是产出目录,固件和 process/(extracted/ analysis/) 共处
 6. **工具用 Docker** — binwalk/ghidra 走容器,宿主机只跑 Python
 7. **分类用 file 硬编码** — 不用 LLM 看文件头,快、准、稳
-8. **Agent 层按需求文档推进** — 架构已定:三 Agent(recon/analysis/verification)串行 ReAct、无 orchestrator(见 requirements.md)
+8. **Agent 层按需求文档推进** — 架构现状:LLM orchestrator 编排三 Agent(recon→analysis→verification),`orchestrator.py` 调度、顺序门单向([ADR-0001](./docs/adr/0001-step5-orchestrator.md);需求文档为 2026-08-16 快照)
 9. **路径用 pathlib** — 跨平台,不用字符串拼路径
 10. **日志清晰** — 每步打印进度和统计,失败要可追溯
 

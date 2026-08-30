@@ -1,6 +1,6 @@
 # 流水线角色与 Agent 工具层
 
-固定 5 步流水线。Step1-4 已实现并验证通过(代码控制);Step5 架构已定(2026-08-16):三个 ReAct Agent 串行(recon → analysis → verification),无 orchestrator,控制流由 Python 硬编码。
+固定 5 步流水线。Step1-4 已实现并验证通过(代码控制);Step5 架构现状(2026-08-28 起):**LLM orchestrator 编排**三个子 Agent(recon → analysis → verification),见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md) 与正文"Step5 Agent 审计"章节。早期(2026-08-16)"三 Agent 串行、无 orchestrator、控制流硬编码"的设计已演进。
 
 ## 一、已落地:Step1-4 流水线角色
 
@@ -48,7 +48,7 @@
 
 * **实现**:`firmware_audit/step3/step3_classify.py`
 
-* **分类**:`elf_exec` / `elf_lib` / `script` / `source` / `config` / `text` / `crypto_*` / `unknown`
+* **分类**:`elf_exec` / `elf_lib` / `script` / `source` / `config` / `text` / `crypto_x509` / `crypto_ssh` / `crypto_gpg` / `crypto_pkcs12` / `crypto_private_key` / `crypto_public_key` / `crypto_unknown` / `unknown`(`crypto_unknown` = 密码学扩展名但 file 未识别,绝不定 `unknown` 避免漏审)
 
 * **原则**:硬编码分类,不用 LLM
 

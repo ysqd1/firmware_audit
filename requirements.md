@@ -1,7 +1,8 @@
 # Agent 阶段需求文档 — 固件审计 Step5
 
-> 状态:架构已定(2026-08-16)——三 Agent(recon/analysis/verification)串行 ReAct,无 orchestrator;工具层实现中。
+> 状态:架构已定(2026-08-16)→ **2026-08-28 演进为 LLM orchestrator 编排**(recon→analysis→verification,见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md))。工具层已实现。
 > 关联文档:`rules.md`(代码规范)、`agents.md`(Agent 架构与工具层设计)。
+> ⚠ 本文档为 2026-08-16 需求快照,后续架构演进与"无 API key 立即终止"见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md)、[ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md) 与最新 `agents.md`。
 
 ## 1. 背景与目标
 
@@ -27,7 +28,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 ## 3. 约束(继承 rules.md 铁律)
 
 1. 核心 pipeline 保持零第三方依赖(既有例外:Step4 证书解析用 cryptography,可选依赖,缺库降级跳过);Agent 工具统一 ToolResult 接口——CLI 类 subprocess 调容器内 CLI、读盘类直读 Step4 工件、API 类 urllib
-2. 无 API key 时降级纯规则,仍出报告(标注"未经 LLM 复审")
+2. ~~无 API key 时降级纯规则,仍出报告(标注"未经 LLM 复审")~~ **已废弃(2026-08-28)**:无 API key 立即终止,不降级(见 [ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md))
 3. 同步为主,不用 asyncio
 4. 任何工具失败降级兜底,不中断整体流程,记录失败原因
 5. 所有产出落在 `target/<N>/process/` 下,不外泄
@@ -89,7 +90,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 
 #### F8 read_file — 工件文件读取
 
-- **触发**:Agent 需要前序工件细节(attack_surface.json / findings.json / transcript / 报告)
+- **触发**:Agent 需要前序工件细节(survey.json / findings.json / verified_findings.json / transcript / 报告)
 - **处理**:宿主机 Python 读文件,支持行号范围与截断
 - **输出**:文件内容片段(ToolResult.text,≤8KB 超长截断)
 - **规则**:路径白名单校验,只允许读 `target/<N>/process/` 之下(防越界);这是"工件文件是唯一契约"数据流的回查机制
@@ -102,9 +103,9 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 | F10 | `semgrep_scan` | 扫提取的 php/lua/shell/js 脚本,`--config auto --json` | 中 |
 | F11 | `web_search` | 厂商公告/exploit-db 检索 | 低 |
 
-### 4.3 编排层(已定 2026-08-16)
+### 4.3 编排层(2026-08-16 定稿 → **2026-08-28 演进为 LLM orchestrator**,见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md))
 
-三个 ReAct Agent 串行,**无 orchestrator**,控制流由 Python 硬编码:
+**现状(v3,以 `orchestrator.py` 为准)**:一个 LLM 驱动的 `Orchestrator` 用 `dispatch_agent`/`summarize`/`finish` 三动作调度 recon→analysis→verification,自身跑 ReAct 循环。下方为演进前的设计快照,已过时。
 
 | Agent | 职责 | 工具 |
 |-------|------|------|
@@ -112,10 +113,10 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 | analysis | 对疑点逐个深挖取证 | find_decompiled_function / xref_query / strings_query / imports_query / cve_lookup |
 | verification | 复核发现,过滤误报,出报告 | find_decompiled_function / xref_query / cve_lookup / checksec / read_file |
 
-- Agent 间只通过工件文件交接(`attack_surface.json` → `findings.json` → `report.md`),不传对话历史
-- 每 Agent 内部 ReAct 循环:Thought/Action → 工具 → Observation → Final Answer;设迭代上限(15-25)与 Observation 截断(≤8KB 入上下文,全文落盘)
+- Agent 间通过工件文件交接(**现状** `survey.json` → `findings.json` → `verified_findings.json`;演进前为 `attack_surface.json` → `findings.json` → `report.md`,仅文档残留),不传对话历史
+- 每 Agent 内部 ReAct 循环:Thought/Action → 工具 → Observation → Final Answer;设迭代上限(现为 20/30/24)与 Observation 截断(≤8KB 入上下文,全文落盘)
 - 工件带 schema 版本号,支持断点续跑(工件存在且 schema 匹配则跳过)
-- 无 API key 降级:三阶段退化为规则模式(recon=批量收集 / analysis=规则匹配 / verification=评级交叉验证),仍出报告
+- **无 API key 语义已变(2026-08-28,见 [ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md))**:立即终止,不降级纯规则。旧"三阶段退化为规则模式"方案未落地,已废弃。
 
 ## 5. 非功能需求
 
@@ -123,7 +124,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 |------|------|---------|
 | N1 | 统一工具接口 | 每个工具返回 ToolResult(ok/text/data/error/elapsed);同参同果(cve_lookup 以缓存快照为准) |
 | N2 | 超时控制 | 每个工具可配超时,超时返回部分结果 + 超时标记,不中断流程 |
-| N3 | 降级 | 无 API key / 断网 / Docker 不可用时,降级纯规则仍出报告 |
+| N3 | 降级 | 工具级降级兜底(工具失败返回 ok=False,不中断流程);断网/Docker 不可用按工具降级。**无 API key 时 Step5 立即终止,不降级**(见 [ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md)) |
 | N4 | 可复现 | 同输入同输出;binwalk 偶发不稳定需按 rules.md 已知坑对策 |
 | N5 | 性能 | 读盘类工具(find_decompiled_function/strings/imports)毫秒级;SCA 批量分钟级可接受;昂贵操作(Ghidra 重分析/仿真)按需触发 |
 | N6 | 可追溯 | 每步日志打印进度与统计,失败可追溯 |
@@ -132,7 +133,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 
 1. 8 个 MVP 工具全部可用,统一 ToolResult 接口,单测覆盖(输入→输出→超时→幂等)
 2. 对 `target/1` 全量跑通:cve_bin_tool_scan 出 CVE 清单,imports_query 圈出危险函数,find_decompiled_function 对 12 个检出硬编码 ELF 逐个取证
-3. 无 API key 环境跑通纯规则报告,标注"未经 LLM 复核"
+3. ~~无 API key 环境跑通纯规则报告,标注"未经 LLM 复核"~~ **已废弃**:无 API key 时 Step5 抛 LLMError 终止(见 [ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md))
 4. 报告为 Markdown,证据含文件路径 + 行号 + 代码片段
 5. 编排层:`ScriptedLLM` 全链路单测跑通 ReAct 循环(Thought/Action/Observation/Final Answer 解析、解析失败回喂重试 ≤2、迭代上限强制收尾)
 6. transcript.jsonl 落盘完整;工件存在且 schema 匹配时断点续跑跳过,验证通过
@@ -144,7 +145,7 @@ Step1-4 流水线已落地并全量验证:对宇树固件补丁包解包、过�
 3. `llm_client.py`(非流式 + 重试退避)+ `react_loop.py`(纯文本 ReAct 解析 + ScriptedLLM 单测)
 4. `context.py` 四分区 + 压缩;`artifacts.py` 工件 schema
 5. 三 AgentConfig 串联 + transcript 落盘 + 断点续跑;端到端跑 `target/1`
-6. 无 key 降级路径联测;报告生成,对照 §6 验收
+6. ~~无 key 降级路径联测~~ **已废弃**(无 key 不降级,见 [ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md));报告生成,对照 §6 验收
 
 ## 8. 开放问题(2026-08-17 更新)
 
