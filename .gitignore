@@ -28,4 +28,7 @@ e2e_*.log
 *.tar.gz
 *.tgz
 firmware_audit/docker/binwalk/binwalk/
-firmware_audit/docker/ghidra/ghidra*.zip
+firmware_audit/docker/ghidra/ghidra*.zip.scratch/
+
+.scratch/
+firmware_audit/docker/ghidra/ghidra_11.3.2_PUBLIC.zip

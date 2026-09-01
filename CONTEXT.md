@@ -59,7 +59,7 @@ _Avoid_: 侦察, 铺面阶段
 _Avoid_: 取证 Agent(职责是取证但名是 analysis)
 
 **verification(复核 Agent)**:
-第三个子 Agent。最后一道质量闸门:复核 analysis 的每条候选,过滤误报,产出经人工可复验的结论(`verified_findings.json`)。
+第三个子 Agent。最后一道质量闸门:复核 analysis 的每条候选,过滤误报,产出经人工可复验的结论(`verified_findings.json`)。**每疑点一实例**:对排序后前 K 条(K 默认 10)各派一个独立实例、每条 max_iters 降到 8,逐条产 verified finding 聚合回 verified_findings.json;未进入前 K 的疑点进报告独立区段(⚠ 未复核)。ADR-0003。
 _Avoid_: 复核阶段
 
 **orchestrator(编排器)**:
@@ -118,6 +118,10 @@ _Avoid_: 步(step 已用于索引)
 **工具 (tool)**:
 Agent 在 Action 里调用的能力,统一 `AgentTool.execute(**kw) → ToolResult` 接口,返回 `{ok, text, data, error, elapsed, raw}`。分三类:读盘类(读 Step4 工件,毫秒级)、CLI 类(subprocess 调容器内 CLI)、API 类(urllib 调 HTTP)。
 _Avoid_: 函数(与 Ghidra 函数混淆), 命令
+
+**接口契约 (interface contract)**:
+工具对 LLM 暴露的参数约定——`params_doc` 是结构化规格(声明侧:参数名→类型/必选/默认/枚举),`base.execute` 按声明校验(执行侧:未知键/类型/缺失必选)。两侧同步闭合。ADR-0004。旧态(散文 + 无校验)已废除。
+_Avoid_: 参数说明(params_doc 只是声明侧), 工具签名(那是 execute 执行侧)
 
 **读盘类工具 (read-disk tool)**:
 直接读 Step4 工件、不调容器的工具:`list_files`/`read_file`/`search_code`/`strings_query`/`imports_query`/`find_decompiled_function`。廉价、毫秒级。
