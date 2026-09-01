@@ -1343,27 +1343,5 @@ class Orchestrator:
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         return out
 
-    # ---- 公开 API(pipeline 等外部调用方用,不再伸手改私有状态) ----
-
-    def record_failed(self, agent: str, error: str, task: str = "") -> None:
-        """登记一个被拒/未执行的阶段为 failed 实例(不占调度史)。
-
-        pipeline 模式被拒阶段用它占位 _agent_results,使调用方可区分
-        "未规划"与"被拒"。seq=-1 标记非真实调度。
-        """
-        self._agent_results[agent] = SubAgentResult(
-            seq=-1, agent_name=agent, status=DispatchStatus.FAILED,
-            error=error, request={"agent": agent, "task": task})
-
-    def finish(self, success: bool, error: str = "") -> None:
-        """设置编排终态(success/error),供 pipeline 等外部路径收敛。"""
-        self._success = success
-        self._error = error
-
-    def write_result(self) -> Path:
-        """落盘编排终态 result.json(transcript 缺省;pipeline 模式无 transcript)。"""
-        return self._write_result(None)
-
-
 __all__ = ["Orchestrator", "SubAgentResult", "DispatchAgentTool",
            "SummarizeTool", "FinishTool", "DispatchStatus"]

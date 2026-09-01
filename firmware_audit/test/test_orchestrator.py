@@ -858,71 +858,20 @@ def test_aggregator_module() -> list[str]:
     return fails
 
 
-def test_pipeline_mode() -> list[str]:
-    """planner=pipeline:无 orchestrator LLM 轮次,三 Agent 顺序产出工件;
-    result.json 与 auto 模式对称落盘(聚合 findings+阶段统计)。"""
+def test_planner_removed() -> list[str]:
+    """ADR-0006:ticket 05——planner 参数移除,step5_run 只剩 LLM 编排一条路径。
+
+    不再有 pipeline 快速模式:传 planner 应直接抛 TypeError(参数已删),
+    不再接受任何分支选择;所有 Step5 运行都是 LLM 编排 + 产报告。
+    行为断言(而非实现细节):绑定期即炸,无需造 process/脚本。
+    """
     fails: list[str] = []
     from firmware_audit.step5_agent.run_step5 import step5_run
-    with tempfile.TemporaryDirectory() as _td:
-        td = Path(_td)
-        target = _make_process(td)
-        h = [TOOL, RECON_FINAL, TOOL, FA, TOOL, FV]  # 只供子 Agent 消耗
-        llm = ScriptedLLM(h)
-        s = step5_run(target, llm=llm, planner="pipeline")
-        if s.get("mode") != "pipeline":
-            fails.append(f"应走 pipeline 模式: {s.get('mode')}")
-        if s.get("report") is not None:
-            fails.append("pipeline 模式不应产出 LLM 报告")
-        agent = td / "process" / "agent"
-        # ADR-0003:verification 阶段聚合到 agent/verified_findings.json,单实例在
-        # 3_verification/(pipeline 同走 per-finding 阶段,布局与 auto 一致)
-        for d, art in (("0_recon", "survey.json"),
-                       ("1_analysis", "findings.json")):
-            if not (agent / d / art).is_file():
-                fails.append(f"pipeline 应产出 {d}/{art}")
-        if not (agent / "verified_findings.json").is_file():
-            fails.append("pipeline verification 应聚合 agent/verified_findings.json")
-        if not (agent / "3_verification" / "verified_findings.json").is_file():
-            fails.append("pipeline verification 单实例应产出 3_verification/")
-        stages = s.get("stages", {})
-        if not stages or not all(v.get("ok") for v in stages.values()):
-            fails.append(f"pipeline 各阶段应 ok: {stages}")
-        # 与 auto 模式对称:result.json 落盘,聚合 findings 可读
-        res = agent / "orchestrator" / "result.json"
-        if not res.is_file():
-            fails.append("pipeline 应落盘 orchestrator/result.json(与 auto 对称)")
-        else:
-            obj = json.loads(res.read_text(encoding="utf-8"))
-            if not obj.get("findings"):
-                fails.append("pipeline result.json 应含聚合 findings")
-            if not {"recon", "analysis", "verification"} <= set(obj.get("stages", {})):
-                fails.append(f"pipeline result.json stages 应齐三阶段: {list(obj.get('stages', {}))}")
-        # 子 Agent 未消耗编排脚本(pipeline 无 orchestrator 轮次)
-        # 6 次调用全部被子 Agent 用掉,无额外编排调用
-        if len(llm.calls) != 6:
-            fails.append(f"pipeline 应零编排轮次(仅子 Agent 6 调), got {len(llm.calls)}")
-    return fails
-
-
-def test_pipeline_stages_cover_rejected() -> list[str]:
-    """pipeline 被拒阶段也进 stages:recon 失败 → analysis/verification 以
-    failed+error 呈现(调用方可区分"未规划"与"被拒")。"""
-    fails: list[str] = []
-    from firmware_audit.step5_agent.run_step5 import step5_run
-    with tempfile.TemporaryDirectory() as _td:
-        td = Path(_td)
-        target = _make_process(td)
-        llm = ScriptedLLM([])  # recon 即耗尽脚本失败
-        s = step5_run(target, llm=llm, planner="pipeline")
-        stages = s.get("stages", {})
-        for name in ("recon", "analysis", "verification"):
-            if name not in stages:
-                fails.append(f"被拒阶段 {name} 也应出现在 stages")
-        if stages.get("analysis", {}).get("ok"):
-            fails.append("recon 失败后 analysis 应为 not ok(被拒)")
-        res = json.loads((td / "process" / "agent" / "orchestrator" / "result.json").read_text(encoding="utf-8"))
-        if res.get("success"):
-            fails.append("阶段失败时 result.success 应为 False")
+    try:
+        step5_run(Path("not-a-workspace"), planner="pipeline")
+        fails.append("step5_run 传 planner 应抛 TypeError(参数已移除)")
+    except TypeError:
+        pass
     return fails
 
 
@@ -1444,8 +1393,7 @@ def test_main() -> int:
         ("ingest_merge_dedup", test_ingest_merge_dedup),
         ("aggregator_module", test_aggregator_module),
         ("ingest_verification_overrides", test_ingest_verification_overrides),
-        ("pipeline_mode", test_pipeline_mode),
-        ("pipeline_stages_cover_rejected", test_pipeline_stages_cover_rejected),
+        ("planner_removed", test_planner_removed),
         ("report_json_byproduct", test_report_json_byproduct),
         ("artifact_instance_seq_backfilled", test_artifact_instance_seq_backfilled),
         ("ingest_skips_recon_v3", test_ingest_skips_recon_v3),

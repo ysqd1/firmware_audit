@@ -38,7 +38,7 @@ af8b7fd  修复 Step5 协议解析漂移与正文/思考拆分,同步工具层�
 
 ### (b) 拆分 FindingAggregator(提交 ff1d7f7)
 - `orchestrator.py` 里的纯聚合逻辑拆到独立 `aggregator.py`
-- 新增公开 API:`record_failed`/`finish`/`write_result`
+- 新增公开 API:`record_failed`/`finish`/`write_result`(2026-09-01 随 pipeline 模式删除,ticket 05)
 
 ### (c) 收敛系统目录判断到 file_rules(提交 7476b35)
 - 新增 `firmware_audit/file_rules.py`,收敛 5 个判断

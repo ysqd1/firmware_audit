@@ -86,7 +86,7 @@
 
 * **实现与分层(2026-08-18 目录重组)**:`firmware_audit/step5_agent/` 子文件夹按并列/附属关系组织——顶层 `run_step5.py`(L0 入口,`python -m` 路径不变)+ `orchestrator.py`(LLM 编排层)+ `runner.py`(L1 单 Agent 执行)+ 三个自包含包:`engine/`(ReAct 执行引擎:react\_loop 状态机 + protocol 纯函数解析 + context 四分区 + transcript 落盘)、`data/`(数据契约:artifacts 工件 schema + prompts 提示词)、`providers/`(外部接入:llm\_client + tools/)。依赖只准向下:orchestrator/run\_step5 接线,engine/data/providers 互不 import、包内走相对导入
 
-* **编排(v3)**:`Orchestrator` 轻量 LLM 驱动(ReAct 循环,3 动作 `dispatch_agent`/`summarize`/`finish`),严格单向顺序门 recon→analysis→verification,同类型最多调度 3 次(默认 1 次+至多 2 次补跑;类型+任务唯一性防重复);`planner="pipeline"` 确定性快速模式跳过编排 LLM 轮次
+* **编排(v3)**:`Orchestrator` 轻量 LLM 驱动(ReAct 循环,3 动作 `dispatch_agent`/`summarize`/`finish`),严格单向顺序门 recon→analysis→verification,同类型最多调度 3 次(默认 1 次+至多 2 次补跑;类型+任务唯一性防重复)
 
 * **编排动态分配(2026-08-29)**:每实例结构化 `budget_state`(agent/exhausted/steps/max\_iters/pending\_count/pending\_focuses/overlap\_ratio)注入 summarize 与 dispatch 的 Observation、dispatch\_log.json(逐实例)及 result.json("budget"汇总);`pending_focuses`=recon recommended\_actions(high/medium)∩ 未被 findings 覆盖的疑点(title/file 差分);analysis 预算耗尽(exhausted)且 pending\_count>0 且调度次数<3 时,dispatch Observation 附补跑建议;补跑(同类型第 2/3 次)简报追加已覆盖清单(前 30 条)+ 差分 task,ANALYSIS\_SYSTEM 含"只处理未覆盖疑点,禁止重复提交已存在标题"补跑红线;`overlap\_ratio`(新实例与既有聚合的 title/file 归一化重合比例)>0.5 提示聚焦差分
 
@@ -100,7 +100,7 @@
 
 * **终止策略**:无 API key 或 API 调用失败时立即终止(抛 `LLMError`),不产出降级工件、不执行规则模式
 
-* **接入**:main.py Step1-4 后自动跑 Step5(`--no-step5` 跳过);`step5_run` 接受 target/<N> 或工作区目录(分区子工作区通用);也可 `python -m firmware_audit.step5_agent.run_step5 <dir> [--planner auto|pipeline]` 独立补跑
+* **接入**:main.py Step1-4 后自动跑 Step5(`--no-step5` 跳过);`step5_run` 接受 target/<N> 或工作区目录(分区子工作区通用);也可 `python -m firmware_audit.step5_agent.run_step5 <dir> [--force]` 独立补跑
 
 * **验证**:全套件 176 passed + 2 skipped(orchestrator 20 项含 summarize 报告/degraded 复跑/handoff 快照/状态枚举/pipeline 模式;tools 增 list\_files;pipeline 含 schema v2/权限矩阵/报告主体)✓
 
@@ -115,12 +115,10 @@ LLM 编排(Orchestrator) + 三 Agent,ReAct 模式(类 DeepAudit 分段思路)。
 ### 控制流(v3)
 
 ```python
-def step5_run(ctx, planner="auto"):
-    if planner == "pipeline":   # 确定性快速模式:无编排 LLM 轮次
-        dispatch("recon"); dispatch("analysis"); dispatch("verification")
-        return                   # 三工件齐;不产 LLM 报告(缺失告警)
+def step5_run(ctx):
     orch = Orchestrator(ctx).run()   # LLM 编排:dispatch×3 → summarize → Final Answer
     # summarize Observation = 报告素材;Final Answer 原样落盘 orchestrator/report.md
+    # 唯一路径(ADR-0006:pipeline 快速模式已删,所有运行都产报告)
 ```
 
 编排 LLM 做调度决策,顺序门/唯一性/上限是代码硬约束(不依赖 LLM 自觉);

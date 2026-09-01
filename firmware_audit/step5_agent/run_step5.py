@@ -16,11 +16,8 @@
 断点续跑:某子 Agent .json 工件存在即跳过;仅 .md 降级工件 → degraded(默认重跑,
 STEP5_RESUME_DEGRADED=0 关闭);上游缺件时下游被链路守卫拒绝(不空转)。
 
-planner="pipeline"(确定性快速模式):跳过 orchestrator LLM 循环,Python 按
-顺序门直接调度三 Agent(无编排轮次消耗);此模式不产 LLM 报告。
-
 用法:
-    python -m firmware_audit.step5_agent.run_step5 <dir> [--force] [--planner auto|pipeline]
+    python -m firmware_audit.step5_agent.run_step5 <dir> [--force]
     <dir> 可以是 target/<N>(内含 process/)或工作区本身(process/ 等价目录)
 环境变量:见 llm_client(FIRMWARE_AUDIT_LLM_API_KEY 等;无 key 或 API 调用失败均立即终止,不做降级)。
 密钥文件:firmware_audit/.env(LLMClient 构造时自动加载,环境变量优先于文件)。
@@ -31,7 +28,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .orchestrator import Orchestrator, SubAgentResult
+from .orchestrator import Orchestrator
 from .providers.llm_client import LLMClient, LLMError
 
 
@@ -78,62 +75,11 @@ def _tool_counts(tool_calls: list) -> dict[str, int]:
     return counts
 
 
-def _stages_summary(subs: list[SubAgentResult]) -> dict:
-    """SubAgentResult 列表 → step5_run 返回用的 stages 摘要。"""
-    stages = {}
-    for sub in subs:
-        rec = stages.setdefault(sub.agent_name, {
-            "ok": True, "error": "", "steps": 0, "tool_calls": {}})
-        rec["ok"] = rec["ok"] and sub.ok
-        rec["error"] = rec["error"] or sub.error
-        rec["steps"] += sub.steps
-        for tool, n in _tool_counts(sub.tool_calls).items():
-            rec["tool_calls"][tool] = rec["tool_calls"].get(tool, 0) + n
-    return stages
-
-
-def _run_pipeline(process_dir: Path, base, force: bool):
-    """确定性快速模式:Python 按顺序调度三 Agent(无 orchestrator LLM 轮次)。
-
-    沿用断点续跑/上游缺件拒绝语义(复用 DispatchAgentTool 守卫,留痕齐全),
-    但不跑协调器 ReAct 循环;不产 LLM 报告(缺失由 step5_run 告警)。
-    终态与 auto 模式对称落盘 orchestrator/result.json:聚合 findings 与各
-    阶段统计完整保留(与 summarize 缺失语义一致,供补跑/再编排)。
-    返回 Orchestrator 实例(不 run()),调用方取 dispatches/_agent_results。
-    """
-    orch = Orchestrator(process_dir, base, force=force)  # 只用其守卫与落盘,不 run()
-    from .orchestrator import DispatchAgentTool
-    from .providers.tools import ToolContext
-
-    tool = DispatchAgentTool(ToolContext(process_dir=process_dir), orch)
-    planned = [("recon", "对解包固件做广度侦察,产出攻击面清单"),
-               ("analysis", "对攻击面疑点逐个取证,输出候选漏洞 findings"),
-               ("verification", "复核候选漏洞,过滤误报,输出 verified_findings")]
-    errors: dict[str, str] = {}
-    for agent, task in planned:
-        res = tool.execute(agent=agent, task=task, context="")
-        if not res.ok:
-            errors[agent] = res.error or "pipeline 阶段未完成"
-            print(f"[step5:pipeline] {agent} 未完成: {res.error}", flush=True)
-    # 被拒/未执行阶段也进 stages(调用方可区分"未规划"与"被拒")
-    planned_task = dict(planned)
-    for agent, err in errors.items():
-        if agent not in orch.agent_results:
-            orch.record_failed(agent, err, task=planned_task.get(agent, ""))
-    orch.finish(
-        success=(not errors and all(sub.ok for sub in orch.dispatches)
-                 and len(orch.dispatches) == len(planned)),
-        error="; ".join(f"{a}: {e}" for a, e in errors.items()))
-    orch.write_result()  # transcript: pipeline 模式无,走公开 API
-    return orch
-
-
-def step5_run(target_dir: Path, force: bool = False, llm=None,
-              planner: str = "auto") -> dict:
-    """跑完整 Step5(Orchestrator 统一编排)。返回摘要 dict(mode/stages/report)。
+def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
+    """跑完整 Step5(Orchestrator 统一编排)。返回摘要 dict(stages/report)。
     无 API key 或 API 调用失败时抛 LLMError(立即终止,不做降级)。
     llm 用于测试注入(ScriptedLLM);None 时按环境变量建 LLMClient。
-    planner: "auto"=LLM 编排(默认,含 summarize 报告);"pipeline"=确定性快速模式。"""
+    唯一路径=LLM 编排(ADR-0006:pipeline 快速模式已删,所有运行都产报告)。"""
     process_dir = resolve_workspace(Path(target_dir))
     if not (process_dir / "analysis").is_dir() and not (process_dir / "agent").is_dir():
         raise FileNotFoundError(f"工作区无 analysis/ 工件: {process_dir}(先跑 Step1-4)")
@@ -141,27 +87,6 @@ def step5_run(target_dir: Path, force: bool = False, llm=None,
     base = llm or LLMClient()
     if not base.available:
         raise _no_key_error()
-
-    if planner == "pipeline":
-        orch = _run_pipeline(process_dir, base, force)
-        report: Path | None = None  # pipeline 无 LLM 报告
-        subs = orch.dispatches
-        # stages 覆盖全部规划阶段(被拒阶段以 failed+error 呈现,与 result.json 对称)
-        stages = _stages_summary(list(orch._agent_results.values()))
-        usage_total = dict(getattr(base, "total_usage", {}))  # 与 auto 模式对称
-        tool_total: dict[str, int] = {}
-        for sub in subs:
-            for tool, n in _tool_counts(sub.tool_calls).items():
-                tool_total[tool] = tool_total.get(tool, 0) + n
-        print("[step5] 警告: pipeline 模式不产 LLM 总结报告"
-              "(verified_findings.json 已产出,详见 process/agent/)", file=sys.stderr)
-        return {
-            "mode": "pipeline",
-            "stages": stages,
-            "usage": usage_total,
-            "tool_calls": tool_total,
-            "report": None,
-        }
 
     orch = Orchestrator(process_dir, base, force=force)
     orch.run()
@@ -207,12 +132,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("target_dir", type=Path,
                     help="target/<N> 目录或工作区目录(含 process/ 或本身即 process 等价)")
     ap.add_argument("--force", action="store_true", help="忽略已有工件,全部重跑")
-    ap.add_argument("--planner", choices=["auto", "pipeline"], default="auto",
-                    help="auto=LLM 编排+summarize 报告(默认);pipeline=确定性快速模式(无 LLM 报告)")
     args = ap.parse_args(argv)
 
     try:
-        summary = step5_run(args.target_dir, force=args.force, planner=args.planner)
+        summary = step5_run(args.target_dir, force=args.force)
     except LLMError as e:
         print(f"[step5] 终止: {e}", file=sys.stderr)
         return 2

@@ -1153,7 +1153,7 @@ Orchestrator 自己的 ReAct 循环只暴露这 3 个动作，与子 Agent 的 1
 
 * `run_agent(cfg, process_dir, base_llm, upstream, output_dir, extra_brief)` → `AgentRunResult`（异常不抛，记入 error）；`output_dir` 由 orchestrator 按 `<seq>_<type>` 指定，`extra_brief` 注入交接块。
 
-* **`Orchestrator`（v3）**：轻量 LLM 驱动编排层，ReAct 循环用 `dispatch_agent`/`summarize`/`finish` 三动作，硬守卫见"编排层工具"节。签发：只认 `.json` 工件断点续跑（`.md` 降级 → `degraded` 默认复跑）；严格单向顺序门；类型+任务唯一性；同类型最多 3 次。动态分配（2026-08-29）：每实例 `budget_state`（exhausted/steps/max\_iters/pending\_count/pending\_focuses/overlap\_ratio）进 summarize 与 dispatch 的 Observation、`dispatch_log.json`（逐实例）及 `result.json`（`budget` 各类型汇总）；`pending_focuses` = recon recommended\_actions（high/medium）∩ 未被 findings 覆盖的疑点（title/file 差分）；analysis 预算耗尽且仍有未覆盖疑点且调度次数<3 时给补跑建议，补跑简报追加已覆盖清单（前 30 条）+ 差分 task。`planner="pipeline"` 确定性快速模式跳过编排 LLM 轮次。
+* **`Orchestrator`（v3）**：轻量 LLM 驱动编排层，ReAct 循环用 `dispatch_agent`/`summarize`/`finish` 三动作，硬守卫见"编排层工具"节。签发：只认 `.json` 工件断点续跑（`.md` 降级 → `degraded` 默认复跑）；严格单向顺序门；类型+任务唯一性；同类型最多 3 次。动态分配（2026-08-29）：每实例 `budget_state`（exhausted/steps/max\_iters/pending\_count/pending\_focuses/overlap\_ratio）进 summarize 与 dispatch 的 Observation、`dispatch_log.json`（逐实例）及 `result.json`（`budget` 各类型汇总）；`pending_focuses` = recon recommended\_actions（high/medium）∩ 未被 findings 覆盖的疑点（title/file 差分）；analysis 预算耗尽且仍有未覆盖疑点且调度次数<3 时给补跑建议，补跑简报追加已覆盖清单（前 30 条）+ 差分 task。
 
 * **报告（v3 生成主体 = orchestrator）**：verification 完成后调用 `summarize` 取素材 → Final Answer 即报告正文，**原样落盘** **`orchestrator/report.md`**（含可解析 JSON 时另存 `report.json` 副产品）。`render_report` 已删除（2026-08-28），报告缺失时 `step5_run` 明确告警不静默降级。
 
@@ -1173,11 +1173,11 @@ class AgentRunResult:
 
 ### 入口 `run_step5.py`
 
-* `step5_run(workspace, force=False, llm=None, planner="auto")`：v3 默认走 `Orchestrator` 编排（dispatch×3 → summarize → 报告落盘）；`planner="pipeline"` 确定性快速模式由 Python 按顺序门直调三 Agent（无编排 LLM 轮次，不产报告）。
+* `step5_run(workspace, force=False, llm=None)`：走 `Orchestrator` 编排（dispatch×3 → summarize → 报告落盘）——唯一路径（ADR-0006:pipeline 快速模式已删）。
 
 * 断点续跑：`.json` 工件存在 → `skipped`；仅 `.md` 降级 → `degraded` 默认复跑（`STEP5_RESUME_DEGRADED=0` 恢复旧跳过语义）。
 
-* `--force` 强制三 Agent 重跑；`--planner auto|pipeline`。
+* `--force` 强制三 Agent 重跑。
 
 * main.py 不传 force 给 Step5（环形续跑始终命中）；要重跑 Step5 用本入口 `--force`。
 
