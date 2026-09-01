@@ -9,7 +9,7 @@ from pathlib import Path
 
 from ....docker.docker_utils import run_docker
 from ....file_rules import get_search_exclude_dirs
-from .base import ToolContext
+from .base import ToolContext, resolve_within
 
 SANDBOX_IMAGE = "firm_audit/sandbox:latest"
 EXTRACTED_MOUNT = "/work/extracted"
@@ -34,11 +34,15 @@ def extracted_root(ctx: ToolContext) -> Path:
 
 
 def container_path(ctx: ToolContext, file_ref: str) -> str | None:
-    """file_ref → /work/extracted/<rel>;含路径穿越(../)或越界时返回 None。"""
+    """file_ref → /work/extracted/<rel>;含路径穿越(../)或越界时返回 None。
+
+    注:file_ref 为 None 时保持原契约(.strip() 抛 AttributeError,由 execute
+    统一捕获为"失败不崩"),不静默转成空串去碰 Docker。空串按越界拒绝
+    (C4 起,原行为是放行到挂载根——那本是不该暴露的边界,故收敛为拒绝)。
+    """
     root = extracted_root(ctx).resolve()
     ref = file_ref.strip().replace("\\", "/")
-    p = (root / ref).resolve()
-    if p != root and root not in p.parents:
+    if resolve_within(root, ref) is None:
         return None
     return f"{EXTRACTED_MOUNT}/{ref}"
 

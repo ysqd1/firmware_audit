@@ -177,6 +177,11 @@ def test_read_file(tools, process_dir) -> list[str]:
     r3 = tools["read_file"].execute(path="fileinfo.json", offset=10**9)
     if r3.ok:
         fails.append("offset 超界应报错")
+
+    # None 缺参快速失败(不静默转空串列根,C4 契约回归 guard)
+    r4 = tools["read_file"].execute(path=None)
+    if r4.ok or not (r4.error or "").startswith(("TypeError", "AttributeError")):
+        fails.append(f"None 缺参应快速失败, got ok={r4.ok} err={r4.error}")
     return fails
 
 

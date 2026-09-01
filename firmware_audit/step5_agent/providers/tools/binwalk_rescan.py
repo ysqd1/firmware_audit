@@ -11,7 +11,7 @@ recon 用它对 unknown 裸二进制按需重扫:确认内部是否藏 squashfs/
 from __future__ import annotations
 
 from ....docker.docker_utils import docker_available, run_docker
-from .base import AgentTool, ToolResult
+from .base import AgentTool, ToolResult, resolve_within
 from .cli_base import extracted_root
 
 BINWALK_IMAGE = "binwalk"
@@ -30,9 +30,9 @@ class BinwalkRescanTool(AgentTool):
                               error=f"binwalk 镜像不可用: {BINWALK_IMAGE}")
         root = extracted_root(self.ctx).resolve()
         ref = file_ref.strip().replace("\\", "/")
-        # 防路径穿越:解析后必须仍在 extracted 根内
-        p = (root / ref).resolve()
-        if p != root and root not in p.parents:
+        # 防路径穿越:解析后必须仍在 extracted 根内(None 由 .strip() 抛,execute 兜底;
+        # 空串按越界拒绝——C4 起,原行为是放行到 extracted 根,收敛为拒绝)
+        if resolve_within(root, ref) is None:
             return ToolResult(ok=False, text="", error=f"非法路径: {file_ref}")
         rc, out, err = run_docker(
             BINWALK_IMAGE, [f"{_MOUNT}/{ref}"],

@@ -13,7 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ....file_rules import is_search_excluded
-from .base import AgentTool, ToolResult
+from .base import AgentTool, ToolResult, resolve_within
 
 DEFAULT_MAX_FILES = 100
 
@@ -38,10 +38,13 @@ class ListFilesTool(AgentTool):
             n = max(1, int(max_files))
         except (TypeError, ValueError):
             n = DEFAULT_MAX_FILES
-        ref = str(directory or ".").replace("\\", "/")
-        target = (root / ref).resolve() if ref not in (".", "") else root
-        if target != root and root not in target.parents:
-            return ToolResult(ok=False, text="", error=f"路径越界: {directory}(只允许 process/ 之下)")
+        ref = str(directory or ".").strip().replace("\\", "/")
+        if ref in (".", ""):
+            target = root
+        else:
+            target = resolve_within(root, ref)
+            if target is None:
+                return ToolResult(ok=False, text="", error=f"路径越界: {directory}(只允许 process/ 之下)")
         if not target.exists():
             return ToolResult(ok=False, text="", error=f"目录不存在: {directory}")
         if not target.is_dir():

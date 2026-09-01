@@ -31,6 +31,27 @@ class ToolContext:
     process_dir: Path  # target/<N>/process(工件根,也是 read_file 白名单根)
 
 
+def resolve_within(root: Path, ref: str | None) -> Path | None:
+    """把 ref(相对路径,可能带 \\ 分隔)解析为 root 下的绝对路径;越界返回 None。
+
+    C4(2026-08-31)收敛:各工具"防路径穿越"判定原为同一句
+      if p != root and root not in p.parents
+    复制在 base.resolve_analysis_file / cli_base.container_path / read_file /
+    list_files / search_code._resolve_scope / binwalk_rescan 六处,规则已分叉。
+    统一收口到此;空串/None/越界(.. / 绝对路径)一律返回 None,由调用方决定
+    是报错还是静默跳过(失败不崩,见 rules.md)。根目录自身(如 ".")按 containment
+    语义视为合法,返回 root(调用方若要"根即越界"需自行特判)。
+    """
+    base = Path(root).resolve()
+    r = str(ref or "").strip().replace("\\", "/")
+    if not r:
+        return None
+    cand = (base / r).resolve()
+    if cand != base and base not in cand.parents:
+        return None
+    return cand
+
+
 def truncate_text(text: str, limit: int = MAX_TEXT_CHARS) -> str:
     """Observation 入上下文截断(学 DeepAudit:截断必告知总量,头尾保留)。
 
@@ -89,7 +110,5 @@ def resolve_analysis_file(ctx: ToolContext, file_ref: str, suffix: str) -> Path 
         if ref.endswith(ext):
             ref = ref[: -len(ext)]
             break
-    cand = (base / (ref + suffix)).resolve()
-    if cand != base and base not in cand.parents:
-        return None
-    return cand if cand.exists() else None
+    cand = resolve_within(base, ref + suffix)
+    return cand if cand and cand.exists() else None

@@ -5,9 +5,7 @@ survey.json / findings.json / 反编译产物细节,不把整个工件塞进对�
 """
 from __future__ import annotations
 
-from pathlib import Path
-
-from .base import AgentTool, ToolResult
+from .base import AgentTool, ToolResult, resolve_within
 
 # 单次读取行数上限:防 Agent 一次把大工件全量读进上下文
 DEFAULT_LINES = 200
@@ -21,8 +19,9 @@ class ReadFileTool(AgentTool):
 
     def _run(self, path: str, offset: int = 0, limit: int = DEFAULT_LINES) -> ToolResult:
         root = self.ctx.process_dir.resolve()
-        p = (Path(path) if Path(path).is_absolute() else root / path).resolve()
-        if p != root and root not in p.parents:
+        ref = path.strip().replace("\\", "/")  # None 抛 AttributeError,execute 兜底(缺参快速失败)
+        p = root if ref in (".", "") else resolve_within(root, ref)
+        if p is None:
             return ToolResult(ok=False, text="", error=f"路径越界: {path}(只允许 process/ 之下)")
         if not p.exists():
             return ToolResult(ok=False, text="", error=f"文件不存在: {path}")

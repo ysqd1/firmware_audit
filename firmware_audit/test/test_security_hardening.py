@@ -17,9 +17,9 @@ from firmware_audit.step0.step0_preprocess import _decompress_archive
 from firmware_audit.step5_agent.providers.tools.base import (
     ToolContext,
     resolve_analysis_file,
+    resolve_within,
 )
 from firmware_audit.step5_agent.providers.tools.gitleaks_scan import build_gitleaks_cmd
-
 
 # ---- Bug B: zip/tar-slip 越界写 ----
 
@@ -87,6 +87,31 @@ def test_preprocess_fallback_on_bad_archive() -> list[str]:
     return fails
 
 
+# ---- C4: resolve_within 收敛原语 ----
+
+def test_resolve_within() -> list[str]:
+    """resolve_within 边界契约(C4 收敛的路径穿越判定原语)。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as _td:
+        root = Path(_td)
+        (root / "sub").mkdir()
+        # 正常子路径 → 绝对路径
+        if resolve_within(root, "sub") != (root / "sub").resolve():
+            fails.append("正常子路径应解析")
+        # 反斜杠宽容
+        if resolve_within(root, "sub\\deep") != (root / "sub" / "deep").resolve():
+            fails.append("反斜杠应宽容换算")
+        # 根自身(./空串)与子路径 → 放行;越界/空 None → None
+        if resolve_within(root, ".") != root.resolve():
+            fails.append("'.' 应解析为根(containment 允许等于根)")
+        for bad in ("", "/", "..", "../x", "sub/../../x", "C:\\evil"):
+            if resolve_within(root, bad) is not None:
+                fails.append(f"越界/空引用应按 None 拒绝: {bad!r}")
+        if resolve_within(root, None) is not None:
+            fails.append("None 引用应按 None 拒绝")
+    return fails
+
+
 # ---- Bug A: analysis 工具路径越界读 ----
 
 def test_resolve_analysis_blocks_escape() -> list[str]:
@@ -147,6 +172,7 @@ def test_main() -> int:
         ("preprocess_fallback_on_bad_archive", test_preprocess_fallback_on_bad_archive),
         ("resolve_analysis_blocks_escape", test_resolve_analysis_blocks_escape),
         ("gitleaks_cmd_quotes_source", test_gitleaks_cmd_quotes_source),
+        ("resolve_within", test_resolve_within),
     ]:
         fl = fn()
         if fl:

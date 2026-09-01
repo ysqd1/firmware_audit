@@ -20,7 +20,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from ....file_rules import is_search_excluded
-from .base import AgentTool, ToolResult
+from .base import AgentTool, ToolResult, resolve_within
 
 MAX_RESULTS_DEFAULT = 50
 MAX_RESULTS_CAP = 100
@@ -182,10 +182,8 @@ class SearchCodeTool(AgentTool):
     def _resolve_scope(self, root: Path, directory: str) -> Path | None:
         """grep 范围:目录默认 extracted/;directory 指定则收窄/扩到 process/ 下。"""
         ref = (directory or "extracted").replace("\\", "/").strip("/")
-        target = (root / ref).resolve() if ref else root
-        if target != root and root not in target.parents:
-            return None
-        return target if target.is_dir() else None
+        target = resolve_within(root, ref) if ref else root
+        return target if target and target.is_dir() else None
 
     def _grep_text(self, scope: Path, file_pattern: str, pat, root: Path,
                    push, searched: dict) -> None:

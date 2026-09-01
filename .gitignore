@@ -17,6 +17,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 *.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+
+# ---- 端到端验证日志(留磁盘取证,不入仓) ----
+e2e_*.log
 
 # ---- Docker 构建临时物 / 第三方嵌入源码 / 大型发布包 ----
 *.tar.gz
