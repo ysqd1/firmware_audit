@@ -44,7 +44,7 @@
 
 ## 已知坑
 
-- **deepseek-v4-flash 是推理模型**(2026-08-17 冒烟实测):回复分两个字段,思考在 `reasoning_content`、正文在 `content`;思考耗尽 max_tokens 时 content 为空(finish_reason=length)。LLMClient 必须合并两个字段再给 ReAct 解析器;max_tokens 默认 8192(思考计入预算)。冒烟结论:协议遵循良好,5 步自主完成 imports→xref→decompile 链,单任务 ~10k token。
+- **deepseek-v4-flash 是推理模型**(2026-08-17 冒烟实测):回复分两个字段,思考在 `reasoning_content`、正文在 `content`;思考耗尽 max_tokens 时 content 为空(finish_reason=length)。LLMClient 只把正文给 ReAct 解析器(思考随 usage.reasoning_content 留档,见 08-30 拆分);max_tokens 默认 32768(ADR-0005,思考计入预算,思考烧满由截断续写兜底)。冒烟结论:协议遵循良好,5 步自主完成 imports→xref→decompile 链,单任务 ~10k token。
 - **cve-bin-tool 3.4 的 PURL2CPE 源首跑必崩**:populate_purl2cpe 时 purl2cpe.db 未初始化,报 `OperationalError: no such table: purl2cpe`。必须 `--disable-data-source PURL2CPE`(cve_bin_tool_scan.py 已内置)。CVE 库首跑下载 NVD 数据较慢(无 key 限速),降级返回错误不崩。**预热 + 库挂载的坑**(2026-08-22 实测):库挂在宿主 `process/.cve_cache`,工具挂到容器 `$HOME/.cache`(父目录,非旧约定 `~/.cache/cvedb`——那是 3.4 找不到库报码 40 的根因);预热命令必须带目录参数(`-u now /tmp`,缺则 InsufficientArgs 码 24)且别把 `cve-bin-tool` 目录本身当挂载根(clear_cached_data 报 Device or resource busy)。详见 agents.md / tools_summary.md。
 
 - **radare2 源码安装是"软链安装"(symstall)**:bullseye apt 无 radare2 包,源码 `sys/install.sh` 后 /usr/local 下的 bin/lib/pkgconfig 全是指向构建目录(/tmp/radare2)的符号链接;删构建目录前必须把软链解引用成真实文件,否则 449 个软链全部悬空、r2 报 command not found。安装全程见 docker/sandbox/Dockerfile,r2 固定 5.9.8 tag,capstone 下载用 `CS_COMMIT_ARCHIVE=1` 走 wget(直连 git clone 会被网络掐断)。

@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import sys
 import urllib.error
 from pathlib import Path
@@ -57,15 +58,20 @@ class _Resp:
 
 
 class _Net:
-    """按序触发预设行为(Exception 直接抛);耗尽后重复最后一个。记调用数。"""
+    """按序触发预设行为(Exception 直接抛);耗尽后重复最后一个。
+
+    记调用数 + 每次请求的原始 body(供断言续写请求内容)。"""
 
     def __init__(self, behaviors: list):
         self.behaviors = behaviors
         self.calls = 0
+        self.request_bodies: list[bytes] = []
 
     def urlopen(self, req, timeout=None):
         b = self.behaviors[min(self.calls, len(self.behaviors) - 1)]
         self.calls += 1
+        if hasattr(req, "data"):
+            self.request_bodies.append(req.data)
         if isinstance(b, Exception):
             raise b
         return _Resp(b)
@@ -163,7 +169,7 @@ def test_reasoning_split_return() -> list[str]:
     防止推理段的"草稿 Action"被 ReAct 解析器当真实调用执行。"""
     fails: list[str] = []
     with _stub_net([_reasoning_body(
-        "内部思考草稿 Action: echo", "Thought: 查\nAction: echo\nAction Input: {}")], []) as net:
+        "内部思考草稿 Action: echo", "Thought: 查\nAction: echo\nAction Input: {}")], []) as _net:
         content, usage = _client().chat([{"role": "user", "content": "hi"}])
         if "草稿" in content or content.strip() != "Thought: 查\nAction: echo\nAction Input: {}":
             fails.append(f"chat 应只返回正文: {content!r}")
@@ -172,17 +178,110 @@ def test_reasoning_split_return() -> list[str]:
     return fails
 
 
-def test_empty_content_with_reasoning_retries() -> list[str]:
-    """2026-08-30:content 空但思考非空 → 不得拿思考顶替当回复,应走空回复重试。"""
+def test_empty_content_with_reasoning_continuation() -> list[str]:
+    """ADR-0005:content 空 + reasoning 非空 → 截断续写,不判空回复硬重试。
+
+    断言:续写请求发出(assistant 带 reasoning_content + 续写提示 + 原 max_tokens)、
+    返回续写 content、无重试等待、续写消息不污染调用方原 messages。"""
     fails: list[str] = []
     sleeps: list[float] = []
-    with _stub_net([_reasoning_body("想了很多但没写正文"), _ok_body("second")],
+    orig_msgs = [{"role": "user", "content": "hi"}]
+    with _stub_net([_reasoning_body("想烧满预算的思考"), _ok_body("接续后的正文")],
                    sleeps) as net:
+        content, usage = _client().chat(orig_msgs)
+        if content != "接续后的正文":
+            fails.append(f"应返回续写 content: {content!r}")
+        if net.calls != 2:
+            fails.append(f"应共 2 次请求(原请求 + 1 次续写), got {net.calls}")
+        if sleeps:
+            fails.append(f"续写成功不应触发重试等待: {sleeps}")
+        # 续写请求内容:assistant 带 reasoning_content + 续写提示 + 原 max_tokens
+        req1 = json.loads(net.request_bodies[0].decode("utf-8"))
+        req2 = json.loads(net.request_bodies[1].decode("utf-8"))
+        msgs2 = req2["messages"]
+        if msgs2[-2].get("role") != "assistant" or \
+                msgs2[-2].get("reasoning_content") != "想烧满预算的思考":
+            fails.append(f"续写请求应带 assistant reasoning_content: {msgs2[-2]}")
+        if msgs2[-1].get("role") != "user" or \
+                "别展开思考" not in msgs2[-1].get("content", ""):
+            fails.append(f"续写请求应带续写提示: {msgs2[-1]}")
+        if req2.get("max_tokens") != req1.get("max_tokens"):
+            fails.append("续写应使用原 max_tokens 再调")
+        # chat 对上层透明:原 messages 不被续写污染(续写只回传 API)
+        if orig_msgs != [{"role": "user", "content": "hi"}]:
+            fails.append(f"续写不得改写调用方 messages: {orig_msgs}")
+        # 思考随 usage 返回(截断段 + 续写段),供 transcript 留档审计
+        if usage.get("reasoning_content") != "想烧满预算的思考":
+            fails.append(f"usage 应携带被截断的思考: {usage}")
+        # usage 全量合并:两次调用的 token 用量都计入(prompt/completion 各 1+1)
+        if usage.get("prompt_tokens") != 2 or usage.get("completion_tokens") != 2:
+            fails.append(f"usage 应合并两次调用用量: {usage}")
+    return fails
+
+
+def test_continuation_reasoning_merge() -> list[str]:
+    """ADR-0005:续写响应本身带 reasoning_content → 思考拼回完整段(截断+续写)。"""
+    fails: list[str] = []
+    sleeps: list[float] = []
+    with _stub_net([_reasoning_body("截断思考"), _reasoning_body("续写思考", "续写正文")],
+                   sleeps) as _net:
+        content, usage = _client().chat([{"role": "user", "content": "hi"}])
+        if content != "续写正文":
+            fails.append(f"应返回续写 content: {content!r}")
+        if usage.get("reasoning_content") != "截断思考\n续写思考":
+            fails.append(f"思考应拼回完整段: {usage.get('reasoning_content')!r}")
+        # 合并 token 用量(prompt/completion 各 1+1)
+        if usage.get("prompt_tokens") != 2 or usage.get("completion_tokens") != 2:
+            fails.append(f"usage 应合并两次调用用量: {usage}")
+    return fails
+
+
+def test_continuation_failure_degrades_to_retry() -> list[str]:
+    """ADR-0005:续写请求失败(400 等)→ 降级为普通重试,不阻塞流程。
+
+    第 1 次:content 空 + reasoning 非空 → 触发续写(第 2 次请求);
+    续写返回 400 → 降级普通重试(第 3 次请求重发原请求——不含 reasoning_content
+    ——并成功);续写只尝试一次,不反复打不兼容供应商。"""
+    fails: list[str] = []
+    sleeps: list[float] = []
+    behaviors = [
+        _reasoning_body("想烧满预算的思考"),
+        urllib.error.HTTPError("u", 400, "Bad Request", None,
+                               io.BytesIO(b"reasoning_content unsupported")),
+        _ok_body("重试后的最终回复"),
+    ]
+    with _stub_net(behaviors, sleeps) as net:
         content, _ = _client().chat([{"role": "user", "content": "hi"}])
-        if content != "second" or net.calls != 2:
-            fails.append(f"正文为空应重试: calls={net.calls} content={content!r}")
-        if sleeps != [lc.RETRY_INTERVALS[0]]:
-            fails.append(f"应触发一次重试等待: {sleeps}")
+        if content != "重试后的最终回复":
+            fails.append(f"续写失败后应降级重试并恢复: {content!r}")
+        if net.calls != 3:
+            fails.append(f"应共 3 次请求(原+续写+降级重试), got {net.calls}")
+        # 第 3 次(降级重试)是原请求重发,不得再带 reasoning_content 续写消息
+        req3 = json.loads(net.request_bodies[2].decode("utf-8"))
+        for m in req3["messages"]:
+            if "reasoning_content" in m:
+                fails.append(f"降级重试不得带 reasoning_content: {m}")
+                break
+    if sleeps != [lc.RETRY_INTERVALS[0]]:
+        fails.append(f"降级重试应等待 {lc.RETRY_INTERVALS[0]}s, got {sleeps}")
+    return fails
+
+
+def test_default_max_tokens_bumped() -> list[str]:
+    """ADR-0005:DEFAULT_MAX_TOKENS 16384→32768;env LLM_MAX_TOKENS 仍可覆盖。"""
+    fails: list[str] = []
+    if lc.DEFAULT_MAX_TOKENS != 32_768:
+        fails.append(f"DEFAULT_MAX_TOKENS 应为 32768, got {lc.DEFAULT_MAX_TOKENS}")
+    os.environ["LLM_MAX_TOKENS"] = "8192"
+    sleeps: list[float] = []
+    try:
+        with _stub_net([_ok_body("ok")], sleeps) as net:
+            _client().chat([{"role": "user", "content": "hi"}])
+        req = json.loads(net.request_bodies[0].decode("utf-8"))
+        if req.get("max_tokens") != 8192:
+            fails.append(f"env 应覆盖 max_tokens: {req.get('max_tokens')}")
+    finally:
+        os.environ.pop("LLM_MAX_TOKENS", None)
     return fails
 
 
@@ -217,7 +316,10 @@ def test_main() -> int:
         ("exhaust_all_retries", test_exhaust_all_retries),
         ("empty_reply_is_retryable", test_empty_reply_is_retryable),
         ("reasoning_split_return", test_reasoning_split_return),
-        ("empty_content_with_reasoning_retries", test_empty_content_with_reasoning_retries),
+        ("empty_content_with_reasoning_continuation", test_empty_content_with_reasoning_continuation),
+        ("continuation_reasoning_merge", test_continuation_reasoning_merge),
+        ("continuation_failure_degrades_to_retry", test_continuation_failure_degrades_to_retry),
+        ("default_max_tokens_bumped", test_default_max_tokens_bumped),
         ("intervals_in_range_and_logs", test_intervals_in_range_and_logs),
     ]:
         fl = fn()
