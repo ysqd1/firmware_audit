@@ -29,6 +29,7 @@ from firmware_audit.step5_agent.orchestrator import (
     build_orchestrator_prompt,
     MAX_DISPATCH_PER_AGENT,
 )
+from firmware_audit.step5_agent.data.artifacts import load_artifact
 from firmware_audit.step5_agent.providers.tools import ToolContext
 from firmware_audit.test.scripted_llm import ScriptedLLM
 
@@ -142,6 +143,11 @@ def test_build_orchestrator_prompt() -> list[str]:
                    "Thought:", "Action:", "Action Input:"):
         if needle not in prompt:
             fails.append(f"提示词应含 '{needle}'")
+    # Ticket 04:报告未复核疑点独立区段(⚠ 未经复核,confidence 为 analysis 初值)
+    for needle in ("未复核疑点", "未经复核,confidence 为 analysis 初值",
+                   "只含**已复核** finding"):
+        if needle not in prompt:
+            fails.append(f"提示词报告结构应含未复核区段要求 '{needle}'")
     if f"最多调度 {MAX_DISPATCH_PER_AGENT} 次" not in prompt:
         fails.append(f"提示词应明确调度次数上限 {MAX_DISPATCH_PER_AGENT}")
     for banned in ("同一时间仅允许一个", "串行执行"):
@@ -544,6 +550,88 @@ def test_summarize_tool_and_report() -> list[str]:
         material_msg = llm.calls[10][-1]["content"]
         if "报告写作素材" not in material_msg:
             fails.append(f"summarize 后应注入报告素材: {material_msg[:120]}")
+    return fails
+
+
+REPORT_MD_04 = ('Final Answer: # 固件安全审计报告\n## 发现清单\n'
+                '- [high] ✓ f1\n- [medium] ✗ f2(误报)\n'
+                '## 未复核疑点\n- [low] ⚠ f3 未经复核,confidence 为 analysis 初值\n'
+                '## 误报剔除\n- f2(实为默认文档示例)')
+
+
+def test_report_unreviewed_section() -> list[str]:
+    """Ticket 04:summarize 素材把 verified=None 的 finding 拆进独立未复核区
+    (⚠,confidence 保留 analysis 初值、rationale 为空),不混入已复核区;
+    report.md 落盘含独立未复核区段(未经复核标注)。"""
+    fails: list[str] = []
+    import os
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    # 3 条 findings:K=2 → 复核 f1/f2,f3(low)未复核 verified=None
+    ANALYSIS3 = ('Final Answer: {"summary": "取证3", "findings": ['
+                 '{"title": "f1", "severity": "high", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f2", "severity": "medium", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f3", "severity": "low", "file": "unitree/bin/idlc", "confidence": "high"}]}')
+    VF1 = ('Final Answer: {"summary": "复核f1", "findings": [{"title": "f1", '
+           '"severity": "high", "file": "unitree/bin/idlc", "verified": true, "rationale": "r1"}]}')
+    VF2 = ('Final Answer: {"summary": "复核f2", "findings": [{"title": "f2", '
+           '"severity": "medium", "file": "unitree/bin/idlc", "verified": false, "rationale": "r2"}]}')
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        _make_process(td)
+        os.environ["STEP5_VERIFY_K"] = "2"
+        try:
+            llm = ScriptedLLM([
+                D % "recon", TOOL, RECON_FINAL,        # 0/1/2
+                D % "analysis", TOOL, ANALYSIS3,        # 3/4/5
+                D % "verification",                      # 6 阶段
+                VTOOL, VF1,                              # 7/8 复核 f1
+                VTOOL, VF2,                              # 9/10 复核 f2
+                SUM,                                     # 11 summarize 取素材
+                REPORT_MD_04,                            # 12 Final Answer = 报告
+            ])
+            orch = _orch(td, llm)
+            orch.run()
+        finally:
+            del os.environ["STEP5_VERIFY_K"]
+
+        agent = td / "process" / "agent"
+        # 素材:Report Final Answer 前一轮 user 消息(Final 调用即 llm.calls[-1])
+        material = llm.calls[-1][-1]["content"]
+        if "#### 已复核 findings" not in material or "#### 未复核疑点" not in material:
+            fails.append("素材应拆已复核/未复核独立区段")
+        # 未复核区:⚠ + confidence 初值 + rationale 空;不含已验证条目/复核结论
+        unrev = material[material.find("#### 未复核疑点"):]
+        for needle in ("f3", "⚠", "confidence 保留 analysis 初值", "rationale 为空"):
+            if needle not in unrev:
+                fails.append(f"未复核区应含 '{needle}': {unrev[:200]}")
+        for banned in ("f1", "f2", "r1", "r2"):
+            if banned in unrev:
+                fails.append(f"未复核区不得混入已验证条目/结论 '{banned}'")
+        # 已复核区:完整 confidence + rationale,含 ✓/✗ 两种复核结论
+        rev = material[material.find("#### 已复核 findings"):material.find("#### 未复核疑点")]
+        for needle in ("f1", "f2", "✓", "✗", "verified=True", "verified=False",
+                       "rationale: r1", "rationale: r2"):
+            if needle not in rev:
+                fails.append(f"已复核区应含 '{needle}': {rev[:200]}")
+        # report.md:独立未复核区段落盘 + 未经复核标注
+        md = agent / "orchestrator" / "report.md"
+        if not md.is_file():
+            fails.append("summarize+Final Answer 后应产出 report.md")
+        else:
+            text = md.read_text(encoding="utf-8")
+            for needle in ("## 未复核疑点", "未经复核", "f3"):
+                if needle not in text:
+                    fails.append(f"报告应含未复核区段 '{needle}': {text[:200]}")
+        # 数据层:verified_findings.json 未复核条目的 confidence 保留 analysis 初值
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is not None:
+            by_title = {f.get("title"): f for f in vf["findings"]}
+            f3 = by_title.get("f3")
+            if f3 is None or f3.get("verified") is not None:
+                fails.append(f"f3 应 verified=None 保留在 verified_findings: {f3}")
+            elif f3.get("confidence") != "high":
+                fails.append(f"未复核 f3 的 confidence 应保留 analysis 初值: {f3}")
     return fails
 
 
@@ -1348,6 +1436,7 @@ def test_main() -> int:
         ("orchestrator_integration_dirs", test_orchestrator_integration_dirs),
         ("orchestrator_multi_dispatch_integration", test_orchestrator_multi_dispatch_integration),
         ("summarize_tool_and_report", test_summarize_tool_and_report),
+        ("report_unreviewed_section", test_report_unreviewed_section),
         ("report_absent_without_summarize", test_report_absent_without_summarize),
         ("degraded_resume_rerun", test_degraded_resume_rerun),
         ("handoff_snapshot_file", test_handoff_snapshot_file),

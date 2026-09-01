@@ -73,6 +73,14 @@ def _verified_mark(f: dict) -> str:
     return "⚠"
 
 
+def _fmt_loc(f: dict) -> str:
+    """finding 位置行(file + 可空的 func/addr)。已复核/未复核两区共用(去重)。"""
+    return (f"   - 位置: {f.get('file', '')}"
+            + (f" :: {f['func']}" if f.get('func') else "")
+            + (f" @ {f['addr']}" if f.get('addr') else "")
+            + "\n")
+
+
 def _verify_k() -> int:
     """verification 每疑点一实例的调度预算(analysis findings 取前 K 条复核)。
 
@@ -177,7 +185,10 @@ Action Input: {"conclusion": "<审计结论>"}
 (summarize 之后)Final Answer 输出一份 Markdown 格式的固件安全审计报告,结构:
 # 固件安全审计报告
 ## 执行概要(编排过程/各阶段轮次与耗时/结论一句话)
-## 发现清单(按 severity 排列:每条含标题/位置/置信度/复核结论)
+## 发现清单(按 severity 排列:每条含标题/位置/置信度/复核结论;只含**已复核** finding)
+## 未复核疑点(独立区段:⚠ 未经复核——verified=None 的疑点(未进入 verification
+前 K 条,或复核实例失败未产出结论),confidence 为 analysis 初值、rationale 为空;
+报告明确标注"未经复核,confidence 为 analysis 初值",禁止混入发现清单或标注为已证实)
 ## 误报剔除(verified=false 的条目与理由)
 ## 编排判断与后续建议
 报告内容必须来自 summarize Observation 提供的素材与各子 Agent 工件,
@@ -494,8 +505,10 @@ class SummarizeTool(AgentTool):
     双用途(参考 deepaudit _summarize_findings,但本工具不做 LLM 汇总):
     1. 决策辅助: 编排中途查看当前进展,决定补调/推进/收尾
     2. 报告素材: verification 完成后调用,Observation 即最终报告的写作素材
-       (已复核 findings 全量字段 + 阶段统计);协调器 LLM 的 Final Answer
-       据此写报告,由 Orchestrator.run 落盘 report.md
+       (已复核/未复核**拆独立区段**:已复核带完整 confidence+rationale;
+       未复核 verified=None 进 ⚠ 未复核区,confidence 保留 analysis 初值、
+       rationale 为空——ticket 04,报告据此画未复核独立区段);协调器 LLM 的
+       Final Answer 据此写报告,由 Orchestrator.run 落盘 report.md
     """
 
     name = "summarize"
@@ -548,31 +561,39 @@ class SummarizeTool(AgentTool):
         if vres is not None and vres.artifact_path:
             loaded = load_artifact(vres.artifact_path) or {}
             vfindings = loaded.get("findings", []) or []
-            # 已复核数 = verified 非 None 的条数(未复核 verified=None 不计入)
-            verified_n = sum(1 for f in vfindings
-                             if f.get("verified") is not None)
+            # 单遍 partition:verified 非 None → 已复核;verified=None → 未复核
+            verified_list = [f for f in vfindings if f.get("verified") is not None]
+            unreviewed_list = [f for f in vfindings if f.get("verified") is None]
+            verified_n = len(verified_list)
             parts.append(f"\n### 报告写作素材(verification 工件 {vres.artifact_path.name},"
-                         f"已复核 {verified_n}/{len(vfindings)} 条,全量字段如下)")
+                         f"已复核 {verified_n}/{len(vfindings)} 条;"
+                         "已复核/未复核拆独立区段,全量字段如下)")
             parts.append(f"工件路径(read_file 可查): {vres.artifact_path}")
             parts.append(f"verification summary: {loaded.get('summary', '')}")
-            for i, f in enumerate(vfindings, 1):
-                lines = [
-                    f"{i}. [{f.get('severity', 'info')}] {_verified_mark(f)} {f.get('title', '?')}\n",
-                    f"   - 位置: {f.get('file', '')}"
-                    f"{' :: ' + f['func'] if f.get('func') else ''}"
-                    f"{' @ ' + f['addr'] if f.get('addr') else ''}\n",
-                ]
-                if f.get("verified") is None:
-                    # 未复核疑点(ADR-0003):confidence 为 analysis 初值,rationale 空
-                    lines.append(f"   - 未复核: confidence 保留 analysis 初值"
-                                 f"({f.get('confidence', '') or '未标注'});"
-                                 " rationale 为空\n")
-                else:
-                    lines.append(f"   - confidence: {f.get('confidence', '') or '未标注'};"
-                                 f" verified={f.get('verified')}\n"
-                                 f"   - rationale: {f.get('rationale', '')}\n"
-                                 f"   - evidence: {str(f.get('evidence', ''))[:600]}\n")
-                parts.append("".join(lines))
+
+            # 已复核区:verified 非 None(true/false),完整 confidence + rationale
+            parts.append(f"\n#### 已复核 findings({len(verified_list)} 条:"
+                         "verified=true/false,完整 confidence + rationale)")
+            for i, f in enumerate(verified_list, 1):
+                parts.append(
+                    f"{i}. [{f.get('severity', 'info')}] {_verified_mark(f)} {f.get('title', '?')}\n"
+                    + _fmt_loc(f)
+                    + f"   - confidence: {f.get('confidence', '') or '未标注'};"
+                      f" verified={f.get('verified')}\n"
+                    + f"   - rationale: {f.get('rationale', '')}\n"
+                    + f"   - evidence: {str(f.get('evidence', ''))[:600]}\n")
+
+            # 未复核区:verified=None(独立区段,⚠ 未经复核;confidence 保留 analysis 初值)
+            parts.append(f"\n#### 未复核疑点({len(unreviewed_list)} 条,⚠ 未经复核:"
+                         "verified=None 的疑点(未进入 verification 前 K 条,"
+                         "或复核实例失败未产出结论),confidence 为 analysis 初值、"
+                         "rationale 为空;禁止混入已复核区或标注为已证实)")
+            for i, f in enumerate(unreviewed_list, 1):
+                parts.append(
+                    f"{i}. [{f.get('severity', 'info')}] {_verified_mark(f)} {f.get('title', '?')}\n"
+                    + _fmt_loc(f)
+                    + f"   - 未复核: confidence 保留 analysis 初值"
+                      f"({f.get('confidence', '') or '未标注'}); rationale 为空\n")
             parts.append(
                 "\n接下来: 输出 Final Answer —— 即最终 Markdown 审计报告正文"
                 "(结构见系统提示词;内容只用以上素材,禁止编造)。")
