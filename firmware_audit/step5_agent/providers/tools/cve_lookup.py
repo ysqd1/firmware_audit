@@ -26,8 +26,10 @@ _call_times: list[float] = []
 class CveLookupTool(AgentTool):
     name = "cve_lookup"
     description = "查 CVE 详情(CVSS 评分/描述/NVD 数据)。cve_bin_tool_scan 命中的 CVE 用它取严重度与描述,补齐证据链。"
-    params_doc = ('Action Input: {"cve_id": "CVE-2024-1234"} 或 {"keyword": "curl 7.5"} '
-                  "—— 二选一,优先 cve_id")
+    params = {
+        "cve_id": {"type": "str", "default": "", "desc": "CVE 编号(如 CVE-2024-1234)"},
+        "keyword": {"type": "str", "default": "", "desc": "关键词搜索(与 cve_id 二选一,cve_id 优先)"},
+    }
 
     def _run(self, cve_id: str = "", keyword: str = "") -> ToolResult:
         if not cve_id and not keyword:

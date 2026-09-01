@@ -178,10 +178,16 @@ def test_read_file(tools, process_dir) -> list[str]:
     if r3.ok:
         fails.append("offset 超界应报错")
 
-    # None 缺参快速失败(不静默转空串列根,C4 契约回归 guard)
+    # None 缺参快速失败(不静默转空串列根,C4 契约回归 guard;
+    # ADR-0004 起改为契约层优雅类型错误,不再暴露 Python 异常文案)
     r4 = tools["read_file"].execute(path=None)
-    if r4.ok or not (r4.error or "").startswith(("TypeError", "AttributeError")):
-        fails.append(f"None 缺参应快速失败, got ok={r4.ok} err={r4.error}")
+    if r4.ok or "类型错误" not in (r4.error or ""):
+        fails.append(f"None 缺参应优雅失败, got ok={r4.ok} err={r4.error}")
+
+    # 未知参数优雅拦截(ADR-0004):recursive 传给 read_file → 列出合法参数而非 TypeError
+    r5 = tools["read_file"].execute(path="fileinfo.json", recursive=True)
+    if r5.ok or "未知参数 recursive" not in (r5.error or "") or "path/offset/limit" not in (r5.error or ""):
+        fails.append(f"recursive 应被优雅拦截, got ok={r5.ok} err={r5.error}")
     return fails
 
 

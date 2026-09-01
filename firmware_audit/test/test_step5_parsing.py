@@ -388,24 +388,27 @@ def test_xref_symbol_prefix(ctx) -> list[str]:
 # ---------- C. 输入解析(畸形 Action Input) ----------
 
 def test_malformed_inputs(ctx) -> list[str]:
+    """畸形调用(ADR-0004):execute 按参数契约优雅拦截,不暴露 Python 异常文案。"""
     fails: list[str] = []
     from firmware_audit.step5_agent.providers.tools.checksec import ChecksecTool
     t = ChecksecTool(ctx)
 
-    # None 参数:不崩 + 错误回喂(异常类名开头)
+    # None 参数:契约层类型错误(优雅,非 TypeError 异常文案)
     r = t.execute(file_ref=None)
-    if r.ok or not (r.error or "").startswith(("TypeError", "AttributeError")):
-        fails.append(f"None 参数应捕获异常回喂, got ok={r.ok} err={r.error}")
+    if r.ok or "类型错误" not in (r.error or ""):
+        fails.append(f"None 参数应契约层拒绝, got ok={r.ok} err={r.error}")
+    if (r.error or "").startswith(("TypeError", "AttributeError")):
+        fails.append(f"不得暴露 Python 异常文案, got {r.error}")
 
-    # 缺必填参数
+    # 缺必填参数:契约层列出缺失项
     r2 = t.execute()
-    if r2.ok or "TypeError" not in (r2.error or ""):
-        fails.append(f"缺参应回喂 TypeError, got {r2.error}")
+    if r2.ok or "缺失必选参数: file_ref" not in (r2.error or ""):
+        fails.append(f"缺参应优雅报缺失, got {r2.error}")
 
-    # 未知参数(LLM 多给字段)
+    # 未知参数(LLM 多给字段):契约层列出合法清单
     r3 = t.execute(file_ref="bin/app", bogus="x")
-    if r3.ok or "TypeError" not in (r3.error or ""):
-        fails.append(f"未知参数应回喂 TypeError, got {r3.error}")
+    if r3.ok or "未知参数 bogus" not in (r3.error or "") or "file_ref" not in (r3.error or ""):
+        fails.append(f"未知参数应优雅列出合法清单, got {r3.error}")
 
     # execute 统一入口契约:elapsed/raw 填充
     r4 = t.execute(file_ref="../escape")

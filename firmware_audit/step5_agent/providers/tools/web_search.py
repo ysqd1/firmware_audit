@@ -27,7 +27,10 @@ class WebSearchTool(AgentTool):
     name = "web_search"
     description = ("检索固件组件/版本的公开漏洞信息(厂商公告/exploit/GitHub Issue)。"
                    "用于确认某组件版本是否确有公开可利用漏洞,补 cve_lookup 覆盖不足。")
-    params_doc = 'Action Input: {"query": "<关键词,如 fastjson 1.2.24 CVE>"}'
+    params = {
+        "query": {"type": "str", "required": True,
+                  "desc": "检索关键词(如 'fastjson 1.2.24 CVE')"},
+    }
 
     def _run(self, query: str = "") -> ToolResult:
         if not query or not query.strip():

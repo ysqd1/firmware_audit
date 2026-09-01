@@ -57,8 +57,10 @@ def format_hits(hits: list[dict]) -> str:
 class ImportsQueryTool(AgentTool):
     name = "imports_query"
     description = "查询 ELF 的导入符号:默认列出全部危险函数(system/strcpy/exec 系等)及调用点;也可按名字过滤任意导入。"
-    params_doc = ('Action Input: {"file_ref": "unitree/bin/idlc", "name": "system"} '
-                  "—— name 可选;不带 name 列危险导入全表")
+    params = {
+        "file_ref": {"type": "str", "required": True, "desc": "相对 extracted 根的 ELF 路径"},
+        "name": {"type": "str", "default": "", "desc": "按符号名精确过滤;缺省列危险导入全表"},
+    }
 
     def _run(self, file_ref: str, name: str = "") -> ToolResult:
         path = resolve_analysis_file(self.ctx, file_ref, ".imports.json")

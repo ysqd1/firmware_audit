@@ -18,7 +18,11 @@ class XrefQueryTool(AgentTool):
                    "注意: 只支持函数/导入符号,数据符号(全局变量/OBJ)不支持;"
                    "返回的函数名是 r2 命名(fcn.<hex>/mangled 方法名),"
                    "不能直接传给 find_decompiled_function,需经 functions.json 按 callees 反查。")
-    params_doc = 'Action Input: {"file_ref": "unitree/bin/idlc", "symbol": "sym.imp.system"}'
+    params = {
+        "file_ref": {"type": "str", "required": True, "desc": "相对 extracted 根的 ELF 路径"},
+        "symbol": {"type": "str", "required": True,
+                   "desc": "符号名(如 sym.imp.system;裸名自动补 sym.imp. 前缀)"},
+    }
 
     def _run(self, file_ref: str, symbol: str) -> ToolResult:
         cpath = container_path(self.ctx, file_ref)

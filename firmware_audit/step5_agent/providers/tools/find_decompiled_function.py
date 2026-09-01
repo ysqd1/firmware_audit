@@ -43,10 +43,11 @@ class FindDecompiledFunctionTool(AgentTool):
     description = ("检索某 ELF 已反编译的函数 C 代码(读 Step4 产物切片,毫秒级,不重跑 Ghidra)。"
                    "func_name 只认 Ghidra 命名:真实符号名或 FUN_<8位hex>;xref_query 返回的 "
                    "fcn.<hex>/mangled 方法名不能直接用,先读 functions.json 按 callees 反查真实名。")
-    params_doc = ('Action Input: {"file_ref": "unitree/bin/idlc", "func_name": "main"} '
-                  "—— file_ref 是相对 extracted 根的路径;func_name 精确匹配 Ghidra 函数名"
-                  "(如 main/CallSystem/FUN_0011c908;不知道确切名就用 read_file 读 "
-                  "<file>.functions.json 按 callees 反查)")
+    params = {
+        "file_ref": {"type": "str", "required": True, "desc": "相对 extracted 根的 ELF 路径"},
+        "func_name": {"type": "str", "required": True,
+                      "desc": "Ghidra 函数名(真实符号或 FUN_<8位hex>;未知名先读 .functions.json 反查)"},
+    }
 
     def _run(self, file_ref: str, func_name: str) -> ToolResult:
         path = resolve_analysis_file(self.ctx, file_ref, ".c")

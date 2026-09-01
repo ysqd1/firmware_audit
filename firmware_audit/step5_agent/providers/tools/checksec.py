@@ -13,7 +13,9 @@ _FIELD_ORDER = ["relro", "canary", "nx", "pie", "fortify", "symbols"]
 class ChecksecTool(AgentTool):
     name = "checksec"
     description = "查 ELF 的安全保护属性(RELRO/Canary/NX/PIE/Fortify)。可利用性评估:NX 关闭 + 无 PIE → 上调。"
-    params_doc = 'Action Input: {"file_ref": "unitree/bin/idlc"}'
+    params = {
+        "file_ref": {"type": "str", "required": True, "desc": "相对 extracted 根的 ELF 路径"},
+    }
 
     def _run(self, file_ref: str) -> ToolResult:
         cpath = container_path(self.ctx, file_ref)

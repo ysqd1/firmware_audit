@@ -33,8 +33,13 @@ class SandboxVerifyTool(AgentTool):
     description = ("在隔离沙箱内执行复核脚本(仅 python/node/php)动态验证疑似漏洞:"
                    "如命令注入的 Fuzzing Harness、反序列化/代码执行 PoC 探测。"
                    "沙箱网络隔离、extracted 只读。用于 verification 判断漏洞是否真实可利用。")
-    params_doc = ('Action Input: {"code": "<脚本源码>", "language": "python|node|php", '
-                  '"timeout": 60}  —— code 为待执行源码;language 默认 python')
+    params = {
+        "code": {"type": "str", "required": True, "desc": "待执行脚本源码(≤64KB)"},
+        "language": {"type": "str", "default": "python", "enum": ["python", "py", "python3",
+                                                                  "node", "js", "javascript", "php"],
+                     "desc": "解释器语言(白名单)"},
+        "timeout": {"type": "int", "default": 60, "desc": "沙箱执行超时秒数(≤180)"},
+    }
 
     def _run(self, code: str, language: str = "python", timeout: int = 60) -> ToolResult:
         if not code or not code.strip():

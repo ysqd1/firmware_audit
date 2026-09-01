@@ -1,0 +1,273 @@
+"""Step5 工具接口契约单测(ADR-0004 / spec 决策 2,Seam 2)。
+
+只测外部行为:给定非法参数调用 execute() → 断言 ok=False + 优雅错误文本
+(而非 Python 异常文案)。校验在 execute 入口拦截,_run 不触发,故可纯离线
+覆盖全部 15 个工具(含依赖 Docker 的 CLI 工具,构造不触发 Docker)。
+
+覆盖:
+  - 每个工具:未知参数 / 类型错误 / 缺失必选 → ok=False + 可自纠错误文本
+  - read_file 收到 recursive → "未知参数 recursive,已忽略;合法参数:path/offset/limit"
+  - params_doc 与校验共享同一份 params 声明(单一来源,ADR-0004 A 侧)
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from firmware_audit.step5_agent.providers.tools import make_tools
+from firmware_audit.step5_agent.providers.tools.base import (
+    ToolContext,
+    render_params_doc,
+    validate_params,
+)
+
+# 契约侧 15 工具(与 spec 决策 2 清单一致;params 声明本身由各工具提供,
+# 测试不重复编码参数清单——派生自 t.params,避免双源漂移)
+_CONTRACT_TOOLS = [
+    "read_file", "list_files", "search_code", "strings_query", "imports_query",
+    "find_decompiled_function", "checksec", "cve_bin_tool_scan", "semgrep_scan",
+    "gitleaks_scan", "sandbox_verify", "binwalk_rescan", "xref_query",
+    "cve_lookup", "web_search",
+]
+
+
+def _tools() -> dict:
+    return make_tools(ToolContext(process_dir=Path(tempfile.mkdtemp())))
+
+
+def test_validate_params_unknown() -> list[str]:
+    """未知参数 → 优雅错误,列出合法参数清单(不抛异常)。"""
+    fails: list[str] = []
+    spec = {"path": {"type": "str", "required": True},
+            "offset": {"type": "int", "default": 0}}
+    out, err = validate_params(spec, {"path": "x", "recursive": True})
+    if out is not None:
+        fails.append("未知参数应返回 (None, err)")
+    if "未知参数 recursive" not in (err or "") or "path/offset" not in (err or ""):
+        fails.append(f"错误应列出未知参数与合法清单: {err}")
+    return fails
+
+
+def test_validate_params_missing_required() -> list[str]:
+    """缺失必选 → 列出缺失项。"""
+    fails: list[str] = []
+    spec = {"file_ref": {"type": "str", "required": True}}
+    out, err = validate_params(spec, {})
+    if out is not None or "缺失必选参数: file_ref" not in (err or ""):
+        fails.append(f"缺失必选应优雅报错: {err}")
+    return fails
+
+
+def test_validate_params_type_error() -> list[str]:
+    """类型错误 → 期望类型 vs 收到类型。"""
+    fails: list[str] = []
+    spec = {"offset": {"type": "int"}}
+    out, err = validate_params(spec, {"offset": "abc"})
+    if out is not None or "参数 offset 类型错误" not in (err or ""):
+        fails.append(f"类型错误应优雅报错: {err}")
+    # bool 类型:recursive 声明为 bool,收到字符串 'yes' → 类型错误
+    spec2 = {"recursive": {"type": "bool"}}
+    out2, err2 = validate_params(spec2, {"recursive": "yes"})
+    if out2 is not None or "参数 recursive 类型错误" not in (err2 or ""):
+        fails.append(f"bool 类型错误应优雅报错: {err2}")
+    # bool 是 int 子类(isinstance(True, int)==True)→ int 参数收到 True 必须拒绝
+    spec3 = {"max_files": {"type": "int"}}
+    out3, err3 = validate_params(spec3, {"max_files": True})
+    if out3 is not None or "参数 max_files 类型错误" not in (err3 or ""):
+        fails.append(f"int 参数收到 bool 应拒绝(防 True 当 1 混用): {err3}")
+    # 不支持的 type 声明 → 校验失败不静默放行
+    spec4 = {"x": {"type": "float"}}
+    out4, err4 = validate_params(spec4, {"x": 1.0})
+    if out4 is not None or "不支持的 type" not in (err4 or ""):
+        fails.append(f"未知 type 声明应拒绝: {err4}")
+    return fails
+
+
+def test_validate_params_enum_case_insensitive() -> list[str]:
+    """str 枚举大小写不敏感(与 _run 的 .lower() 归一一致):PYTHON 应通过。"""
+    fails: list[str] = []
+    spec = {"language": {"type": "str", "default": "python",
+                         "enum": ["python", "node", "php"]}}
+    _, err = validate_params(spec, {"language": "PYTHON"})
+    if err is not None:
+        fails.append(f"PYTHON 应通过 str 枚举(大小写不敏感): {err}")
+    # 非法值仍拒绝
+    out2, err2 = validate_params(spec, {"language": "bash"})
+    if out2 is not None or "取值非法" not in (err2 or ""):
+        fails.append(f"bash 应被枚举拒绝: {err2}")
+    return fails
+
+
+def test_validate_params_enum() -> list[str]:
+    """枚举越界 → 列出可选值。"""
+    fails: list[str] = []
+    spec = {"language": {"type": "str", "default": "python",
+                         "enum": ["python", "node", "php"]}}
+    out, err = validate_params(spec, {"language": "bash"})
+    if out is not None or "取值非法" not in (err or "") or "python/node/php" not in (err or ""):
+        fails.append(f"枚举越界应优雅报错: {err}")
+    return fails
+
+
+def test_validate_params_valid() -> list[str]:
+    """合法参数原样通过(类型已检查)。"""
+    fails: list[str] = []
+    spec = {"path": {"type": "str", "required": True},
+            "offset": {"type": "int", "default": 0}}
+    out, err = validate_params(spec, {"path": "a", "offset": 3})
+    if err is not None or out != {"path": "a", "offset": 3}:
+        fails.append(f"合法参数应通过: out={out} err={err}")
+    # 缺省不传 → checked 只含传入键(默认值由 _run 签名兜底)
+    out2, err2 = validate_params(spec, {"path": "a"})
+    if err2 is not None or out2 != {"path": "a"}:
+        fails.append(f"缺省参数不强制补默认: out={out2} err={err2}")
+    return fails
+
+
+def test_render_params_doc() -> list[str]:
+    """params_doc 从声明渲染:JSON 骨架 + 每参数类型/必填/默认。"""
+    fails: list[str] = []
+    doc = render_params_doc({
+        "path": {"type": "str", "required": True, "desc": "相对路径"},
+        "offset": {"type": "int", "default": 0, "desc": "起始行"},
+    })
+    if "path" not in doc or "offset" not in doc:
+        fails.append(f"渲染应含参数名: {doc}")
+    if "必填" not in doc:
+        fails.append(f"必填参数应标注: {doc}")
+    if "默认 0" not in doc:
+        fails.append(f"默认值应渲染: {doc}")
+    # 空声明 → 空串(无契约工具)
+    if render_params_doc({}) != "":
+        fails.append("空声明应返回空串")
+    return fails
+
+
+def _spec_from_tool(t) -> dict[str, dict]:
+    """从工具声明派生 (params, 必填集);派生源即 t.params(单一来源)。"""
+    return dict(t.params)
+
+
+def test_tools_declare_params() -> list[str]:
+    """全部 15 个工具声明了 params(契约 A 侧);params_doc 渲染出类型/必填信息。"""
+    fails: list[str] = []
+    tools = _tools()
+    for name in sorted(_CONTRACT_TOOLS):
+        t = tools.get(name)
+        if t is None:
+            fails.append(f"注册表缺 {name}")
+            continue
+        if not t.params:
+            fails.append(f"{name} 未声明 params")
+        if not t.params_doc:
+            fails.append(f"{name}.params_doc 渲染为空")
+        # 每个声明参数都应出现在渲染的 params_doc 中(单一来源契约)
+        for pname in t.params:
+            if pname not in t.params_doc:
+                fails.append(f"{name}.params_doc 缺参数 '{pname}': {t.params_doc[:80]}")
+        # 必填参数不应以空串默认值出现在 JSON 骨架(避免 LLM 照抄空串)
+        for pname, decl in t.params.items():
+            if decl.get("required") and '"' + pname + '": ""' in t.params_doc:
+                fails.append(f"{name}.{pname} 必填参数不得渲染成空串默认值")
+    return fails
+
+
+def test_every_tool_rejects_invalid_params() -> list[str]:
+    """每个工具:非法参数调用 → ok=False + 优雅错误(未知/类型/缺失必选各一例)。"""
+    fails: list[str] = []
+    tools = _tools()
+
+    def check(name: str, kw: dict, needle: str, tag: str) -> None:
+        t = tools[name]
+        r = t.execute(**kw)
+        if r.ok:
+            fails.append(f"{name} {tag}: 应 ok=False, got ok=True")
+            return
+        err = r.error or ""
+        if needle not in err:
+            fails.append(f"{name} {tag}: 错误应含 '{needle}', got {err[:120]}")
+        # 优雅错误 ≠ Python 异常文案
+        if err.startswith(("TypeError", "AttributeError", "ValueError")):
+            fails.append(f"{name} {tag}: 不得暴露 Python 异常文案, got {err[:80]}")
+
+    for name in _CONTRACT_TOOLS:
+        spec = _spec_from_tool(tools[name])
+        required = [p for p, d in spec.items() if d.get("required")]
+        # 合法必填参数填充值(类型正确的样例,供类型错误探测用)
+        fill = {p: "x" for p in required}
+        # 未知参数
+        check(name, {"_bogus_key": 1}, "未知参数 _bogus_key", "未知参数")
+        # 类型错误:每个 str/bool 参数传 int 都该被拒(先填齐必填,避免缺参抢先报错)。
+        # int 参数传 int 属合法(如 max_files=123),契约放行后由 _run 内部钳制。
+        for p, d in spec.items():
+            if d.get("type") == "int":
+                continue
+            r2 = tools[name].execute(**{**fill, p: 123})
+            if r2.ok:
+                fails.append(f"{name}.{p} 传 int 应 ok=False")
+            elif "类型错误" not in (r2.error or ""):
+                fails.append(f"{name}.{p} 传 int 应类型错误, got {r2.error[:80]}")
+        # int 参数收到 bool 应拒绝(防 True 当 1 混用)
+        for p, d in spec.items():
+            if d.get("type") == "int":
+                r3 = tools[name].execute(**{**fill, p: True})
+                if r3.ok:
+                    fails.append(f"{name}.{p} 传 True 应 ok=False(bool 冒充 int)")
+        # 缺失必选:缺一个必填参数即报缺失清单
+        if required:
+            check(name, {}, f"缺失必选参数: {', '.join(required)}", "缺失必选")
+    return fails
+
+
+def test_read_file_recursive_graceful() -> list[str]:
+    """read_file 收到 recursive → '未知参数 recursive,已忽略;合法参数:path/offset/limit'。"""
+    fails: list[str] = []
+    r = _tools()["read_file"].execute(path="x", recursive=True)
+    expected = "未知参数 recursive,已忽略;合法参数:path/offset/limit"
+    if r.ok or expected not in (r.error or ""):
+        fails.append(f"recursive 应优雅拦截: ok={r.ok} err={r.error}")
+    if (r.error or "").startswith(("TypeError", "AttributeError")):
+        fails.append(f"不得暴露 Python 异常: {r.error}")
+    return fails
+
+
+def test_read_file_valid_params_pass_through() -> list[str]:
+    """合法参数正常放行:契约不误伤正常调用(纯校验层,文件不存在属于业务错误)。"""
+    fails: list[str] = []
+    r = _tools()["read_file"].execute(path="no/such/file.json", offset=0, limit=5)
+    if r.ok or "类型错误" in (r.error or "") or "未知参数" in (r.error or ""):
+        fails.append(f"合法参数不应被契约拒绝: ok={r.ok} err={r.error}")
+    return fails
+
+
+def test_main() -> int:
+    failures = 0
+    for name, fn in [
+        ("validate_params_unknown", test_validate_params_unknown),
+        ("validate_params_missing_required", test_validate_params_missing_required),
+        ("validate_params_type_error", test_validate_params_type_error),
+        ("validate_params_enum", test_validate_params_enum),
+        ("validate_params_enum_case_insensitive", test_validate_params_enum_case_insensitive),
+        ("validate_params_valid", test_validate_params_valid),
+        ("render_params_doc", test_render_params_doc),
+        ("tools_declare_params", test_tools_declare_params),
+        ("every_tool_rejects_invalid_params", test_every_tool_rejects_invalid_params),
+        ("read_file_recursive_graceful", test_read_file_recursive_graceful),
+        ("read_file_valid_params_pass_through", test_read_file_valid_params_pass_through),
+    ]:
+        fl = fn()
+        if fl:
+            failures += len(fl)
+            for msg in fl:
+                print(f"[FAIL] {name}: {msg}")
+        else:
+            print(f"[PASS] {name}")
+    print(f"\n结果: {'全部通过' if failures == 0 else f'{failures} 个断言失败'}")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(test_main())

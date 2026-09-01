@@ -32,8 +32,10 @@ class GitleaksScanTool(AgentTool):
     description = ("扫描 extracted/ 下的硬编码密钥/凭据(gitleaks):API Key/私钥/"
                    "数据库凭据/OAuth token/JWT secret。与 strings_query 互补,走语义"
                    "规则而非正则,误报更低。")
-    params_doc = ('Action Input: {"path": "unitree/etc"}  —— 相对 extracted 根;'
-                  '缺省可传 "." 扫全树(较慢)')
+    params = {
+        "path": {"type": "str", "default": ".",
+                 "desc": "相对 extracted 根的目录;缺省 '.' 扫全树(较慢)"},
+    }
 
     def _run(self, path: str = ".") -> ToolResult:
         # 相对 extracted 根 → 容器内绝对路径(gitleaks --source 需真实容器路径)

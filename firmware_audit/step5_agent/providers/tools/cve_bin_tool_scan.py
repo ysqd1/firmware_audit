@@ -22,7 +22,10 @@ CVE_CACHE_MOUNT = "/home/sandbox/.cache"
 class CveBinToolScanTool(AgentTool):
     name = "cve_bin_tool_scan"
     description = "对单个 ELF 或目录跑已知漏洞扫描(cve-bin-tool,按产品名+版本特征匹配 400+ 检查器)。首跑要下载 CVE 库,较慢。"
-    params_doc = 'Action Input: {"file_ref": "unitree/bin"}  —— file_ref 支持单文件或目录(相对 extracted 根)'
+    params = {
+        "file_ref": {"type": "str", "required": True,
+                     "desc": "相对 extracted 根的路径,支持单文件或目录"},
+    }
 
     def _run(self, file_ref: str) -> ToolResult:
         cpath = container_path(self.ctx, file_ref)

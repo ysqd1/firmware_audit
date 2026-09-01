@@ -5,6 +5,7 @@ ToolResult 是数据口袋:ReAct 循环只消费它,不感知工具的数据来�
 """
 from __future__ import annotations
 
+import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -68,19 +69,125 @@ def truncate_text(text: str, limit: int = MAX_TEXT_CHARS) -> str:
     return text[:head] + notice + text[-tail:]
 
 
+# 声明字段 type 的取值 → Python 类型 / JSON 骨架占位符(单一 map,避免对同一
+# 字符串判别的重复 switch;声明了不支持的 type 时校验失败不静默放行)
+_TYPE_CHECKS = {"str": str, "int": int, "bool": bool}
+_PLACEHOLDERS = {"str": "<str>", "int": 0, "bool": False}
+
+
+def validate_params(spec: dict, kwargs: dict) -> tuple[dict | None, str | None]:
+    """按结构化参数声明校验(执行侧 B,ADR-0004)。
+
+    未知键 / 类型错误 / 枚举越界 / 缺失必选 → 返回 (None, 优雅错误文本),
+    由 execute 转成 ok=False;校验失败一律不触发 _run,不让 Python 异常文案
+    暴露给 LLM(§7#2 根因:畸形调用收到的是 TypeError 而不是可自纠的指引)。
+
+    声明字段:type(str/int/bool)/required/default/enum(可选)。dict 保留声明
+    顺序,"合法参数"清单按声明顺序列出(如 read_file → path/offset/limit)。
+    """
+    legal = set(spec)
+    unknown = [k for k in kwargs if k not in legal]  # 按调用方传入顺序列出
+    if unknown:
+        return None, f"未知参数 {', '.join(unknown)},已忽略;合法参数:{'/'.join(spec)}"
+
+    checked: dict[str, object] = {}
+    for name, decl in spec.items():
+        if name not in kwargs:
+            continue
+        val = kwargs[name]
+        t = decl.get("type", "str")
+        cls = _TYPE_CHECKS.get(t)
+        if cls is None:
+            return None, f"参数 {name} 声明了不支持的 type '{t}'"
+        # bool 是 int 的子类(isinstance(True, int) 为真),int 参数须显式排除 bool
+        if not isinstance(val, cls) or (t == "int" and isinstance(val, bool)):
+            return None, f"参数 {name} 类型错误: 期望 {t},收到 {type(val).__name__}"
+        enum = decl.get("enum")
+        if enum:
+            # str 枚举大小写不敏感(如 language: 'python'/'PYTHON' 等价,与 _run 的
+            # .lower() 归一一致);非 str 枚举仍按值精确比较
+            hit = (isinstance(val, str)
+                   and val.strip().lower() in {str(e).lower() for e in enum}) \
+                if t == "str" else val in enum
+            if not hit:
+                return None, (f"参数 {name} 取值非法: {val!r};"
+                              f"可选: {'/'.join(map(str, enum))}")
+        checked[name] = val
+
+    missing = [n for n in spec if spec[n].get("required") and n not in kwargs]
+    if missing:
+        return None, f"缺失必选参数: {', '.join(missing)}"
+
+    return checked, None
+
+
+def render_params_doc(params: dict) -> str:
+    """结构化参数声明 → LLM 可读参数规格(声明侧 A,ADR-0004)。
+
+    与校验共享同一份声明(单一来源):首行是 JSON 骨架(必填参数用 <type>
+    占位,可选参数填默认值;默认值为空串/None 时也用 <type> 占位,避免 LLM
+    照抄空串),后续每行一个参数列出 类型/必填/默认/枚举 + 说明。
+    空声明返回空串(无契约工具,如测试替身)。
+    """
+    if not params:
+        return ""
+
+    skeleton: dict[str, object] = {}
+    lines: list[str] = []
+    for name, d in params.items():
+        t = d.get("type", "str")
+        placeholder = _PLACEHOLDERS.get(t, "<str>")
+        default = d.get("default")
+        required = bool(d.get("required"))
+        skeleton[name] = placeholder if (required or default in (None, "")) else default
+        bits = [t]
+        if required:
+            bits.append("必填")
+        elif default not in (None, ""):
+            bits.append(f"默认 {default}")
+        else:
+            bits.append("可选")
+        if d.get("enum"):
+            bits.append("可选值: " + "/".join(map(str, d["enum"])))
+        head = f"{name} ({', '.join(bits)})"
+        desc = d.get("desc", "")
+        lines.append(f"  {head}: {desc}" if desc else f"  {head}")
+    return json.dumps(skeleton, ensure_ascii=False) + "\n" + "\n".join(lines)
+
+
 class AgentTool(ABC):
     name: str = ""
     description: str = ""  # 写进系统提示词,LLM 据此选工具
-    params_doc: str = ""   # 参数说明,LLM 据此填 Action Input
+    params: dict[str, dict] = {}  # 结构化参数声明(单一来源:params_doc 渲染 + execute 校验共用)
 
     def __init__(self, ctx: ToolContext):
         self.ctx = ctx
 
+    @property
+    def params_doc(self) -> str:
+        """参数说明(声明侧 A):从 params 结构化声明渲染,LLM 据此填 Action Input。
+
+        子类可沿用旧的类属性 params_doc 字符串(测试/演示替身)覆盖此属性;
+        声明了 params 的生产工具自动渲染,不再手写散文。
+        """
+        return render_params_doc(self.params)
+
     def execute(self, **kw) -> ToolResult:
-        """统一入口:计时、异常捕获、text 截断(原文留 raw 供落盘)。失败不崩。"""
+        """统一入口:参数校验(契约) → 执行 → 计时、异常捕获、text 截断。失败不崩。
+
+        声明了 params 的工具先按声明校验:未知键/类型错误/缺失必选 → 优雅错误
+        返回(不抛异常);未声明 params 的工具保持透传(legacy 兼容)。
+        """
         start = time.time()
         try:
-            result = self._run(**kw)
+            if self.params:
+                checked, err = validate_params(self.params, kw)
+                if err is not None:
+                    result = ToolResult(ok=False, text="", error=err)
+                else:
+                    result = self._run(**checked)
+            else:
+                result = self._run(**kw)
         except Exception as e:
             result = ToolResult(ok=False, text="", error=f"{type(e).__name__}: {e}")
         result.elapsed = round(time.time() - start, 3)

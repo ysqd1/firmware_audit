@@ -22,7 +22,9 @@ class BinwalkRescanTool(AgentTool):
     name = "binwalk_rescan"
     description = ("对不透明二进制(.bin/固件段)做 binwalk 签名复扫,识别内部嵌套容器"
                    "(squashfs/cpio/gzip 等)。只识别不落盘;深层解包由 Step1 管线负责。")
-    params_doc = 'Action Input: {"file_ref": "unitree/firmware/odd.bin"}  —— 相对 extracted 根'
+    params = {
+        "file_ref": {"type": "str", "required": True, "desc": "相对 extracted 根的二进制路径"},
+    }
 
     def _run(self, file_ref: str) -> ToolResult:
         if not docker_available(BINWALK_IMAGE):

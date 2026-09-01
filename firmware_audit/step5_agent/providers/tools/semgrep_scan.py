@@ -24,8 +24,10 @@ class SemgrepScanTool(AgentTool):
     name = "semgrep_scan"
     description = ("对 extracted/ 下脚本/源码跑语义级漏洞匹配(semgrep 本地规则):"
                    "命令注入/SQL注入/反序列化。比字符串扫描(passwd/url)更接近真漏洞。")
-    params_doc = ('Action Input: {"path": "unitree/opt/lib/vlc/lua"}  —— 相对 extracted '
-                  '根;缺省可传 "." 扫全部脚本(较慢),支持单文件/目录')
+    params = {
+        "path": {"type": "str", "default": ".",
+                 "desc": "相对 extracted 根的路径(单文件/目录);缺省 '.' 扫全部脚本(较慢)"},
+    }
 
     def _run(self, path: str = ".") -> ToolResult:
         root = _RULES_HOST

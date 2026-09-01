@@ -65,9 +65,15 @@ class SearchCodeTool(AgentTool):
                    "①ELF 字符串/导入/文本扫描边车(process/analysis/*.json);"
                    "②extracted/ 文本文件按行 grep(自动跳过二进制与 SDK 目录)。"
                    "返回 文件:锚点 命中行,可直接 read_file 回查。")
-    params_doc = ('{"keyword": "password", "file_pattern": "*.py", '
-                  '"directory": "extracted/unitree", "is_regex": false, '
-                  '"max_results": 50} —— keyword 必填;其余可选(默认搜全 extracted)')
+    params = {
+        "keyword": {"type": "str", "required": True,
+                    "desc": "搜索关键词(非空);is_regex=True 时视为正则"},
+        "file_pattern": {"type": "str", "default": "", "desc": "文件名 glob 过滤(仅文本 grep 路)"},
+        "directory": {"type": "str", "default": "", "desc": "收窄搜索目录(相对 process/,默认 extracted/)"},
+        "is_regex": {"type": "bool", "default": False, "desc": "keyword 是否按正则解释"},
+        "max_results": {"type": "int", "default": MAX_RESULTS_DEFAULT,
+                        "desc": f"结果上限(≤{MAX_RESULTS_CAP})"},
+    }
 
     def _run(self, keyword: str = "", file_pattern: str = "",
              directory: str = "", is_regex: bool = False,

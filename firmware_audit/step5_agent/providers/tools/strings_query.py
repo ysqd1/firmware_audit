@@ -23,9 +23,12 @@ STRING_PATTERNS: dict[str, str] = {
 class StringsQueryTool(AgentTool):
     name = "strings_query"
     description = "按模式检索 ELF 字符串表(Step4 提取,含地址与引用函数):url / ip / password / key / shadow / empty_password,或自定义正则。"
-    params_doc = ('Action Input: {"file_ref": "unitree/bin/idlc", "pattern": "url", "max_results": 30} '
-                  "—— pattern 只能取内置值之一: url, ip, password, key, shadow, empty_password,"
-                  "或 're:<正则>'(如查 http 链接请用内置 url 或 're:http');max_results 可选默认 30")
+    params = {
+        "file_ref": {"type": "str", "required": True, "desc": "相对 extracted 根的 ELF 路径"},
+        "pattern": {"type": "str", "required": True,
+                    "desc": "内置模式: url/ip/password/key/shadow/empty_password;或 're:<正则>'"},
+        "max_results": {"type": "int", "default": 30, "desc": "命中上限"},
+    }
 
     def _run(self, file_ref: str, pattern: str, max_results: int = 30) -> ToolResult:
         path = resolve_analysis_file(self.ctx, file_ref, ".strings.json")

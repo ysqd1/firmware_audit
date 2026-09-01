@@ -23,9 +23,13 @@ class ListFilesTool(AgentTool):
     description = ("列出 process/ 下的文件与目录(默认 100 条上限,目录项带 / 后缀)。"
                    "铺面首选工具:先用 directory='.' 看顶层,再按目录下钻;"
                    "recursive=True 递归(自动排除 SDK/系统库),pattern 过滤文件名。")
-    params_doc = ('{"directory": ".", "pattern": "*.py", "recursive": false, '
-                  '"max_files": 100} —— directory 相对 process/;pattern 可选; '
-                  'recursive 可选;max_files 可选')
+    params = {
+        "directory": {"type": "str", "default": ".", "desc": "相对 process/ 的目录(默认 '.',顶层)"},
+        "pattern": {"type": "str", "default": "", "desc": "文件名 glob 过滤(如 *.py);空串不过滤"},
+        "recursive": {"type": "bool", "default": False, "desc": "递归枚举(自动排除 SDK/系统库目录)"},
+        "max_files": {"type": "int", "default": DEFAULT_MAX_FILES, "desc": "条目上限"},
+        "path": {"type": "str", "desc": "directory 的别名(deepaudit 兼容)"},
+    }
 
     def _run(self, directory: str = ".", pattern: str = "",
              recursive: bool = False, max_files: int = DEFAULT_MAX_FILES,

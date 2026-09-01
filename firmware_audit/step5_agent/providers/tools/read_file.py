@@ -14,12 +14,16 @@ DEFAULT_LINES = 200
 class ReadFileTool(AgentTool):
     name = "read_file"
     description = "读取 process/ 目录下的工件文件(分页,默认前 200 行):前序 Agent 的 JSON 工件、报告、反编译 .c 等。"
-    params_doc = ('Action Input: {"path": "fileinfo.json", "offset": 0, "limit": 50} '
-                  "—— path 相对 process/(示例为固定存在的文件,请按需替换为目标工件路径);offset/limit 可选")
+    params = {
+        "path": {"type": "str", "required": True,
+                 "desc": "相对 process/ 的工件路径(如 fileinfo.json 或 extracted/unitree/...)"},
+        "offset": {"type": "int", "default": 0, "desc": "起始行号(0 基)"},
+        "limit": {"type": "int", "default": DEFAULT_LINES, "desc": "最多读取行数"},
+    }
 
     def _run(self, path: str, offset: int = 0, limit: int = DEFAULT_LINES) -> ToolResult:
         root = self.ctx.process_dir.resolve()
-        ref = path.strip().replace("\\", "/")  # None 抛 AttributeError,execute 兜底(缺参快速失败)
+        ref = path.strip().replace("\\", "/")  # path 已由 execute 契约校验为 str;None 会被优雅拒绝(缺参快速失败)
         p = root if ref in (".", "") else resolve_within(root, ref)
         if p is None:
             return ToolResult(ok=False, text="", error=f"路径越界: {path}(只允许 process/ 之下)")
