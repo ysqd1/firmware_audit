@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -70,6 +71,14 @@ ANALYSIS_EXTRA_FINAL = 'Final Answer: {"summary": "补跑取证", "findings": [{
 ANALYSIS_FINAL = 'Final Answer: {"summary": "取证完成", "findings": [{"title": "main 经 system 执行拼接命令", "severity": "high", "file": "unitree/bin/idlc", "func": "main", "addr": "0010d000", "evidence": "decompile: system(cmd)", "confidence": "medium"}, {"title": "硬编码口令", "severity": "high", "file": "unitree/bin/idlc", "evidence": "password=unitree2018", "confidence": "low"}]}'
 
 VERIFY_FINAL = 'Final Answer: {"summary": "复核完成", "findings": [{"title": "main 经 system 执行拼接命令", "severity": "high", "file": "unitree/bin/idlc", "func": "main", "verified": true, "rationale": "调用链确认", "confidence": "high"}, {"title": "硬编码口令", "severity": "high", "file": "unitree/bin/idlc", "verified": false, "rationale": "实为默认文档示例", "confidence": "low"}]}'
+
+# ADR-0003 每疑点一实例:verification 单实例只复核一条(拆 VERIFY_FINAL 为单条 finals)
+VERIFY_FINAL_F1 = ('Final Answer: {"summary": "复核1", "findings": [{"title": '
+                   '"main 经 system 执行拼接命令", "severity": "high", "file": "unitree/bin/idlc", '
+                   '"func": "main", "verified": true, "rationale": "调用链确认", "confidence": "high"}]}')
+VERIFY_FINAL_F2 = ('Final Answer: {"summary": "复核2", "findings": [{"title": "硬编码口令", '
+                   '"severity": "high", "file": "unitree/bin/idlc", "verified": false, '
+                   '"rationale": "实为默认文档示例", "confidence": "low"}]}')
 
 
 # ---- artifacts ----
@@ -205,11 +214,11 @@ def test_full_chain_and_resume() -> list[str]:
     """Orchestrator 全链路(recon→analysis→verification)→finish,含断点续跑(子 Agent 跳过)。"""
     fails: list[str] = []
     D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 10}'
     with tempfile.TemporaryDirectory() as td:
         target = _make_process(Path(td))
         # 脚本顺序(共享一个 ScriptedLLM):orchestrator 决策 + 子 Agent(工具+终)交错。
-        # orchestrator 每轮一次调用,dispatch 同步跑子 Agent(各 2 次调用)。
-        # v3: 收尾前加 summarize(取报告素材)→ Final Answer 即报告正文。
+        # ADR-0003:verification 每疑点一实例——2 条 analysis findings → 2 个独立实例
         S = 'Thought: 收尾\nAction: summarize\nAction Input: {"conclusion": "全链路完成"}'
         REPORT_MD = ('Final Answer: # 固件安全审计报告\n## 发现清单\n'
                      '- [high] ✓ main 经 system 注入(unitree/bin/idlc)\n'
@@ -221,11 +230,11 @@ def test_full_chain_and_resume() -> list[str]:
             D % "analysis",     # 3 orchestrator 调度 analysis
             'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 10}',
             ANALYSIS_FINAL,     # 5 analysis 终
-            D % "verification",  # 6 orchestrator 调度 verification
-            'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 10}',
-            VERIFY_FINAL,       # 8 verification 终
-            S,                  # 9 orchestrator summarize(取素材)
-            REPORT_MD,          # 10 Final Answer = 报告正文
+            D % "verification",  # 6 orchestrator 调度 verification(阶段)
+            VTOOL, VERIFY_FINAL_F1,   # 7/8  复核实例 1(首条 finding)
+            VTOOL, VERIFY_FINAL_F2,   # 9/10 复核实例 2(次条 finding)
+            S,                  # 11 orchestrator summarize(取素材)
+            REPORT_MD,          # 12 Final Answer = 报告正文
         ]
         llm = ScriptedLLM(h)
         summary = step5_run(target, llm=llm)
@@ -242,9 +251,10 @@ def test_full_chain_and_resume() -> list[str]:
         find = load_artifact(agent / "1_analysis" / "findings.json")
         if find is None or len(find["findings"]) != 2:
             fails.append(f"1_analysis findings 应有 2 条: {find and len(find['findings'])}")
-        ver = load_artifact(agent / "2_verification" / "verified_findings.json")
+        # ADR-0003:verified_findings.json 聚合到 agent 根(阶段级产物)
+        ver = load_artifact(agent / "verified_findings.json")
         if ver is None:
-            fails.append("2_verification verified_findings 缺失")
+            fails.append("agent/verified_findings.json 缺失(verification 每疑点一实例聚合)")
         else:
             v_counts = [f.get("verified") for f in ver["findings"]]
             if v_counts != [True, False]:
@@ -259,12 +269,13 @@ def test_full_chain_and_resume() -> list[str]:
         analysis_init = llm.calls[4][1]["content"]
         if "survey.json" not in analysis_init or "攻击面" not in analysis_init:
             fails.append(f"analysis 简报应含上游 survey 摘要: {analysis_init[:100]}")
+        # verification 实例简报(ADR-0003):注入单条 finding 全字段,不 dump 全量
         verify_init = llm.calls[7][1]["content"]
-        if "findings.json" not in verify_init or "取证完成" not in verify_init:
-            fails.append("verification 简报应含 findings 摘要")
+        if "待复核 finding" not in verify_init or "main 经 system" not in verify_init:
+            fails.append("verification 实例简报应含单条待复核 finding")
 
-        # 子 Agent transcript 落盘(编号目录) + orchestrator transcript
-        for base in ("0_recon", "1_analysis", "2_verification"):
+        # 子 Agent transcript 落盘(编号目录)+ orchestrator transcript
+        for base in ("0_recon", "1_analysis", "3_verification", "4_verification"):
             tr = agent / base / "transcript.jsonl"
             if not tr.is_file():
                 fails.append(f"{base} transcript 缺失")
@@ -288,12 +299,14 @@ def test_full_chain_and_resume() -> list[str]:
         if not res.get("summarize_called") or not res.get("report_path"):
             fails.append("result.json 应记录 summarize_called 与 report_path")
 
-        # 断点续跑:三编号工件齐 → 子 Agent 全跳过,仅 orchestrator 消耗 5 次决策
+        # 断点续跑:recon/analysis/verified_findings 工件齐 → 子 Agent 全跳过,
+        # 仅 orchestrator 消耗 5 次决策(3×dispatch + summarize + Final)
         llm2 = ScriptedLLM([D % "recon", D % "analysis", D % "verification",
                             S, REPORT_MD])
         s2 = step5_run(target, llm=llm2)
         if len(llm2.calls) != 5:
-            fails.append(f"续跑 orchestrator 应 5 次调用(子 Agent 全跳过+summarize), got {len(llm2.calls)}")
+            fails.append(f"续跑 orchestrator 应 5 次调用(子 Agent 全跳过+summarize),"
+                         f" got {len(llm2.calls)}")
         stages = s2.get("stages", {})
         if not stages or not all(v.get("ok") for v in stages.values()):
             fails.append(f"续跑各阶段应 ok: {stages}")
@@ -415,8 +428,10 @@ def test_fresh_run_with_tool_call() -> list[str]:
     """recon 先调一次 read_file(真实工具)再收尾,验证工具分发在 orchestrator 编排下也通。"""
     fails: list[str] = []
     D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.functions.json", "limit": 10}'
     with tempfile.TemporaryDirectory() as td:
         target = _make_process(Path(td))
+        # ADR-0003:verification 每疑点一实例——2 条 findings → 2 个实例各 1 次 read_file
         llm = ScriptedLLM([
             D % "recon",        # 0
             'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 10}',
@@ -425,9 +440,9 @@ def test_fresh_run_with_tool_call() -> list[str]:
             'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}',
             ANALYSIS_FINAL,     # 5
             D % "verification",  # 6
-            'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.functions.json", "limit": 10}',
-            VERIFY_FINAL,       # 8
-            'Final Answer: {"summary": "完成", "conclusion": ""}',  # 9
+            VTOOL, VERIFY_FINAL_F1,   # 7/8  复核实例 1
+            VTOOL, VERIFY_FINAL_F2,   # 9/10 复核实例 2
+            'Final Answer: {"summary": "完成", "conclusion": ""}',  # 11
         ])
         summary = step5_run(target, llm=llm)
         # recon 末轮 chat 的最后一条消息 = read_file 的 Observation
@@ -440,8 +455,10 @@ def test_fresh_run_with_tool_call() -> list[str]:
         recon_stats = summary["stages"]["recon"]["tool_calls"]
         if recon_stats.get("read_file") != 1:
             fails.append(f"recon tool_calls 应为 {{read_file: 1}}, got: {recon_stats}")
-        if summary["tool_calls"].get("read_file") != 3:
-            fails.append(f"全局 tool_calls 合计错误(三子 Agent 各 1 次 read_file): {summary['tool_calls']}")
+        # 全局 read_file = recon 1 + analysis 1 + verification 2 实例各 1 = 4
+        if summary["tool_calls"].get("read_file") != 4:
+            fails.append(f"全局 tool_calls 合计错误(应 recon1+analysis1+verify2): "
+                         f"{summary['tool_calls']}")
         if summary["stages"]["recon"]["steps"] < 1:
             fails.append(f"recon steps 应 ≥1, got: {summary['stages']['recon']['steps']}")
     return fails
@@ -694,6 +711,149 @@ def test_resolve_workspace_absolute() -> list[str]:
     return fails
 
 
+def _verify_single_final(title: str, verified: bool) -> str:
+    """ADR-0003 单实例复核 Final:一条 finding,verified/rationale 必填。"""
+    return ('Final Answer: {"summary": "复核%s", "findings": [{"title": "%s", '
+            '"file": "unitree/bin/idlc", "verified": %s, "rationale": "r-%s"}]}'
+            % (title, title, "true" if verified else "false", title))
+
+
+def test_verification_per_finding_flow() -> list[str]:
+    """ADR-0003 流程级验收(Seam 1):喂含 N 条 findings 的 fixtures → 断言
+    verified_findings.json 全量 N 条、已验证恰好 K 条(其余 verified=None +
+    confidence 保留 analysis 初值)、每实例 max_iters=8、补跑逻辑取消
+    (verification 只调度一次,不适用同类型 3 次上限)。"""
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    # 4 条 findings:两条同 severity=high(confidence 不同)验证 confidence 次排序,
+    # 再加 medium/low → K=3 应复核 high+high(confidence 高的先)+medium,low 未复核
+    ANALYSIS3 = ('Final Answer: {"summary": "取证3", "findings": ['
+                 '{"title": "f1", "severity": "high", "file": "unitree/bin/idlc", "confidence": "low"},'
+                 '{"title": "f2", "severity": "high", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f3", "severity": "medium", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f4", "severity": "low", "file": "unitree/bin/idlc", "confidence": "high"}]}')
+    with tempfile.TemporaryDirectory() as td:
+        target = _make_process(Path(td))
+        # K=3:复核 f1/f2(两条 high,f2 confidence=high 应先)+f3(medium);f4 未复核
+        os.environ["STEP5_VERIFY_K"] = "3"
+        try:
+            llm = ScriptedLLM([
+                D % "recon",
+                'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5}',
+                RECON_FINAL,
+                D % "analysis",
+                'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 5}',
+                ANALYSIS3,
+                D % "verification",
+                VTOOL, _verify_single_final("f2", True),   # high+confidence=high 排最前
+                VTOOL, _verify_single_final("f1", True),   # high+confidence=low
+                VTOOL, _verify_single_final("f3", True),   # medium
+                'Final Answer: {"summary": "完成", "conclusion": ""}',
+            ])
+            summary = step5_run(target, llm=llm)
+        finally:
+            del os.environ["STEP5_VERIFY_K"]
+
+        agent = target / "process" / "agent"
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is None:
+            fails.append("verified_findings.json 缺失(verification 每疑点一实例聚合)")
+        else:
+            findings = vf["findings"]
+            if len(findings) != 4:
+                fails.append(f"verified_findings.json 应全量 N=4 条(未复核也保留), got {len(findings)}")
+            by_title = {f.get("title"): f for f in findings}
+            # K=3 复核:f1/f2/f3 有 verified;f4 未复核 verified=None
+            if by_title["f1"].get("verified") is not True:
+                fails.append(f"f1(high)应复核 verified=True: {by_title['f1']}")
+            if by_title["f2"].get("verified") is not True:
+                fails.append(f"f2(high,confidence=high)应复核 verified=True: {by_title['f2']}")
+            if by_title["f3"].get("verified") is not True:
+                fails.append(f"f3(medium)应复核 verified=True: {by_title['f3']}")
+            f4 = by_title.get("f4")
+            if f4 is None:
+                fails.append("f4(low)不应被丢弃(未复核也要保留在 verified_findings)")
+            elif f4.get("verified") is not None:
+                fails.append(f"f4(未进入前 K)应 verified=None: {f4}")
+            elif f4.get("confidence") != "high":
+                fails.append(f"未复核 f4 的 confidence 应保留 analysis 初值 high: {f4}")
+            if f4 is not None and f4.get("rationale", "") != "":
+                fails.append(f"未复核 f4 的 rationale 应为空: {f4.get('rationale')}")
+            # 复核的 3 条有 rationale
+            if not all(by_title[t].get("rationale") for t in ("f1", "f2", "f3")):
+                fails.append("已复核 finding 应带 rationale")
+            # confidence 次排序验证:同 severity=high 时 confidence=high 的 f2 先复核
+            # 每实例两轮 LLM 调用(工具+Final),init 重复出现两次——按序去重取首个
+            brief_titles = []
+            for i in range(len(llm.calls)):
+                content = llm.calls[i][1]["content"]
+                if "待复核 finding" not in content:
+                    continue
+                t = json.loads(content[content.find("{"):content.rfind("}") + 1]).get("title")
+                if t and (not brief_titles or brief_titles[-1] != t):
+                    brief_titles.append(t)
+            f2_before_f1 = (brief_titles[:2] == ["f2", "f1"])
+            if not f2_before_f1:
+                fails.append(f"confidence 次排序:high+conf=high 的 f2 应先于 high+conf=low 的 f1"
+                             f"复核(实例简报序): {brief_titles}")
+
+        # 每实例 max_iters=8(ADR-0003):从实例落盘 system_prompt 校验
+        sp = agent / "4_verification" / "system_prompt.txt"
+        if sp.is_file() and "最多 8 轮" not in sp.read_text(encoding="utf-8"):
+            fails.append(f"verification 实例 system_prompt 应 max_iters=8: {sp}")
+        # 补跑逻辑取消:verification 只调度一次(阶段 seq=2),实例目录恰好 K=3 个
+        dispatch_log = json.loads((agent / "orchestrator" / "dispatch_log.json")
+                                  .read_text(encoding="utf-8"))
+        ver_logs = [r for r in dispatch_log if r.get("agent") == "verification"]
+        if len(ver_logs) != 1:
+            fails.append(f"verification 应只调度一次(补跑取消), got {len(ver_logs)}")
+        vdirs = sorted(p.name for p in agent.glob("*_verification")
+                       if p.is_dir())
+        if len(vdirs) != 3:
+            fails.append(f"应恰好 K=3 个独立复核实例目录, got {vdirs}")
+        # 阶段 steps = 各实例轮次累加(每实例 2 轮:工具 + Final → 共 4)
+        if summary["stages"]["verification"]["steps"] < 1:
+            fails.append("verification 阶段 steps 应 >0")
+    return fails
+
+
+def test_verification_k_cap() -> list[str]:
+    """K 上限语义:analysis findings 超过 K 时只复核前 K 条,其余 verified=None;
+    K 可配置(STEP5_VERIFY_K),默认 10。"""
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    with tempfile.TemporaryDirectory() as td:
+        target = _make_process(Path(td))
+        # 4 条 findings,默认 K=10 → 全复核;无未复核条目
+        ANALYSIS4 = ('Final Answer: {"summary": "取证4", "findings": ['
+                     '{"title": "a", "severity": "critical", "file": "unitree/bin/idlc"},'
+                     '{"title": "b", "severity": "high", "file": "unitree/bin/idlc"},'
+                     '{"title": "c", "severity": "medium", "file": "unitree/bin/idlc"},'
+                     '{"title": "d", "severity": "low", "file": "unitree/bin/idlc"}]}')
+        llm = ScriptedLLM([
+            D % "recon", 'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5}', RECON_FINAL,
+            D % "analysis", 'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 5}', ANALYSIS4,
+            D % "verification",
+            VTOOL, _verify_single_final("a", True),
+            VTOOL, _verify_single_final("b", True),
+            VTOOL, _verify_single_final("c", True),
+            VTOOL, _verify_single_final("d", True),
+            'Final Answer: {"summary": "完成", "conclusion": ""}',
+        ])
+        step5_run(target, llm=llm)
+        agent = target / "process" / "agent"
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is None or len(vf["findings"]) != 4:
+            fails.append(f"N=4 条应全量保留: {vf and len(vf['findings'])}")
+        elif not all(f.get("verified") is not None for f in vf["findings"]):
+            fails.append("默认 K=10 ≥ N → 全部应复核")
+        if len(list(agent.glob("*_verification"))) != 4:
+            fails.append(f"默认 K=10 时 4 条应 4 个实例")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -703,6 +863,8 @@ def test_main() -> int:
         ("build_messages_partitions", test_build_messages_partitions),
         ("compaction_boundary_and_failure", test_compaction_boundary_and_failure),
         ("full_chain_and_resume", test_full_chain_and_resume),
+        ("verification_per_finding_flow", test_verification_per_finding_flow),
+        ("verification_k_cap", test_verification_k_cap),
         ("recon_v3_orchestration_boundary", test_recon_v3_orchestration_boundary),
         ("redispatch_analysis_brief_carries_recon_summary", test_redispatch_analysis_brief_carries_recon_summary),
         ("fresh_run_with_tool_call", test_fresh_run_with_tool_call),

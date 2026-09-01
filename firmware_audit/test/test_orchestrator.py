@@ -40,6 +40,13 @@ TOOL = 'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analys
 FA = 'Final Answer: {"summary": "首轮取证", "findings": [{"title": "fa", "severity": "high", "file": "unitree/bin/idlc"}]}'
 FB = 'Final Answer: {"summary": "补充深挖", "findings": [{"title": "fb", "severity": "medium", "file": "unitree/bin/idlc"}]}'
 FV = 'Final Answer: {"summary": "复核", "findings": [{"title": "fa", "severity": "high", "file": "unitree/bin/idlc", "verified": true}]}'
+# ADR-0003 每疑点一实例:verification 单实例只复核一条(单条 finals)
+VERIFY_F1 = ('Final Answer: {"summary": "复核fa", "findings": [{"title": "fa", '
+             '"severity": "high", "file": "unitree/bin/idlc", "verified": true}]}')
+VERIFY_F2 = ('Final Answer: {"summary": "复核fb", "findings": [{"title": "fb", '
+             '"severity": "medium", "file": "unitree/bin/idlc", "verified": true}]}')
+VERIFY_FC = ('Final Answer: {"summary": "复核fc", "findings": [{"title": "fc", '
+             '"severity": "medium", "file": "unitree/bin/netswitch", "verified": true}]}')
 
 # Task6 用例 fixture:v3 recon survey(recommended_actions 含 high/medium/low 各一,
 # high_risk_areas 锚定 idlc 顺序)+ 补跑实例的部分重复 findings(fa 重复 + fc 新增)
@@ -326,7 +333,9 @@ def test_multi_dispatch_and_duplicate() -> list[str]:
     with tempfile.TemporaryDirectory() as _td:
         td = Path(_td)
         _make_process(td)
-        llm = ScriptedLLM([TOOL, RECON_FINAL, TOOL, FA, TOOL, FB, TOOL, FV])
+        # ADR-0003:verification 每疑点一实例——analysis 聚合 fa+fb 两条 → 2 个复核实例
+        llm = ScriptedLLM([TOOL, RECON_FINAL, TOOL, FA, TOOL, FB,
+                           TOOL, VERIFY_F1, TOOL, VERIFY_F2])
         orch = _orch(td, llm)
         tool = _tool(orch)
         tool.execute(agent="recon", task="t0")
@@ -335,23 +344,29 @@ def test_multi_dispatch_and_duplicate() -> list[str]:
         dup = tool.execute(agent="analysis", task="t1")  # 重复任务
         tool.execute(agent="verification", task="t3")
         agent_dir = td / "process" / "agent"
-        for d in ("0_recon", "1_analysis", "2_analysis", "3_verification"):
+        # verification 阶段 seq=3(聚合到 verified_findings.json,无目录),
+        # 两个独立复核实例 seq=4/5(目录 4/5_verification)
+        for d in ("0_recon", "1_analysis", "2_analysis", "4_verification",
+                  "5_verification"):
             if not (agent_dir / d).is_dir():
                 fails.append(f"多次调用应生成实例目录 {d}/")
+        if not (agent_dir / "verified_findings.json").is_file():
+            fails.append("verification 阶段应聚合 verified_findings.json")
         if (agent_dir / "4_analysis").exists():
             fails.append("重复任务不应新建实例目录")
         if not dup.ok or "重复" not in dup.text:
             fails.append(f"重复调度应返回历史结果并说明被拒: ok={dup.ok}, text={dup.text[:80]}")
         if len(orch.dispatches) != 4:
-            fails.append(f"实际执行调度应为 4 次(重复不计), got {len(orch.dispatches)}")
+            fails.append(f"实际执行调度应为 4 次(重复不计;verification 阶段计 1 次),"
+                         f" got {len(orch.dispatches)}")
         # 交接:analysis#2 简报应说明第 2 次调用
         a2_init = llm.calls[4][1]["content"]
         if "第 2 次调用" not in a2_init:
             fails.append(f"analysis#2 简报应含交接说明: {a2_init[:150]}")
-        # verification 上游 = 最近一次 analysis(2_analysis 的 findings.json)
+        # verification 实例简报(ADR-0003):注入单条待复核 finding(fa),不 dump 全量
         verify_init = llm.calls[6][1]["content"]
-        if "2_analysis" not in verify_init:
-            fails.append(f"verification 上游应为 2_analysis 的 findings.json: {verify_init[:150]}")
+        if "待复核 finding" not in verify_init or "fa" not in verify_init:
+            fails.append(f"verification 实例简报应含单条待复核 finding(fa): {verify_init[:150]}")
         log = json.loads((agent_dir / "orchestrator" / "dispatch_log.json").read_text(encoding="utf-8"))
         if not any(r.get("status") == "duplicate" for r in log):
             fails.append("dispatch_log 应记录 duplicate 尝试")
@@ -409,7 +424,7 @@ def test_orchestrator_integration_dirs() -> list[str]:
             D % "recon", TOOL, RECON_FINAL,             # 0/1/2
             D % "analysis", TOOL,
             'Final Answer: {"summary": "取证", "findings": [{"title": "注入", "severity": "high", "file": "unitree/bin/idlc"}]}',  # 5
-            D % "verification", TOOL,
+            D % "verification", TOOL,                   # 6 阶段
             'Final Answer: {"summary": "复核", "findings": [{"title": "注入", "severity": "high", "file": "unitree/bin/idlc", "verified": true}]}',  # 8
             'Final Answer: {"summary": "编排完成", "conclusion": "ok"}',  # 9
         ]
@@ -417,11 +432,13 @@ def test_orchestrator_integration_dirs() -> list[str]:
         orch = _orch(td, llm)
         orch.run()
         agent = td / "process" / "agent"
-        for sub in ("0_recon", "1_analysis", "2_verification"):
+        for sub in ("0_recon", "1_analysis", "3_verification"):
             if not (agent / sub).is_dir():
                 fails.append(f"子 Agent 目录缺失: {sub}")
             if not (agent / sub / "transcript.jsonl").is_file():
                 fails.append(f"{sub} transcript 缺失")
+        if not (agent / "verified_findings.json").is_file():
+            fails.append("agent/verified_findings.json 缺失(verification 每疑点一实例聚合)")
         for fn in ("transcript.jsonl", "dispatch_log.json", "result.json"):
             if not (agent / "orchestrator" / fn).is_file():
                 fails.append(f"orchestrator/{fn} 缺失")
@@ -448,14 +465,17 @@ def test_orchestrator_multi_dispatch_integration() -> list[str]:
             D2 % ("recon", "侦察攻击面"), TOOL, RECON_FINAL,       # 0/1/2
             D2 % ("analysis", "首轮取证"), TOOL, FA,               # 3/4/5
             D2 % ("analysis", "补充深挖"), TOOL, FB,               # 6/7/8
-            D2 % ("verification", "复核结论"), TOOL, FV,           # 9/10/11
-            'Final Answer: {"summary": "编排完成", "conclusion": "ok"}',  # 12
+            D2 % ("verification", "复核结论"),                     # 9 阶段
+            TOOL, VERIFY_F1, TOOL, VERIFY_F2,                      # 10..13 复核实例×2
+            'Final Answer: {"summary": "编排完成", "conclusion": "ok"}',  # 14
         ]
         llm = ScriptedLLM(h)
         orch = _orch(td, llm)
         orch.run()
         agent = td / "process" / "agent"
-        for sub in ("0_recon", "1_analysis", "2_analysis", "3_verification"):
+        # 阶段 seq=3(无目录),两个复核实例 seq=4/5
+        for sub in ("0_recon", "1_analysis", "2_analysis", "4_verification",
+                    "5_verification"):
             if not (agent / sub / "transcript.jsonl").is_file():
                 fails.append(f"实例目录/转录缺失: {sub}")
         for fn in ("transcript.jsonl", "dispatch_log.json", "result.json"):
@@ -766,11 +786,16 @@ def test_pipeline_mode() -> list[str]:
         if s.get("report") is not None:
             fails.append("pipeline 模式不应产出 LLM 报告")
         agent = td / "process" / "agent"
+        # ADR-0003:verification 阶段聚合到 agent/verified_findings.json,单实例在
+        # 3_verification/(pipeline 同走 per-finding 阶段,布局与 auto 一致)
         for d, art in (("0_recon", "survey.json"),
-                       ("1_analysis", "findings.json"),
-                       ("2_verification", "verified_findings.json")):
+                       ("1_analysis", "findings.json")):
             if not (agent / d / art).is_file():
                 fails.append(f"pipeline 应产出 {d}/{art}")
+        if not (agent / "verified_findings.json").is_file():
+            fails.append("pipeline verification 应聚合 agent/verified_findings.json")
+        if not (agent / "3_verification" / "verified_findings.json").is_file():
+            fails.append("pipeline verification 单实例应产出 3_verification/")
         stages = s.get("stages", {})
         if not stages or not all(v.get("ok") for v in stages.values()):
             fails.append(f"pipeline 各阶段应 ok: {stages}")
@@ -1071,10 +1096,11 @@ def test_dynamic_dispatch_full_chain_budget() -> list[str]:
             FA,                                               # 34 FORCE_FINAL 兜底
             D2 % ("analysis", "补跑:未覆盖 netswitch 疑点"),    # 35 依补跑建议追加
             TOOL, FDUP_MIX,                                   # 36/37 补跑实例
-            D2 % ("verification", "复核结论"),                 # 38
-            TOOL, FV,                                         # 39/40
-            SUM,                                              # 41 取报告素材
-            REPORT_MD,                                        # 42 Final Answer
+            D2 % ("verification", "复核结论"),                 # 38 阶段(每疑点一实例)
+            TOOL, FV,                                         # 39/40 复核 fa
+            TOOL, VERIFY_FC,                                  # 41/42 复核 fc
+            SUM,                                              # 43 取报告素材
+            REPORT_MD,                                        # 44 Final Answer
         ]
         llm = ScriptedLLM(h)
         orch = _orch(td, llm)

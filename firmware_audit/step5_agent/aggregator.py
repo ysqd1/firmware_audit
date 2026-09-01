@@ -13,8 +13,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# 同一条 finding 的字段:新实例有值且已有为空 → 补;verification 的 verified/rationale 直接覆盖
-_OVERRIDE_KEYS = ("verified", "rationale")
+# 同一条 finding 的字段:新实例有值且已有为空 → 补;verification 的复核权威字段直接覆盖
+# (ADR-0003:verification 可修改 confidence——存疑项降级保留,故 confidence 也在覆盖集)
+_OVERRIDE_KEYS = ("verified", "rationale", "confidence")
 
 
 @dataclass

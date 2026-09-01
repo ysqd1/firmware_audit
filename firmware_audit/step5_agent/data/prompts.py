@@ -244,17 +244,17 @@ Action Input: {{"path": "agent/1_analysis/findings.json", "limit": 200}}
 {AGENT_DISCIPLINE}"""
 
 VERIFY_SYSTEM = f"""## 1 角色与使命
-你是固件安全审计的复核 Agent(verification)。使命:对 analysis 阶段(findings.json)的候选逐条复核,过滤误报,输出最终结论。你是最后一道质量闸门:放进 verified_findings 的每一条都要经得起人工复验;你的产出是下游编排器总结报告的唯一素材。
+你是固件安全审计的复核 Agent(verification)。使命:对 analysis 阶段(findings.json)的**单条候选 finding**独立复核,过滤误报,输出最终结论(verified + rationale)。你是最后一道质量闸门:放进 verified_findings 的每一条都要经得起人工复验;你的产出是下游编排器总结报告的素材。
 
 ## 2 工作区结构
 {ANALYSIS_DIR_DOC}
 
 ## 3 输入与输出
-- 输入:analysis 的 findings.json(简报已给摘要,每条候选含 title/file/evidence 等)
-- 输出:process/agent/<seq>_verification/verified_findings.json(每条都带 verified/rationale,结构见 ## 5)
+- 输入:任务简报注入的**单条候选 finding**(含 title/severity/file/func/addr/evidence/confidence)与相关工件指针;细节用 read_file 按指针分页拉取
+- 输出:process/agent/<seq>_verification/verified_findings.json——**这一条 finding**(title/file 不得改)带 verified/rationale,结构见 ## 5
 
 ## 4 执行流程
-复核方法(每条 finding 独立判断):
+复核这一条 finding(独立判断):
 1. 静态复核: find_decompiled_function/xref_query 重看证据,确认漏洞逻辑真实存在(不是规则误报或同名巧合);imports_query/strings_query 复核导入类与硬编码类 finding
 2. CVE 复核: cve_lookup 核对该 CVE 是否真影响此组件版本区间;版本对不上 → verified=false
 3. 保护机制复核: finding 声称"无 NX/无 PIE"时用 checksec 实测确认,不沿用上游说法
@@ -294,7 +294,7 @@ Fuzzing Harness 模板(sandbox_verify 的 code 参数照此骨架改,不要照�
   但有输出也算证据(工具不判失败);无触发输出 → 不能标 confirmed,如实降级
 
 ## 5 判定与输出规范
-Final Answer 的 JSON 结构(verified/rationale 是本阶段必填字段):
+Final Answer 的 JSON 结构(verified/rationale 是本阶段必填字段;**title/file 必须与输入 finding 一致**):
 {schema_with('"verified": true|false', '"rationale": "<复核结论:为何成立/为何误报>"')}
 结论三分(与 4.5 对应,写入 verified 与 rationale):
 - verified=true(成立)/ false(误报,写明 rationale)/ 存疑(confidence 降级保留,rationale 区分"静态成立但无法动态验证"与"证据不足待查")
@@ -304,27 +304,28 @@ Final Answer 的 JSON 结构(verified/rationale 是本阶段必填字段):
 1. 文件必须存在: 先用 read_file/find_decompiled_function 按 finding 的 file 验证——工具返回"文件不存在/产物缺失/路径越界"时,该条必须 verified=false,rationale 写"工件不存在";禁止猜测相似路径(不加后缀、换目录、找兄弟文件),禁止脑补"应该在某处"
 2. 证据必须吻合: finding 的 evidence 片段要在你本次的 Observation 里真实出现;文件存在但内容对不上(如同名函数里没有该调用)→ verified=false,rationale 写"证据与工件不符"
 3. 信息缺失不脑补: finding 缺 file/evidence 等关键字段时不替它补;标 verified=false 或降 confidence,rationale 写"关键字段缺失"
-4. 输出不缩水: 每条输入 finding 都要出现在 Final Answer 里(误报也要 verified=false + rationale),不许静默丢弃
+4. 单条必达: Final Answer 只输出简报注入的这一条 finding(title/file 必须一致),verified/rationale 必填;不许静默丢弃、不许换成别的 finding、不许混入第二条
 
 ## 7 输出协议
 {REACT_PROTOCOL}
 格式正误对照(每轮回复第一行必须是协议块,以下错误形态都会被系统判为协议失败):
 ✅ 正确开场(第一行就是协议块):
-Thought: 先读上游工件(路径见任务简报)
+Thought: 先按 finding 的 file 验证工件
 Action: read_file
-Action Input: {{"path": "<简报注入的上游工件路径>", "offset": 0, "limit": 200}}
-(任务简报没给路径时先 list_files 枚举 agent/ 目录找到 findings.json)
+Action Input: {{"path": "<简报注入的工件指针>", "offset": 0, "limit": 200}}
+(简报没给指针时按 finding 的 file 推导 process/analysis/<rel>/ 下 sidecar,或先 list_files 枚举 agent/ 目录)
 ❌ 错误形态(均禁止):
 - **Thought:** 复核开始(**Markdown 加粗**)
 - <Thought>复核</Thought>(XML 角括号包裹)
 - 复核计划:先验证文件,再看证据…… Thought: …(以计划散文开头)
 - Action: read_file {{"path": "…"}}(参数 JSON 与 Action 同行,必须换行写 Action Input:)
 - <text>Action: read_file …</text>(用 <reasoning>/<text> 等 XML 标签包裹调用)
-✅ 正确 Final Answer(纯 JSON,一行起,不包围栏、前后不加散文):
-Final Answer: {{"summary": "…", "findings": [{{…}}]}}
+✅ 正确 Final Answer(纯 JSON,一行起,不包围栏、前后不加散文,只含这一条 finding):
+Final Answer: {{"summary": "…", "findings": [{{"title": "<输入那条的 title>", "file": "<输入那条的 file>", "verified": true, "rationale": "…"}}]}}
 ❌ 错误 Final Answer:
 - ```json\n{{…}}\n``` 围栏包裹(引擎会救但不要依赖)
 - Final Answer: 复核结论如下 {{…}} 以上就是全部(JSON 前后混散文)
+- findings 数组含简报之外的第二条 finding(单实例只复核一条,title/file 必须一致)
 
 ## 8 通用纪律
 {AGENT_DISCIPLINE}"""
@@ -628,7 +629,41 @@ def build_analysis_brief(process_dir: Path, upstream_path: Path | None = None) -
 
 
 def build_verify_brief(process_dir: Path, upstream_path: Path | None = None) -> str:
-    path = upstream_path or (process_dir / "agent" / "findings.json")
-    return build_downstream_brief(
-        "verification", "复核候选漏洞,过滤误报,输出最终 verified_findings", path,
-        process_dir=process_dir)
+    """verification 实例简报:工作区概览 + 复核对象指示(不 dump 上游 findings)。
+
+    ADR-0003 起 verification 为"每疑点一实例":单条 finding 由编排器经
+    extra_brief 注入(build_verify_single_brief),此处只给工作区锚点与任务说明,
+    不再把全量 findings 摘要塞进每个实例(上下文隔离:每实例只装它那一条)。
+    """
+    return (
+        "任务:复核简报尾部注入的**单条候选 finding**,过滤误报,输出该条 verified"
+        " finding(带 verified/rationale)。\n"
+        "复核对象与相关工件指针见简报尾部(编排器注入),细节用 read_file 分页拉取。\n\n"
+        + build_filtered_overview(process_dir))
+
+
+def build_verify_single_brief(process_dir: Path, finding: dict) -> str:
+    """verification 单实例简报(extra_brief):单条 finding 全字段 + 相关工件指针。
+
+    上下文隔离铁律(ADR-0003):每实例只装这一条 finding 与其工件指针,不传对话
+    历史/其他 findings;工件指针列出该 file 在 process/analysis/ 下的 sidecar,
+    LLM 用 read_file 按相对 process/ 路径分页拉取细节。
+    """
+    rel = str(finding.get("file", "") or "").replace("\\", "/")
+    lines = [
+        "--- 待复核 finding(单条,本实例唯一对象) ---",
+        json.dumps(finding, ensure_ascii=False, indent=2),
+    ]
+    if rel:
+        ana = process_dir / "analysis"
+        pointers = [
+            f"- process/analysis/{rel}{suf}"
+            for suf in (".c", ".imports.json", ".strings.json", ".functions.json")
+            if (ana / f"{rel}{suf}").is_file()
+        ]
+        if pointers:
+            lines.append("相关工件指针(用 read_file 按相对 process/ 路径读取):")
+            lines.extend(pointers)
+    lines.append("输出: Final Answer 输出**这一条 finding**(title/file 不得改)并附"
+                 "verified + rationale,不允许换成别的 finding 或静默丢弃。")
+    return "\n".join(lines)

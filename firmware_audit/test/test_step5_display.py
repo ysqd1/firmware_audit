@@ -271,7 +271,8 @@ def test_runner_banner_end_to_end(capsys) -> list[str]:
     from firmware_audit.test.test_step5_pipeline import (
         ANALYSIS_FINAL,
         RECON_FINAL,
-        VERIFY_FINAL,
+        VERIFY_FINAL_F1,
+        VERIFY_FINAL_F2,
         _make_process,
     )
     from firmware_audit.step5_agent.run_step5 import step5_run
@@ -282,6 +283,8 @@ def test_runner_banner_end_to_end(capsys) -> list[str]:
         with tempfile.TemporaryDirectory() as td:
             target = _make_process(Path(td))
             D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+            VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+            # ADR-0003:verification 每疑点一实例——2 条 findings → 2 个独立实例
             llm = ScriptedLLM([
                 D % "recon",
                 'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5}',
@@ -290,8 +293,8 @@ def test_runner_banner_end_to_end(capsys) -> list[str]:
                 'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 5}',
                 ANALYSIS_FINAL,
                 D % "verification",
-                'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}',
-                VERIFY_FINAL,
+                VTOOL, VERIFY_FINAL_F1,
+                VTOOL, VERIFY_FINAL_F2,
                 'Final Answer: {"summary": "完成", "conclusion": ""}',
             ])
             step5_run(target, llm=llm)

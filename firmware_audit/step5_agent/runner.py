@@ -76,7 +76,7 @@ VERIFY_CFG = AgentConfig(
                 "cve_lookup", "checksec", "read_file", "strings_query",
                 "imports_query", "sandbox_verify"),
     output_name="verified_findings.json",
-    max_iters=24,
+    max_iters=8,   # ADR-0003:每疑点一实例,单条复核轮次需求 ≤8(原 24 多疑点摊薄)
     build_brief=build_verify_brief,
 )
 
