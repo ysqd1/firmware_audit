@@ -71,6 +71,7 @@ class TerminalDisplay:
         self.color = use_color
         self.width = width or shutil.get_terminal_size((100, 24)).columns
         self._t0 = 0.0
+        self._narrow_warned = False  # 窄编码降级仅提示一次(防每条 ✓/⚠ 刷屏)
         if use_color:
             _enable_win_ansi()
 
@@ -83,7 +84,21 @@ class TerminalDisplay:
         # flush=True:stdout 接管道/重定向/后台运行时 Python 走块缓冲,
         # 不刷会把实时反馈积压到缓冲满才可见(2026-08-27 后台运行实测:
         # STEP5_DISPLAY=1 但捕获输出零显示行,仅 stderr 的 llm-retry 可见)。
-        print(line, file=self.out, flush=True)
+        try:
+            print(line, file=self.out, flush=True)
+        except UnicodeEncodeError:
+            # 窄编码 stdout(Windows 默认 GBK 控制台页)打 ✓/⚠ 等字符会抛
+            # UnicodeEncodeError 并中断整个管线——违反本模块契约
+            # "显示失败也不改变 Agent 行为"(2026-09-01 独立测试模式实发)。
+            # 降级为按输出流编码替换不可编码字符后重打,流程照常推进。
+            # 记录失败原因(铁律 4/10),仅提示一次防刷屏。
+            enc = getattr(self.out, "encoding", None) or "utf-8"
+            safe = line.encode(enc, errors="replace").decode(enc)
+            if not self._narrow_warned:
+                self._narrow_warned = True
+                print(f"[display] 输出流编码 {enc} 无法表达部分字符,"
+                      f"已降级替换(不影响 Agent 结果)", file=sys.stderr, flush=True)
+            print(safe, file=self.out, flush=True)
 
     def _clip(self, text: str, limit: int) -> str:
         """压成单行并截断;超长以省略号结尾(全文已由 obs/ 与 transcript 兜底)。"""

@@ -5,6 +5,7 @@ make_display 环境变量矩阵/react_loop 事件接线/runner 端到端横幅�
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import sys
@@ -264,6 +265,38 @@ def test_emit_flushes_stream() -> list[str]:
     return fails
 
 
+def test_emit_narrow_encoding_degrades() -> list[str]:
+    """窄编码 stdout 守护(2026-09-01):Windows 默认 GBK 控制台页打 ✓/⚠ 等
+    不可编码字符会抛 UnicodeEncodeError 并中断整个管线——违反本模块契约
+    "显示失败也不改变 Agent 行为"。_emit 应按输出流编码降级重打,流程照常;
+    失败原因按铁律 4/10 记录一次(防每条 ✓/⚠ 刷屏)。"""
+    fails: list[str] = []
+    # 真实 GBK 输出流(Windows 默认控制台页):UTF-8 可编码但 GBK 不可编码的
+    # 字符(✓/⚠)写入时抛 UnicodeEncodeError——修复前会中断整个管线
+    with tempfile.TemporaryDirectory() as td:
+        out_path = Path(td) / "narrow.txt"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with open(out_path, "w", encoding="gbk") as out:
+                d = TerminalDisplay(mode="compact", use_color=False, width=100, out=out)
+                # 不抛异常即通过(修复前 _emit 会抛 UnicodeEncodeError 中断管线)
+                d.observation(1, "read_file", "✓ 命中 ⚠ 注意", True, 0.1)
+                d.final(2, '{"findings": []}')
+        # 失败原因只记录一次(多条窄编码行不刷屏)
+        if err.getvalue().count("[display]") != 1:
+            fails.append(f"窄编码降级应只记录一次失败原因, got {err.getvalue().count('[display]')}")
+        if "[display]" in err.getvalue() and "不影响 Agent 结果" not in err.getvalue():
+            fails.append("降级提示应说明不影响 Agent 结果")
+        # 降级后仍输出到流:不可编码字符被替换(? 占位)而非吞行——
+        # 行骨架(步骤号/工具名/耗时)应保留,原始 ✓/⚠ 不落盘
+        text = out_path.read_text(encoding="gbk")
+        if "[01]" not in text or "OK" not in text or "0.10s" not in text:
+            fails.append(f"窄编码降级不应吞行(应保留行骨架): {text[:80]!r}")
+        if "✓" in text or "⚠" in text:
+            fails.append("不可编码字符应按输出流编码替换(不应原样落盘)")
+    return fails
+
+
 # ---- runner 端到端(真实编排层走 make_display) ----
 
 def test_runner_banner_end_to_end(capsys) -> list[str]:
@@ -324,6 +357,7 @@ def test_main() -> int:
         ("react_loop_emits_events", test_react_loop_emits_events),
         ("react_loop_guard_events_shown", test_react_loop_guard_events_shown),
         ("display_none_no_regression", test_display_none_no_regression),
+        ("emit_narrow_encoding_degrades", test_emit_narrow_encoding_degrades),
     ]:
         fl = fn()
         if fl:

@@ -854,6 +854,109 @@ def test_verification_k_cap() -> list[str]:
     return fails
 
 
+def test_unreviewed_section_through_step5_run() -> list[str]:
+    """ADR-0003/ticket 04 流程级验收(Seam 1):走公开 step5_run() 全流程,
+    断言最终产出报告含独立未复核区段(⚠ 未经复核、confidence 保留 analysis 初值),
+    未复核疑点不混入已验证区;verified_findings.json 全量 N 条、已验证恰好 K 条、
+    未复核 verified=None。
+
+    与 test_orchestrator.test_report_unreviewed_section(Orchestrator seam)互补:
+    本用例从 step5_run 入口驱动,覆盖"所有 Step5 运行都产出报告"的公开契约。"""
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    TOOL = ('Thought: 先看工件\nAction: read_file\nAction Input: '
+            '{"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}')
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    # 3 条 findings:K=2 → 复核 f1/f2,f3(low)未复核 verified=None
+    ANALYSIS3 = ('Final Answer: {"summary": "取证3", "findings": ['
+                 '{"title": "f1", "severity": "high", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f2", "severity": "medium", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f3", "severity": "low", "file": "unitree/bin/idlc", "confidence": "high"}]}')
+    VF1 = ('Final Answer: {"summary": "复核f1", "findings": [{"title": "f1", '
+           '"severity": "high", "file": "unitree/bin/idlc", "verified": true, "rationale": "r1"}]}')
+    VF2 = ('Final Answer: {"summary": "复核f2", "findings": [{"title": "f2", '
+           '"severity": "medium", "file": "unitree/bin/idlc", "verified": false, "rationale": "r2"}]}')
+    S = 'Thought: 收尾\nAction: summarize\nAction Input: {"conclusion": "全链路完成"}'
+    REPORT_MD = ('Final Answer: # 固件安全审计报告\n## 发现清单\n'
+                 '- [high] ✓ f1\n- [medium] ✗ f2(误报)\n'
+                 '## 未复核疑点\n- [low] ⚠ f3 未经复核,confidence 为 analysis 初值\n'
+                 '## 误报剔除\n- f2(实为默认文档示例)')
+    with tempfile.TemporaryDirectory() as td:
+        target = _make_process(Path(td))
+        os.environ["STEP5_VERIFY_K"] = "2"
+        try:
+            llm = ScriptedLLM([
+                D % "recon", TOOL, RECON_FINAL,
+                D % "analysis", TOOL, ANALYSIS3,
+                D % "verification",
+                VTOOL, VF1,
+                VTOOL, VF2,
+                S,
+                REPORT_MD,
+            ])
+            summary = step5_run(target, llm=llm)
+        finally:
+            del os.environ["STEP5_VERIFY_K"]
+
+        # planner 参数移除的行为断言由 test_orchestrator.test_planner_removed 负责
+        # (传 planner="pipeline" 应抛 TypeError);本用例从 step5_run 入口驱动,
+        # 专注"所有 Step5 运行都产出报告"的未复核区段验收(ADR-0003/ticket 04)。
+        agent = target / "process" / "agent"
+
+        # 数据层:verified_findings.json 全量 N=3,已验证 K=2,未复核 verified=None
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is None:
+            fails.append("verified_findings.json 缺失(verification 每疑点一实例聚合)")
+        else:
+            findings = vf["findings"]
+            if len(findings) != 3:
+                fails.append(f"verified_findings.json 应全量 N=3 条, got {len(findings)}")
+            by_title = {f.get("title"): f for f in findings}
+            if by_title["f1"].get("verified") is not True or by_title["f2"].get("verified") is not False:
+                fails.append("f1/f2 应复核(verified True/False)")
+            f3 = by_title.get("f3")
+            if f3 is None or f3.get("verified") is not None:
+                fails.append(f"f3 应 verified=None 保留: {f3}")
+            elif f3.get("confidence") != "high":
+                fails.append(f"未复核 f3 的 confidence 应保留 analysis 初值: {f3}")
+
+        # 报告:step5_run 全流程产出报告(不再有"不产报告"快速模式),report.md 落盘
+        if not summary.get("report"):
+            fails.append("所有 Step5 运行都应产出报告(planner 快速模式已删)")
+        else:
+            md = Path(summary["report"])
+            if not md.is_file():
+                fails.append(f"报告文件不存在: {md}")
+            else:
+                text = md.read_text(encoding="utf-8")
+                # 独立未复核区段:⚠ + 未经复核标注 + 未复核 f3 在区内
+                if "## 未复核疑点" not in text:
+                    fails.append("报告应含独立未复核区段(## 未复核疑点)")
+                else:
+                    unrev = text[text.find("## 未复核疑点"):]
+                    for needle in ("⚠", "f3", "未经复核"):
+                        if needle not in unrev:
+                            fails.append(f"未复核区应含 '{needle}': {unrev[:200]}")
+                    for banned in ("✓ f1", "✗ f2", "r1", "r2"):
+                        if banned in unrev:
+                            fails.append(f"未复核区不得混入已验证条目/结论 '{banned}'")
+                if "## 发现清单" not in text or "✓ f1" not in text:
+                    fails.append("报告应含已复核发现清单")
+
+        # 素材层:summarize 注入的写作素材把已复核/未复核拆独立区段(报告据此画区段)
+        material = llm.calls[-1][-1]["content"]
+        if "#### 已复核 findings" not in material or "#### 未复核疑点" not in material:
+            fails.append("素材应拆已复核/未复核独立区段")
+        unrev_mat = material[material.find("#### 未复核疑点"):] if "#### 未复核疑点" in material else ""
+        for needle in ("f3", "⚠", "confidence 保留 analysis 初值", "rationale 为空"):
+            if needle not in unrev_mat:
+                fails.append(f"未复核素材应含 '{needle}': {unrev_mat[:200]}")
+        for banned in ("f1", "f2", "r1", "r2"):
+            if banned in unrev_mat:
+                fails.append(f"未复核素材不得混入已验证条目 '{banned}'")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -865,6 +968,7 @@ def test_main() -> int:
         ("full_chain_and_resume", test_full_chain_and_resume),
         ("verification_per_finding_flow", test_verification_per_finding_flow),
         ("verification_k_cap", test_verification_k_cap),
+        ("unreviewed_section_through_step5_run", test_unreviewed_section_through_step5_run),
         ("recon_v3_orchestration_boundary", test_recon_v3_orchestration_boundary),
         ("redispatch_analysis_brief_carries_recon_summary", test_redispatch_analysis_brief_carries_recon_summary),
         ("fresh_run_with_tool_call", test_fresh_run_with_tool_call),
