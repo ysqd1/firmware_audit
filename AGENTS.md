@@ -181,8 +181,11 @@ Step5 流程,不产出任何替代工件(无 survey/findings/report)。
 ```
 step5_agent/
   __init__.py              ← 对外只暴露 step5_run
-  run_step5.py             ← L0 总控入口(python -m 路径不变)
+  run_step5.py             ← L0 总控入口(python -m 路径不变;step5_run + resolve_workspace)
+  orchestrator.py          ← LLM 编排层(Orchestrator:调度门/每疑点一实例/报告落盘)
+  aggregator.py            ← findings 聚合纯逻辑(与 orchestrator 解耦)
   runner.py                ← L1 单 Agent 执行(AgentConfig × 3 + run_agent)
+  demo_display.py          ← 终端显示演示脚本
   engine/                  ← ReAct 执行引擎(自包含,包内相对导入)
     __init__.py            ← 再导出 run_react_agent / ReactResult
     react_loop.py          ← L2 状态机(解析→分发→回喂→收尾;display 钩子)
@@ -203,6 +206,7 @@ step5_agent/
       cli_base.py          ← 沙箱容器挂载与路径换算
       checksec.py / cve_bin_tool_scan.py / xref_query.py      ← CLI 类
       strings_query.py / imports_query.py / find_decompiled_function.py / read_file.py  ← 读盘类
+      list_files.py / search_code.py  ← 读盘类(目录铺面 / 边车+文本混合检索)
       cve_lookup.py        ← API 类(NVD)
       semgrep_scan.py      ← CLI 类(semgrep 本地规则,2026-08-18)
       gitleaks_scan.py     ← CLI 类(gitleaks,2026-08-18)
@@ -222,25 +226,33 @@ step5_agent/
 @dataclass
 class ToolResult:
     ok: bool                 # 退出码/文件存在/API 200
-    text: str                # 给 LLM 看的文本,≤8KB,超长截断标 truncated
+    text: str                # 给 LLM 看的文本,≤8KB,超长截断(头75%+尾20%+提示)
     data: dict | list | None # 结构化结果(有 JSON 就解析,没有就 None)
     error: str | None
     elapsed: float
+    raw: str                 # 截断前原文(execute 统一填充;全文落盘 obs/ 用)
 
 class AgentTool(ABC):
     name: str                # LLM 调用名,如 "checksec"
     description: str         # 写进系统提示词
-    params_doc: str          # 参数说明,LLM 按此填参
-    def execute(self, **kw) -> ToolResult: ...
+    params: dict[str, dict]  # 结构化参数声明(单一来源,ADR-0004)
+                             #   参数名 → {type: str/int/bool, required, default, enum}
+    @property
+    def params_doc(self) -> str:  # 从 params 渲染的 LLM 可读规格(含 JSON 骨架)
+        ...
+    def execute(self, **kw) -> ToolResult:
+        # 先 validate_params(self.params, kw)(未知键/类型错/缺失必选 → 优雅错误),
+        # 校验通过才 _run。见 docs/adr/0004-step5-interface-contract.md
+        ...
 ```
 
 **工具分两类,填袋方式不同,但袋子一样:**
 
 | 类型     | 工具                                                         | 数据来源                                | `ok` 判据  | `text`    | `data`                             |
 | ------ | ---------------------------------------------------------- | ----------------------------------- | -------- | --------- | ---------------------------------- |
-| CLI 工具 | checksec, cve\_bin\_tool\_scan, xref\_query, semgrep\_scan | `subprocess` 调 Docker 沙箱            | 退出码 0    | stdout 截断 | JSON 解析(有 `--json` 就 `json.loads`) |
-| 读盘工具   | strings\_query, imports\_query, find\_decompiled\_function | Step4 产出的 `analysis/*.json` / `*.c` | 文件存在且读成功 | 文件内容截断    | None(文本即内容)                        |
-| API 工具 | cve\_lookup                                                | `urllib` 调 NVD REST API             | HTTP 200 | 格式化摘要     | 原始 JSON                            |
+| CLI 工具 | checksec, cve\_bin\_tool\_scan, xref\_query, semgrep\_scan, gitleaks\_scan, sandbox\_verify, binwalk\_rescan | `subprocess` 调 Docker 沙箱 / binwalk 专用镜像 | 退出码 0    | stdout 截断 | JSON 解析(有 `--json` 就 `json.loads`) |
+| 读盘工具   | strings\_query, imports\_query, find\_decompiled\_function, read\_file, list\_files, search\_code | Step4 产出的 `analysis/*.json` / `*.c`,或 `process/` 下文件 | 文件存在且读成功 | 文件内容截断    | None(文本即内容)                        |
+| API 工具 | cve\_lookup, web\_search                                    | `urllib` 调 NVD / DDG HTML             | HTTP 200 | 格式化摘要     | 原始 JSON / 检索结果                    |
 
 **关键:find\_decompiled\_function 不重新调 Ghidra。** Step4 已经把反编译 C 代码落到 `analysis/<rel>.c`,find\_decompiled\_function 的 `execute(file_ref, func_name)` 只需要:
 
@@ -254,7 +266,7 @@ ReAct 循环不感知数据来源。它对 LLM 说的永远是:"给你一个 Obs
 
 | 层     | 工具                                                                                          | 运行位置                                    | 镜像                                                                   |
 | ----- | ------------------------------------------------------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------- |
-| 读盘层   | strings\_query, imports\_query, find\_decompiled\_function                                  | 宿主机 Python(读 `analysis/*.json` / `*.c`) | 无                                                                    |
+| 读盘层   | strings\_query, imports\_query, find\_decompiled\_function, read\_file, list\_files, search\_code | 宿主机 Python(读 `analysis/*.json` / `*.c` 或 `process/` 下文件) | 无                                                                    |
 | API 层 | cve\_lookup, web\_search                                                                    | 宿主机 Python(`urllib`)                    | 无                                                                    |
 | CLI 层 | checksec, cve\_bin\_tool\_scan, xref\_query, semgrep\_scan, gitleaks\_scan, sandbox\_verify | `firm_audit/sandbox` 容器                 | sandbox(已装 checksec/cve-bin-tool/r2/semgrep 1.100.0/gitleaks 8.18.2) |
 | CLI 层 | binwalk\_rescan                                                                             | `binwalk` 容器(extracted 只读挂载扫签名)         | binwalk(专用,保留不动)                                                     |
@@ -288,10 +300,12 @@ docker run --rm --entrypoint cve-bin-tool `
 
 sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁镜像(四工具 + Ghidra 实跑全检 ALL-PASS,见 verify\_agent\_tools.sh),旧 9.53GB 层与 `:flat` 中间 tag 已清理,工具层统一引用 `latest`。ENTRYPOINT 仍是 `analyzeHeadless`,调工具必须 `run_docker(..., entrypoint="checksec")` 覆盖。**binwalk 刻意不进 sandbox**(2026-08-18 实测:pip 版是停更的 2.1.0,py3.11 import 即崩;v3 Rust 二进制需 GLIBC 2.39 而 bullseye 只有 2.31),binwalk\_rescan 走专用镜像。另外:全量重建主 Dockerfile 会重编译 radare2 且其构建要 git clone vector35-arch-\*(GitHub 被掐断 Error 128)——增量改动用 `Dockerfile.binwalk` 式派生层(见文件头注释)。
 
-### MVP 工具清单(13 个)
+### 工具清单(15 个)
 
 | 工具                         | 类型  | 底层                                                                        | 输出                         | 归属 Agent               |
 | -------------------------- | --- | ------------------------------------------------------------------------- | -------------------------- | ---------------------- |
+| `list_files`               | 读盘  | pathlib 枚举目录(白名单 + SDK 目录排除 + max\_files 截断)                           | 目录/文件清单                    | recon 首动铺面;全 Agent      |
+| `search_code`              | 读盘  | 边车索引(strings/imports/text.json)+ extracted 文本 grep 双路检索                 | 命中列表(带地址/行锚点)               | analysis, verification |
 | `checksec`                 | CLI | slimm609/checksec `--format=json`                                         | RELRO/NX/PIE/Canary JSON   | recon, verification    |
 | `cve_bin_tool_scan`        | CLI | cve-bin-tool `--format json -o -`                                         | 已知 CVE 清单                  | recon(**可选**,见下)       |
 | `strings_query`            | 读盘  | 读 `analysis/*.strings.json` + 正则                                          | URL/IP/密钥/口令命中             | recon, analysis        |
@@ -366,13 +380,15 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 * 重试机制(2026-08-18):首次失败按错误类型分流——可重试(网络瞬断/超时/HTTP 5xx/429/空回复/响应非 JSON)按 `RETRY_INTERVALS=(10,15,20)s` 间隔自动重试至多 `MAX_RETRIES=3` 次,每次向 stderr 输出带时间戳日志(`[llm-retry]` 前缀:错误类型+重试次数+等待时长),重试后成功也打点;不可重试(HTTP 400/401/403/404)立即抛不重试;全部失败抛携带最终错误详情的 LLMError(→ Step5 终止)。单测 `test_step5_llm.py` 打桩 urlopen/sleep 零真实等待
 
+* **token 预算与截断续写(2026-09-01,ADR-0005,ticket 02)**:`DEFAULT_MAX_TOKENS` 由 16384 提至 **32768**(env `LLM_MAX_TOKENS` 可覆盖,`_client()` 读取)。deepseek-v4-flash 是推理模型,`reasoning_content`(思考)与 `content`(正文)分占 token 预算——思考烧满时 content 为空、`finish_reason=stop`,`chat()` 不再当空回复硬重试,而是**截断续写**:把 reasoning 拼回 assistant 消息回传 API + "直接给最终答复,别展开思考"提示,用原 max_tokens 再调一次;续写只回传 API 接续,**不进 ReAct 上下文/长期记忆**(对上层透明,上层仍只拿 content);续写请求失败(400 等)→ 降级为普通重试,不阻塞。单测 `test_step5_llm.py::test_empty_content_with_reasoning_continuation` / `test_continuation_failure_degrades_to_retry`。见 `docs/adr/0005-step5-llm-token-and-continuation.md`
+
 * key 永不写入代码或提交仓库;测试用 key 已在对话中暴露,建议测试期结束后在 DeepSeek 后台轮换
 
 ### 已定:上下文管理与压缩(2026-08-17)
 
 每个 Agent 的 messages\[] 四分区:系统提示词(永不压缩)/ 任务简报(前序最终报告+工件索引,永不压缩)/ 概括区(压缩摘要,触发时滚动更新)/ 保留区(最近 K 轮原文)。
 
-* 触发:每轮结束估算总字符数(零依赖,中文≈1字/token、代码≈3字符/token)。阈值(2026-08-18 上调):v4-flash 上下文窗口 1M,`window × 0.6 = 600k` est tokens 触发(原 60k 窗口 × 0.65 = 39k),留 40% 余量给单轮 Observation 峰值与概括回写;规模化稳定性有单测守护(`compact_at_600k_threshold`,\~700k est tokens 触发/边界对齐/构建)
+* 触发:每轮结束估算总字符数(零依赖,**统一 1 token ≈ 2 字符**,`est_tokens = 总字符数 // 2`,够触发判断即可不追求精确)。阈值(2026-08-18 上调):v4-flash 上下文窗口 1M,`window × 0.6 = 600k` est tokens 触发(原 60k 窗口 × 0.65 = 39k),留 40% 余量给单轮 Observation 峰值与概括回写;规模化稳定性有单测守护(`compact_at_600k_threshold`,\~700k est tokens 触发/边界对齐/构建)
 
 * 压缩函数:复用默认模型 deepseek-v4-flash(AgentConfig.model 可覆盖为更便宜型号),概括保留区最老若干轮,摘要写回概括区、原文删除;概括 prompt 保留四类信息:已确认事实/已排除项/未决问题/证据指针(工件路径)
 
@@ -394,7 +410,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 **不拆三个 Agent 子类**——三个 agent 只差 system prompt / 工具集 / 输入输出工件,循环逻辑完全一致,用一个 `run_react_agent(cfg: AgentConfig, ctx)` 函数 + 三个 `AgentConfig` 实例即可。未来某 agent 演化出不同循环行为时再拆子类。
 
-**工具层:AgentTool 基类 + 每工具一个子类**。基类保留 name / description / params\_doc 接口三元组 + `execute(**kw) -> ToolResult` 统一入口(计时/异常捕获/结果截断)。子类分 CLI/读盘/API 三种,各自实现 `_build_cmd` / `_parse` / `_run`。详见[三、工具层实现](#三工具层实现)。
+**工具层:AgentTool 基类 + 每工具一个子类**。基类保留 name / description / **结构化 `params`**(参数名→type/required/default/enum 声明)+ 渲染的 `params_doc` 属性 + `execute(**kw) -> ToolResult` 统一入口(先 `validate_params` 校验、计时/异常捕获/结果截断)。子类分 CLI/读盘/API 三种,**各自只实现 `_run`**(CLI 构建命令/解析在 `cli_base` 与 `_run` 内;读盘直读工件;API urllib)。详见[三、工具层实现](#三工具层实现)。
 
 **Agent 间传递:JSON 工件文件是唯一契约**,dataclass 是 Python 侧的宽容访问层:
 
