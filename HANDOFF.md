@@ -1,68 +1,66 @@
 # HANDOFF — 固件审计项目会话交接
 
-> 写于 2026-09-01(上版 08-31)。这是给**下一个对话/接手者**的交接文档。
+> 写于 2026-09-02(上版 09-01)。这是给**下一个对话/接手者**的交接文档。
 > 目的:让接手者无需重读全部历史,就能知道项目状态、已做什么、接下来做什么、关键背景。
 
 ---
 
 ## 0. 项目一句话
 
-`E:\固件\create\important` — 宇树固件安全审计流水线(Step1-5)。Step1-4 规则化处理(解包→过滤→分类→反编译),Step5 LLM Agent 审计(三个子 Agent:recon→analysis→verification,由 orchestrator 编排)。
+`E:\固件\create\important` — 宇树固件安全审计流水线(Step1-5)。Step1-4 规则化处理(解包→过滤→分类→反编译),Step5 LLM Agent 审计(三个子 Agent:recon→analysis→verification,由 orchestrator 编排,每疑点一独立复核实例)。
 
 ## 1. 当前 git 状态(截至交接)
 
 ```
 (最新提交)
-7476b35  重构:收敛系统目录判断到 file_rules,修复 step4 降级名单分叉
-ff1d7f7  重构:拆分 FindingAggregator 独立模块,Orchestrator 增加公开 API
-02ae1bf  补充项目术语表与 ADR 架构决策记录,同步修订三份需求/规则/架构文档
-af8b7fd  修复 Step5 协议解析漂移与正文/思考拆分,同步工具层与编排器增强
+eb0211d  Step5: 全流程测试补强(ADR-0003/ticket 06)
+3444a87  Step5: 删除 pipeline 快速模式(ADR-0006/ticket 05)
+7731a31  Step5: 报告未复核疑点独立区段(ADR-0003/ticket 04)
+ab9f52b  Step5: verification 每疑点一实例(ADR-0003)
+b52eb39  Step5: LLM token 预算提升与截断续写(ADR-0005)
+7a9c0eb  Step5: 工具接口契约结构化声明与校验(ADR-0004)
+929a65f  docs:Step5 agents 设计会话产出(ADR-0003~0006 + spec + tickets)
+8ffa163  docs:补充 C3/C4 落地总结与会话交接(HANDOFF)
+1dee1ab  C4:收敛路径逃逸检查到 resolve_within,统一 6 处 containment 判定
 ```
 
-**工作区未提交**(本次会话的 C4 落地,已 code-review + e2e 验证,待提交):
-- `firmware_audit/step5_agent/providers/tools/{base,cli_base,read_file,list_files,search_code,binwalk_rescan}.py` — **C4:路径逃逸收敛到 `resolve_within`**
-- `firmware_audit/test/test_security_hardening.py` — `resolve_within` 单测 + `test_main` 注册
-- `firmware_audit/test/test_step5_tools.py` — read_file None 缺参回归 guard
-- `docs/c4-path-escape.md` — C4 总结(含 code-review 追认 + e2e 验证,详见 §6/§7)
-- `docs/c3-file-rules.md` — C3 总结(上轮遗留,本次一并提交)
-- `HANDOFF.md` — 本文件
+**工作区干净**(无未提交改动)。上版 §1 的"C4 未提交"清单已全部入库(`1dee1ab` C4 + `8ffa163` docs),不再待办。
 
-**不入仓(临时,勿提交)**:`.coverage`、`e2e_run.log`、`e2e_step5_force.log`
+**不入仓(临时,勿提交)**:`.coverage`、`e2e_run.log`、`e2e_step5_force.log`;OS 临时目录可能有 `/handoff` 便携快照(重启即没,非权威)。
 
-## 2. 已完成的工作(最近四轮)
+## 2. 已完成的工作(自 09-01 起三个大块)
 
-### (a) 领域建模(提交 02ae1bf)
-- 新建 `CONTEXT.md`(术语表,40+ 术语,含 Avoid 词)
-- 新建 `docs/adr/0001-step5-orchestrator.md`、`0002-step5-no-key-hard-stop.md`
-- 修正 `requirements.md`/`rules.md`/`agents.md` 过时表述
+### (a) C3/C4 路径安全收敛(提交 1dee1ab、7476b35,08-31~09-01)
+- C3:`firmware_audit/file_rules.py` 收敛系统目录判断到 file_rules,修复 step4 把 `etc/init.d` 当标准目录跳过的真实 bug。详见 `docs/c3-file-rules.md`
+- C4:`base.resolve_within(root, ref)` 原语统一"解析 + containment 判定",实际收敛 6 处。详见 `docs/c4-path-escape.md`
 
-### (b) 拆分 FindingAggregator(提交 ff1d7f7)
-- `orchestrator.py` 里的纯聚合逻辑拆到独立 `aggregator.py`
-- 新增公开 API:`record_failed`/`finish`/`write_result`(2026-09-01 随 pipeline 模式删除,ticket 05)
+### (b) Step5 Agents 重构(ADR-0003~0006,六张 ticket 01–06,提交 7a9c0eb→eb0211d)
+上一版 §7"下一会话焦点:agents 问题"**已整体落地**。设计决策与验收逐条记录在:
+- **Spec**:`docs/specs/step5-agents-refactor.md`(四决策 + 三测试 seam)
+- **ADR**:`docs/adr/0003-0006-*.md`
+- **Tickets**(每张一 md,状态 done,含实现说明/验收):`.scratch/step5-agents-refactor/issues/01~06-*.md`
 
-### (c) 收敛系统目录判断到 file_rules(提交 7476b35)
-- 新增 `firmware_audit/file_rules.py`,收敛 5 个判断
-- 修复真实 bug:step4 硬编码名单把 `etc/init.d`/`ssh`/`apt` 当标准目录跳过
-- 全量测试 208 passed, 10 skipped;详见 `docs/c3-file-rules.md`
+四块内容(细节引用上述文件,不在此重复):
+1. **ADR-0004 工具接口契约**(ticket 01):每工具结构化 `params` 声明 + `base.execute` 统一校验,未知/类型/缺失必选返回优雅错误
+2. **ADR-0005 LLM token/续写**(ticket 02):max_tokens→32768,content 空 + reasoning 非空 → 截断续写,失败降级普通重试
+3. **ADR-0003 verification 每疑点一实例**(ticket 03/04):findings 按 severity+confidence 排序取前 K,逐条独立实例复核(max_iters=8)聚合回 `verified_findings.json`(全量 N 保留,未进 K 的 verified=None);未复核进报告独立区段(⚠)。补跑逻辑取消
+4. **ADR-0006 删 pipeline 模式**(ticket 05):`planner` 参数移除,step5_run 只剩 LLM 编排一条路径,所有运行产报告
 
-### (d) 收敛路径逃逸检查到 resolve_within(C4,2026-09-01,未提交)
-- 新增 `base.resolve_within(root, ref)` 原语,统一"解析 + containment 判定"
-- **实际收敛 6 处**(架构报告说 4 处,`search_code._resolve_scope`/`binwalk_rescan` 也藏着同一句,一并捞了)
-- 新增单测 `test_resolve_within` + `test_main` 注册 + read_file None guard
-- **code-review(两轴)修复 4 项**:`read_file(path=None)` 契约回归、`resolve_within` docstring 矛盾、`container_path`/`binwalk` 空串行为变更未披露、测试注册
-- 全量测试 **217 passed, 2 skipped**
-- 详见 `docs/c4-path-escape.md`
+### (c) Step5 全流程测试补强(ticket 06,提交 eb0211d)
+- 三个 seam 的测试在先前 ticket 落库时已齐备(工具契约 / LLM 续写 / 流程 K 聚合)
+- 本票补:流程级未复核区段测试(从 `step5_run()` 入口驱动);修 `display._emit` 在 GBK 控制台打 ✓/⚠ 抛 `UnicodeEncodeError` 中断管线的 bug(独立测试模式实发)
 
 ## 3. 关键背景(接手者必读)
 
 - **CONTEXT.md** 是术语表,用词前先看它。
 - **rules.md** 是代码规范铁律("失败不崩"、零第三方依赖、配置集中等)。
-- **docs/adr/** 记录两个决策:orchestrator 存在、无 key 立即终止(API 失败也终止,不降级)。
+- **docs/adr/** 现有 0001-0006:0001 orchestrator 存在、0002 无 key/API 失败立即终止(不降级)、0003-0006 本次重构四决策。
 - 术语辨析:Step2 过滤=筛深度分析对象;Step5 工具层过滤=搜索跳噪音;`is_system_trust`=系统证书信任库。
+- Step5 当前:`step5_run` 唯一入口,verification 每疑点一实例(K 默认 10,env `STEP5_VERIFY_K` 覆盖),`verified_findings.json` 全量 N(未复核 verified=None)聚合在 agent 根。
 
 ## 4. 架构体检遗留候选(下一个可做)
 
-来自 `improve-codebase-architecture` 报告(已做 C3、C4)。剩余:
+来自 `improve-codebase-architecture` 报告(已做 C3、C4,Step5 重构是独立线)。剩余:
 
 | 候选 | 强度 | 内容 |
 |---|---|---|
@@ -77,37 +75,32 @@ af8b7fd  修复 Step5 协议解析漂移与正文/思考拆分,同步工具层�
 - **想提升测试覆盖**(尤其 Step4)
 - 架构方向认可,主要问题是"大模块该拆未拆"
 - **e2e 验证实证过 ADR-0002**:API 失败干净终止,不降级
+- 调 skill 前先征得同意;代码改动先说明意图(见 §8)
 
-## 6. 本次端到端验证(e2e,2026-09-01,`/verify`)
+## 6. 历史 e2e 验证(2026-09-01,已过时记录,留档参考)
 
-对 `target/1`(nano-ubuntu 固件)跑了两轮,详见 `docs/c4-path-escape.md §六`:
+对 `target/1` 的 C4 验证见 `docs/c4-path-escape.md §六`。**当时验证的 agents 行为问题已被 01–06 重构解决**,此节不再作为下一步依据,仅留档。
 
-- **D1 全流程 `main target/1`**:Step2 过滤 5541→2047、Step3 分类 2047、Step4 ELF=522 全跑通;C3 的 `etc/init.d` 等该审的进入送审集。但 Step5 三子 Agent **skipped**(旧工件在)。
-- **D2 `run_step5 --force`**:三子 Agent 真跑。recon 20 轮 + analysis 前半段,**C4 工具(`list_files`×13、`read_file`×15、`search_code`×5)全部正常,合法路径零越界误报**。
-- analysis 中途 **LLM API 连续失败(空回复×2 + HTTP 307×1)→ 重试 4 次全败 → 按 ADR-0002 干净终止,exit 0**。
+## 7. 下一会话焦点(候选)
 
-## 7. 下一会话焦点:解决 agents 问题(本次 e2e 暴露)
+上一轮焦点(agents 问题)已解决。剩余方向按优先级:
 
-用户指定下一会话**解决 agents 的问题**,且**要走全流程调用 skill**(不是手写)。e2e 里观察到的具体问题(接手者从这里挑/发散):
-
-1. **verification 子 Agent 未完整执行**:D2 跑到 analysis 中途 API 307 终止,verification 没跑到。API 稳定后需重跑 `--force` 验证完整链路。
-2. **LLM 传参质量差,靠工具层兜底**:recon 把 `recursive` 传给 `read_file`(`TypeError: unexpected keyword`);semgrep 收到拼碎的 JSON(`{"path":...}{"path":...}`)。工具层 execute 兜住了(失败不崩),但**说明 agents 提示词/`params_doc` 对参数引导不足**,Agent 偶发畸形调用。可改进点:params_doc 更严格、协议层校验。
-3. **llm-retry 空回复**:`reasoning_content` 很长但 `content` 空、`finish_reason=stop`(reasoning 溢出?)。模型侧问题,工具层已重试兜底,但值得关注是否需要降 reasoning。
-4. **orchestrator 的 tool_calls 统计是 `{}`**:编排层只记了自己的 dispatch/summarize,子 Agent 的工具调用没归入编排统计(可能是设计如此,待确认)。
-5. **API 307 故障**:`mimo-v2.5` 服务端 openresty 网关临时重定向,非代码问题,但说明 Step5 对上游抖动敏感。
+1. **C1:拆 Step4 `decompile()`**(§4 Strong 候选)——用户明确想提 Step4 覆盖。**建议走全流程 skill**:`grill-with-docs` 打磨 → `to-spec` → `to-tickets` → 逐票 `implement`(`/clear` 间隔),提交前 `code-review`
+2. **C2**(crypto parser 去重)— 同候选表,Worth
+3. 暂无新焦点的技术债——项目已相对收敛,可停一轮
 
 ## 8. 工作规则(用户明确要求,接手者必须遵守)
 
 - **调用任何 skill 前,必须先提示用户,得到许可后再调**。用户说:"我需要调用 skill 的时候提示我。"
 - **不许擅自修改代码**。任何代码改动(哪怕小)先向用户说明意图、经同意再做。
-- 下一会话解决 agents 问题时,**使用全流程调用 skill**(matt-pocock-skills 完整 flow,如 grill-with-docs → to-spec → to-tickets → implement → code-review),而不是手动改。
+- 复杂功能/重构优先**使用全流程 skill**(matt-pocock-skills:grill-with-docs → to-spec → to-tickets → implement → code-review),而不是手动改。
 
 ---
 
 ## 下一步选项(接手者从这里选)
 
-1. **提交当前 C4 改动**(见 §1 工作区清单)+ 更新后的 HANDOFF
-2. **做 C1**(拆 Step4 decompile)+ 提测试覆盖——用户明确想
-3. **下一会话焦点:agents 问题**(见 §7,走全流程 skill)
+1. **做 C1**(拆 Step4 decompile + 提覆盖)——用户明确想,当前最优先
+2. **做 C2**(crypto parser 去重)
+3. **停一轮**(重构已收敛,无紧急技术债)
 
 > 用户沟通偏好:中文;喜欢具体代码例子;会追问细节("这一步在干嘛")。
