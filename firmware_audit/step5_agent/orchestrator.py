@@ -805,6 +805,20 @@ class Orchestrator:
             return ToolResult(ok=False, text="", error=(
                 f"verification 阶段失败(实例 {seq}): {type(e).__name__}: {e}"))
 
+    @staticmethod
+    def _lift_verify_verdict(loaded: dict | None, vfs: list) -> None:
+        """0/N bug(2026-09-03):模型把复核结论写在实例工件**顶层**
+        (verified/rationale),findings[] 只含 identity 字段(verified 空)。
+        归一进 findings[0],聚合层才读得到——否则已复核条目被丢进未复核区
+        (VERIFY_SYSTEM 虽要求写进 findings[],save_artifact 会保留未知顶层字段)。"""
+        if not vfs or not loaded:
+            return
+        head = vfs[0]
+        if head.get("verified") is None and "verified" in loaded:
+            head["verified"] = loaded["verified"]
+        if not head.get("rationale") and loaded.get("rationale"):
+            head["rationale"] = loaded["rationale"]
+
     def _run_verify_one(self, vseq: int, finding: dict, upstream: Path,
                         task: str, request: dict) -> SubAgentResult:
         """单条 finding 的独立 verification 实例(ADR-0003)。
@@ -824,6 +838,7 @@ class Orchestrator:
                 loaded = load_artifact(out_path) or {}
                 vfs = [f for f in (loaded.get("findings") or [])
                        if isinstance(f, dict)]
+                self._lift_verify_verdict(loaded, vfs)
                 return SubAgentResult(
                     seq=vseq, agent_name="verification", status=DispatchStatus.SKIPPED,
                     artifact_path=out_path, summary=loaded.get("summary", ""),
@@ -844,6 +859,7 @@ class Orchestrator:
                         if ares.artifact_path else None)
             vfs = [f for f in (loaded_v or {}).get("findings", []) or []
                    if isinstance(f, dict)]
+            self._lift_verify_verdict(loaded_v, vfs)
             for f in vfs:                 # 溯源:该条复核结论产自本实例
                 f["source_agent"] = "verification"
                 f["instance_seq"] = vseq

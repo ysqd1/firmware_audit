@@ -691,6 +691,66 @@ def test_report_unreviewed_section() -> list[str]:
     return fails
 
 
+def test_verify_toplevel_verdict_merged() -> list[str]:
+    """0/N bug(2026-09-03):verification 实例把结论写在**顶层**(verified/rationale,
+    findings[].verified 为空)时,聚合必须保留结论——不得把已复核条目丢进未复核区。
+
+    复现形态:模型实际输出为顶层 verified/rationale + findings[] 只含 identity 字段
+    (VERIFY_SYSTEM 虽要求写进 findings[],但 save_artifact 会把未知顶层字段原样保留,
+    于是落盘工件即"顶层有结论、findings[] 空")。修复前聚合只读 findings[0].verified
+    → null → summary 写"已复核 0/N"。"""
+    fails: list[str] = []
+    import os
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    ANALYSIS2 = ('Final Answer: {"summary": "取证2", "findings": ['
+                 '{"title": "f1", "severity": "high", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f2", "severity": "medium", "file": "unitree/bin/idlc", "confidence": "high"}]}')
+    # 模型实际输出形态:结论在顶层,findings[] 只含 identity 字段(verified 空)
+    VF1_TOP = ('Final Answer: {"summary": "复核f1", "verified": true, "rationale": "r1", '
+               '"findings": [{"title": "f1", "severity": "high", "file": "unitree/bin/idlc"}]}')
+    VF2_TOP = ('Final Answer: {"summary": "复核f2", "verified": false, "rationale": "r2-误报", '
+               '"findings": [{"title": "f2", "severity": "medium", "file": "unitree/bin/idlc"}]}')
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        _make_process(td)
+        os.environ["STEP5_VERIFY_K"] = "2"
+        try:
+            llm = ScriptedLLM([
+                D % "recon", TOOL, RECON_FINAL,        # 0/1/2
+                D % "analysis", TOOL, ANALYSIS2,        # 3/4/5
+                D % "verification",                      # 6 阶段
+                VTOOL, VF1_TOP,                          # 7/8 复核 f1(顶层结论)
+                VTOOL, VF2_TOP,                          # 9/10 复核 f2(顶层结论)
+                SUM,                                     # 11 summarize 取素材
+                'Final Answer: {"summary": "完成", "conclusion": "ok"}',  # 12
+            ])
+            orch = _orch(td, llm)
+            orch.run()
+        finally:
+            del os.environ["STEP5_VERIFY_K"]
+
+        agent = td / "process" / "agent"
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is None:
+            fails.append("verified_findings.json 缺失(verification 每疑点一实例聚合)")
+        else:
+            by_title = {f.get("title"): f for f in vf["findings"]}
+            f1 = by_title.get("f1")
+            f2 = by_title.get("f2")
+            if f1 is None or f1.get("verified") is not True:
+                fails.append(f"f1 顶层 verified=true 应在聚合中被保留: {f1}")
+            if f1 is None or f1.get("rationale") != "r1":
+                fails.append(f"f1 顶层 rationale 应在聚合中被保留: {f1}")
+            if f2 is None or f2.get("verified") is not False:
+                fails.append(f"f2 顶层 verified=false 应在聚合中被保留: {f2}")
+            if f2 is None or f2.get("rationale") != "r2-误报":
+                fails.append(f"f2 顶层 rationale 应在聚合中被保留: {f2}")
+            if "已复核 0/2" in vf.get("summary", ""):
+                fails.append(f"聚合 summary 不应再写'已复核 0/2': {vf.get('summary')}")
+    return fails
+
+
 def test_report_absent_without_summarize() -> list[str]:
     """未调用 summarize 直接 finish → 不出报告(不静默降级)。"""
     fails: list[str] = []
@@ -1442,6 +1502,7 @@ def test_main() -> int:
         ("orchestrator_multi_dispatch_integration", test_orchestrator_multi_dispatch_integration),
         ("summarize_tool_and_report", test_summarize_tool_and_report),
         ("report_unreviewed_section", test_report_unreviewed_section),
+        ("verify_toplevel_verdict_merged", test_verify_toplevel_verdict_merged),
         ("report_absent_without_summarize", test_report_absent_without_summarize),
         ("degraded_resume_rerun", test_degraded_resume_rerun),
         ("handoff_snapshot_file", test_handoff_snapshot_file),
