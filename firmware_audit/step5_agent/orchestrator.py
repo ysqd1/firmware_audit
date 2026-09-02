@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -41,7 +41,7 @@ from .engine.react_loop import run_react_agent
 from .providers.llm_client import LLMError
 from .providers.tools import ToolContext
 from .providers.tools.base import AgentTool, ToolResult, truncate_text
-from .runner import ALL_CONFIGS, run_agent
+from .runner import ALL_CONFIGS, resolve_max_iters, run_agent
 
 # 多次调用下编排轮数上限:默认 3 次调度+summarize+收尾,余量留给补充调用
 ORCH_MAX_ITERS = 12
@@ -628,7 +628,9 @@ class Orchestrator:
         self.force = force
         self.agent_dir = process_dir / "agent"
         self.orch_dir = self.agent_dir / "orchestrator"
-        self._sub_cfgs = {c.name: c for c in ALL_CONFIGS}
+        # 轮次上限 env 覆盖(STEP5_<NAME>_MAX_ITERS):replace 出副本,模块常量不污染
+        self._sub_cfgs = {c.name: replace(c, max_iters=resolve_max_iters(c.name, c.max_iters))
+                          for c in ALL_CONFIGS}
         self._seq = 0
         self._agent_results: dict[str, SubAgentResult] = {}
         self._dispatches: list[SubAgentResult] = []   # 全部实际执行的调度(时序)
@@ -1250,7 +1252,8 @@ class Orchestrator:
             "summarize": SummarizeTool(ctx, self),
             "finish": FinishTool(ctx),
         }
-        system_prompt = build_orchestrator_prompt(tools, max_iters=ORCH_MAX_ITERS)
+        orch_iters = resolve_max_iters("orchestrator", ORCH_MAX_ITERS)
+        system_prompt = build_orchestrator_prompt(tools, max_iters=orch_iters)
         save_system_prompt(self.orch_dir, system_prompt)  # 编排器系统提示词留档(复现用)
         init = self._build_initial_message()
         transcript = self.orch_dir / "transcript.jsonl"
@@ -1259,9 +1262,9 @@ class Orchestrator:
         disp = make_display()
         if disp.enabled:
             disp.stage("orchestrator", "编排", len(tools),
-                       getattr(self.base_llm, "model", "?"), ORCH_MAX_ITERS)
+                       getattr(self.base_llm, "model", "?"), orch_iters)
         react = run_react_agent(self.base_llm, tools, system_prompt, init,
-                                max_iters=ORCH_MAX_ITERS, transcript=transcript,
+                                max_iters=orch_iters, transcript=transcript,
                                 display=disp)
 
         self._success = react.ok

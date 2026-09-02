@@ -138,7 +138,7 @@ def step5_run(ctx):
 
 * 每 Agent 一个 while 循环:LLM 输出 Thought/Action → 执行工具 → Observation 回填 → Final Answer 终止
 
-* **迭代上限按 Agent 固化**:recon 20 / analysis 30(2026-08-29 由 24 上调,防疑点取证中途截断)/ **verification 每实例 8**(2026-09-01 ADR-0003:每疑点一实例后,单条复核轮次需求 ≤8;原 24 是"单实例复核全部疑点"的多疑点摊薄值,已不适用),防死循环烧预算
+* **迭代上限按 Agent 固化**:recon 20 / analysis 30(2026-08-29 由 24 上调,防疑点取证中途截断)/ **verification 每实例 8**(2026-09-01 ADR-0003:每疑点一实例后,单条复核轮次需求 ≤8;原 24 是"单实例复核全部疑点"的多疑点摊薄值,已不适用),防死循环烧预算。**轮次可 env 覆盖(2026-09-02)**:`STEP5_RECON_MAX_ITERS` / `STEP5_ANALYSIS_MAX_ITERS` / `STEP5_VERIFICATION_MAX_ITERS` / `STEP5_ORCHESTRATOR_MAX_ITERS`(默认 20/30/8/12),缺失/非法值回落默认、下限钳 1;`runner.resolve_max_iters` 消费点解析,模块常量不污染;均可写入 `firmware_audit/.env`(`load_env_file` 启动注入,OS 环境变量优先)
 
 * **Observation 截断**:单条工具结果 ≤ 8KB 入上下文,全文落盘供后续查询
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 
 from .data.artifacts import parse_artifact, parse_survey_artifact, save_artifact, save_survey
 from .data.prompts import (
@@ -31,6 +32,20 @@ from .providers.llm_client import LLMClient, LLMError
 from .providers.tools import ToolContext, make_tools
 
 AGENT_DIR = "agent"   # process/agent/
+
+
+def resolve_max_iters(name: str, default: int) -> int:
+    """env STEP5_<NAME>_MAX_ITERS 覆盖轮次上限(缺失/非法回落默认,下限 1)。
+
+    消费点解析而非 import 时固化:改 env 后新建 Orchestrator 即生效,
+    模块级 AgentConfig 常量不被污染(测试可逐用例设/删 env)。
+    """
+    raw = os.environ.get(f"STEP5_{name.upper()}_MAX_ITERS", "").strip()
+    try:
+        v = int(raw) if raw else default
+    except ValueError:
+        return default
+    return max(1, v)
 
 
 @dataclass

@@ -104,6 +104,62 @@ def _tool(orch: Orchestrator) -> DispatchAgentTool:
     return DispatchAgentTool(ToolContext(process_dir=orch.process_dir), orch)
 
 
+# ---- 轮次上限 env 覆盖(STEP5_<NAME>_MAX_ITERS)----
+
+def test_max_iters_env_override() -> list[str]:
+    """resolve_max_iters:缺失/非法回落默认、下限钳 1;Orchestrator 消费点
+    生效且不污染模块常量(env 名统一 STEP5_<NAME>_MAX_ITERS)。"""
+    fails: list[str] = []
+    import os
+    from firmware_audit.step5_agent.runner import (
+        RECON_CFG, ANALYSIS_CFG, VERIFY_CFG, resolve_max_iters)
+
+    # 缺失 → 默认
+    os.environ.pop("STEP5_RECON_MAX_ITERS", None)
+    if resolve_max_iters("recon", 20) != 20:
+        fails.append("env 缺失应回落默认 20")
+    # 合法值 → 生效
+    os.environ["STEP5_RECON_MAX_ITERS"] = "5"
+    try:
+        if resolve_max_iters("recon", 20) != 5:
+            fails.append("env=5 应生效")
+        # 非法值 → 默认
+        os.environ["STEP5_RECON_MAX_ITERS"] = "abc"
+        if resolve_max_iters("recon", 20) != 20:
+            fails.append("非法值应回落默认")
+        # 0/负数 → 钳到 1
+        for bad in ("0", "-3"):
+            os.environ["STEP5_RECON_MAX_ITERS"] = bad
+            if resolve_max_iters("recon", 20) != 1:
+                fails.append(f"env={bad} 应钳到 1")
+    finally:
+        del os.environ["STEP5_RECON_MAX_ITERS"]
+
+    # 四个 config 名与 env 名对齐(消费点构造副本,模块常量不动)
+    os.environ["STEP5_VERIFICATION_MAX_ITERS"] = "3"
+    try:
+        if VERIFY_CFG.max_iters != 8:
+            fails.append("模块常量 VERIFY_CFG 不应被 env 污染")
+        orch = _orch(Path(tempfile.mkdtemp()), ScriptedLLM([]))
+        if orch._sub_cfgs["verification"].max_iters != 3:
+            fails.append("Orchestrator 应消费 env 覆盖后的 verification max_iters=3")
+        if orch._sub_cfgs["recon"].max_iters != RECON_CFG.max_iters:
+            fails.append("未覆盖的 agent 应保持默认")
+        if orch._sub_cfgs["analysis"].max_iters != ANALYSIS_CFG.max_iters:
+            fails.append("未覆盖的 analysis 应保持默认")
+    finally:
+        del os.environ["STEP5_VERIFICATION_MAX_ITERS"]
+
+    # orchestrator 自身轮次 env(run() 内消费点同名规则)
+    os.environ["STEP5_ORCHESTRATOR_MAX_ITERS"] = "7"
+    try:
+        if resolve_max_iters("orchestrator", 12) != 7:
+            fails.append("orchestrator env=7 应生效")
+    finally:
+        del os.environ["STEP5_ORCHESTRATOR_MAX_ITERS"]
+    return fails
+
+
 # ---- SubAgentResult ----
 
 def test_sub_agent_result() -> list[str]:
