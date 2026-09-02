@@ -86,7 +86,7 @@
 
 * **实现与分层(2026-08-18 目录重组)**:`firmware_audit/step5_agent/` 子文件夹按并列/附属关系组织——顶层 `run_step5.py`(L0 入口,`python -m` 路径不变)+ `orchestrator.py`(LLM 编排层)+ `runner.py`(L1 单 Agent 执行)+ 三个自包含包:`engine/`(ReAct 执行引擎:react\_loop 状态机 + protocol 纯函数解析 + context 四分区 + transcript 落盘)、`data/`(数据契约:artifacts 工件 schema + prompts 提示词)、`providers/`(外部接入:llm\_client + tools/)。依赖只准向下:orchestrator/run\_step5 接线,engine/data/providers 互不 import、包内走相对导入
 
-* **编排(v3)**:`Orchestrator` 轻量 LLM 驱动(ReAct 循环,3 动作 `dispatch_agent`/`summarize`/`finish`),严格单向顺序门 recon→analysis→verification,同类型最多调度 3 次(默认 1 次+至多 2 次补跑;类型+任务唯一性防重复)
+* **编排(v3)**:`Orchestrator` 轻量 LLM 驱动(ReAct 循环,3 动作 `dispatch_agent`/`summarize`/`finish`),严格单向顺序门 recon→analysis→verification。调度上限按类型区分:recon/analysis 同类型最多 3 次(默认 1 次+至多 2 次补跑,动态分配机制保留);**verification 例外(2026-09-01 ADR-0003)——不再适用"同类型最多 3 次",补跑逻辑整体取消,改为每疑点一实例、按 finding 计数(K 上限,见下)**
 
 * **编排动态分配(2026-08-29)**:每实例结构化 `budget_state`(agent/exhausted/steps/max\_iters/pending\_count/pending\_focuses/overlap\_ratio)注入 summarize 与 dispatch 的 Observation、dispatch\_log.json(逐实例)及 result.json("budget"汇总);`pending_focuses`=recon recommended\_actions(high/medium)∩ 未被 findings 覆盖的疑点(title/file 差分);analysis 预算耗尽(exhausted)且 pending\_count>0 且调度次数<3 时,dispatch Observation 附补跑建议;补跑(同类型第 2/3 次)简报追加已覆盖清单(前 30 条)+ 差分 task,ANALYSIS\_SYSTEM 含"只处理未覆盖疑点,禁止重复提交已存在标题"补跑红线;`overlap\_ratio`(新实例与既有聚合的 title/file 归一化重合比例)>0.5 提示聚焦差分
 
@@ -95,6 +95,8 @@
 * **断点续跑(v3 收紧)**:`.json` 工件存在 → skipped;仅 `.md` 降级 → **degraded**(ok=False),默认复跑(`STEP5_RESUME_DEGRADED=0` 恢复旧跳过语义)
 
 * **报告(v3,生成主体=orchestrator)**:verification 完成后调用 `summarize` 取素材(已复核 findings 全量字段+阶段统计),Final Answer 即报告正文,**原样落盘** **`orchestrator/report.md`**(同时含可解析 JSON 时另存 report.json 副产品);未产出时明确告警不静默降级。原 `render_report` 已删除——verification 只产 verified\_findings.json,不产报告
+
+* **verification 每疑点一实例(2026-09-01,ADR-0003,ticket 03/04)**:verification 从"单实例多疑点(24 轮内逐条复核)"改为**每 finding 一个独立复核实例**。analysis 产出 findings 后按 severity(critical>high>medium>low>info)主排序 + confidence(high>medium>low)次排序,取前 K 条(env `STEP5_VERIFY_K`,默认 10);对每条派独立实例,输入=单条 finding + 相关工件指针,**max_iters=8**,逐条产单条 verified finding,聚合回 `verified_findings.json`(**全量 N 保留**:前 K 带 verified/rationale/confidence,未进 K 的 `verified=None`、confidence 保留 analysis 初值)。**补跑逻辑整体取消**——verification 只调度一次,自动对前 K 各派实例,不再适用"同类型最多 3 次"上限(代码注释 `orchestrator.py` `_verify_k` 明示)。报告据此把 `verified=None` 划进**独立未复核区段**(⚠ 未经复核,见下 summarize 素材)。上下文隔离铁律不破(每实例只从工件读,不传对话历史)
 
 * **recon v3:权限收敛+工件重构(2026-08-29)**:移除 `strings_query`/`imports_query`/`checksec`(深挖归 analysis/verification),新集 6 件套:`list_files, read_file, cve_bin_tool_scan, semgrep_scan, gitleaks_scan, binwalk_rescan`;`max_iters` 保持 20;工件改名 `survey.json`(schema v3):`arch_snapshot`(top\_level\_dirs/components\_grouped\[name+size,role 推断必附 role\_evidence]/os\_or\_runtime)+`components`(只收 cve\_bin\_tool\_scan Observation 实况)+`entry_points`+`high_risk_areas`(观察点,无判级)+`recommended_actions`(priority+action)+`summary`;**禁止** findings 数组与任意层级 severity/confidence/verified/evidence/rationale(解析层守护:违规键整条降级为 high\_risk\_areas 观察点)——判级与证据链移交 analysis;提示词防幻觉红线:high\_risk\_areas 只标工具 Observation 原文、components 版本/CVE 不凭记忆(v2 兼容层已移除,只读 survey.json)
 
@@ -130,13 +132,13 @@ def step5_run(ctx):
 | ---------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | **recon**        | 广度侦察:枚举铺面不判级(判级/证据链移交 analysis) | list\_files, read\_file, cve\_bin\_tool\_scan(可选), semgrep\_scan, gitleaks\_scan, binwalk\_rescan                                                                                 | 20  | Step4 工件清单+目录概览 | `survey.json`(v3:arch\_snapshot 架构快照、components 组件 CVE 实况、entry\_points、high\_risk\_areas 观察点、recommended\_actions 扫描建议;无 findings/判级字段) |
 | **analysis**     | 深度分析:对疑点逐个取证+判级                 | list\_files, search\_code, find\_decompiled\_function, xref\_query, strings\_query, imports\_query, read\_file, cve\_lookup, checksec, semgrep\_scan, gitleaks\_scan, web\_search | 30  | survey.json     | `findings.json`(候选漏洞,含证据链:路径+地址+代码片段+严重度)                                                                                                |
-| **verification** | 复核过滤误报(不产报告)                    | list\_files, search\_code, find\_decompiled\_function, xref\_query, cve\_lookup, checksec, read\_file, strings\_query, imports\_query, sandbox\_verify                            | 24  | findings.json   | `verified_findings.json`(唯一产物;summary/verified/rationale 为 summarize 素材)                                                                 |
+| **verification** | 复核过滤误报(不产报告);**每疑点一独立实例(ADR-0003)**,仅复核前 K 条 | list\_files, search\_code, find\_decompiled\_function, xref\_query, cve\_lookup, checksec, read\_file, strings\_query, imports\_query, sandbox\_verify                         | 8/实例 | 单条 finding(前 K 条之一)+ 工件指针 | `verified_findings.json`(唯一产物;全量 N 保留,前 K 带 verified/rationale;未进 K 的 verified=None 进报告未复核区)                                                                 |
 
 ### ReAct 循环约定
 
 * 每 Agent 一个 while 循环:LLM 输出 Thought/Action → 执行工具 → Observation 回填 → Final Answer 终止
 
-* **迭代上限按 Agent 固化**:recon 20 / analysis 30(2026-08-29 由 24 上调,防疑点取证中途截断)/ verification 24,防死循环烧预算
+* **迭代上限按 Agent 固化**:recon 20 / analysis 30(2026-08-29 由 24 上调,防疑点取证中途截断)/ **verification 每实例 8**(2026-09-01 ADR-0003:每疑点一实例后,单条复核轮次需求 ≤8;原 24 是"单实例复核全部疑点"的多疑点摊薄值,已不适用),防死循环烧预算
 
 * **Observation 截断**:单条工具结果 ≤ 8KB 入上下文,全文落盘供后续查询
 
@@ -330,7 +332,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 已定决策见下方各小节(输出协议 / LLM 接入 / 上下文管理 / transcript / 类结构)。当前真正开放:
 
-* token 预算——迭代上限已按 Agent 固化(recon 20 / analysis 30 / verification 24,2026-08-29),预算充裕度待 `target/1` 实测校准(冒烟单任务 \~10k token)
+* token 预算——迭代上限已按 Agent 固化(recon 20 / analysis 30 / **verification 每实例 8**,2026-08-29 / 09-01 ADR-0003 调整),预算充裕度待 `target/1` 实测校准(冒烟单任务 \~10k token)
 
 * ~~deepseek-v4-flash 的协议遵循度~~ **已验证(2026-08-17 冒烟)**:推理模型,`reasoning_content`/`content` 分离,LLMClient 已合并处理;ReAct 遵循良好,5 步自主完成 imports→xref→decompile 工具链
 
