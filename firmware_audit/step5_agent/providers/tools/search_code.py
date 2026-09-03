@@ -69,7 +69,9 @@ class SearchCodeTool(AgentTool):
         "keyword": {"type": "str", "required": True,
                     "desc": "搜索关键词(非空);is_regex=True 时视为正则"},
         "file_pattern": {"type": "str", "default": "", "desc": "文件名 glob 过滤(仅文本 grep 路)"},
-        "directory": {"type": "str", "default": "", "desc": "收窄搜索目录(相对 process/,默认 extracted/)"},
+        "directory": {"type": "str", "default": "",
+                      "desc": "收窄搜索目录(相对 process/,默认 extracted/;"
+                              "根目录、agent/、.cve_cache 不可搜索)"},
         "is_regex": {"type": "bool", "default": False, "desc": "keyword 是否按正则解释"},
         "max_results": {"type": "int", "default": MAX_RESULTS_DEFAULT,
                         "desc": f"结果上限(≤{MAX_RESULTS_CAP})"},
@@ -92,6 +94,11 @@ class SearchCodeTool(AgentTool):
             return ToolResult(ok=False, text="", error=f"无效的搜索模式: {e}")
 
         root = self.ctx.process_dir.resolve()
+        # 范围守卫先行(2026-09-03 code-review 补):被守卫拒绝的 directory
+        # 无条件报错——不能因边车命中已满 max_results 跳过守卫检查(绕过漏洞)
+        scope, scope_err = self._resolve_scope(root, directory)
+        if scope_err:
+            return ToolResult(ok=False, text="", error=scope_err)
         matches: list[dict] = []            # {path, anchor, text}
         searched = {"sidecar": 0, "text": 0}
 
@@ -117,17 +124,16 @@ class SearchCodeTool(AgentTool):
                     break
 
         # ---- ② 文本 grep 路(directory 收窄;默认 extracted/) ----
+        # scope 已在守卫段解析:scope=None 且 scope_err=None → 越界/不存在,
+        # 按既有语义(默认 extracted/ 缺失静默跳过;显式 directory 且无
+        # 命中明确报错,防静默空结果)
         if len(matches) < n:
-            scope = self._resolve_scope(root, directory)
-            if scope is None:
-                # 默认 extracted/ 缺失 → 静默跳过(边车命中仍返回);
-                # 显式 directory 越界/不存在 → 明确报错,防静默空结果
-                if directory and not matches:
-                    return ToolResult(
-                        ok=False, text="",
-                        error=f"目录越界或不存在: {directory}")
-            else:
+            if scope is not None:
                 self._grep_text(scope, file_pattern, pat, root, push, searched)
+            elif directory and not matches:
+                return ToolResult(
+                    ok=False, text="",
+                    error=f"目录越界或不存在: {directory}")
 
         if not matches:
             return ToolResult(
@@ -185,11 +191,38 @@ class SearchCodeTool(AgentTool):
 
     # ---- 文本 grep ----
 
-    def _resolve_scope(self, root: Path, directory: str) -> Path | None:
-        """grep 范围:目录默认 extracted/;directory 指定则收窄/扩到 process/ 下。"""
+    def _resolve_scope(self, root: Path,
+                       directory: str) -> tuple[Path | None, str | None]:
+        """grep 范围解析。返回 (scope, 拒绝原因)。
+
+        - scope=None 且原因=None → 目录越界/不存在,调用方按既有语义处理
+          (显式 directory 且无命中时报错,默认 extracted/ 缺失时静默跳过)
+        - scope=None 且原因非空 → 范围被守卫拒绝,调用方必须报错
+
+        守卫三类范围(2026-09-03 target/1 卡死根因修复):
+        根目录自身(".")按 C4 containment 语义合法但范围过大——会把
+        .cve_cache(cve-bin-tool 预热缓存卷,10万+ json/yml,全在 _TEXT_EXTS
+        白名单)卷进逐文件 grep,实测数十分钟无输出;agent/ 是运行工件
+        (transcript/obs/终端转储),grep 它会命中 Agent 自己的日志,证据污染。
+        """
         ref = (directory or "extracted").replace("\\", "/").strip("/")
         target = resolve_within(root, ref) if ref else root
-        return target if target and target.is_dir() else None
+        if target is None:
+            return None, None
+        if target == root:
+            return None, (f"目录不可搜索: {directory} (根目录会把 "
+                          ".cve_cache 缓存卷整个卷进 grep;请指定 extracted/ "
+                          "或其子目录)")
+        rel = target.relative_to(root).as_posix()
+        if rel == "agent" or rel.startswith("agent/"):
+            return None, (f"目录不可搜索: {directory} (agent/ 是运行工件,"
+                          "搜索会命中 Agent 自身日志;请指定 extracted/ 或"
+                          "其子目录)")
+        if rel == ".cve_cache" or rel.startswith(".cve_cache/"):
+            return None, (f"目录不可搜索: {directory} (.cve_cache 是 CVE "
+                          f"缓存卷,10万+ 文件,非固件内容;请指定 extracted/"
+                          " 或其子目录)")
+        return (target if target.is_dir() else None), None
 
     def _grep_text(self, scope: Path, file_pattern: str, pat, root: Path,
                    push, searched: dict) -> None:

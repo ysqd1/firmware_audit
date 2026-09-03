@@ -284,6 +284,7 @@ def test_search_code() -> list[str]:
     - 边车: strings.json/imports.json/text.json 命中带 地址/调用点 锚点
     - 文本: extracted/ 下的 .py/.sh 按行命中;SDK 目录排除;二进制跳过
     - 错误: 空 keyword / 越界 directory / 非法正则 → ok=False
+    - 守卫: 根目录(".")、agent/、.cve_cache 范围拒绝(2026-09-03 卡死修复)
     """
     import json as _json
     fails: list[str] = []
@@ -318,6 +319,18 @@ def test_search_code() -> list[str]:
             "password = 'sdk-skip-me'\n", encoding="utf-8")
         # 二进制文件(应被嗅探跳过)
         (ext / "blob.bin").write_bytes(b"\x00\x01password\x00")
+        # --- 2026-09-03 卡死修复的范围守卫 fixture ---
+        # .cve_cache: cve-bin-tool 预热缓存卷(生产实测 10.7万 json/yml,
+        # 全在 _TEXT_EXTS 白名单,进 grep 范围会磨数十分钟)
+        cve = root / ".cve_cache" / "cve-bin-tool" / "redhat"
+        cve.mkdir(parents=True)
+        (cve / "CVE-1999-0001.json").write_text('{"a": "password=cache-hit"}',
+                                                encoding="utf-8")
+        # agent/: 运行工件(transcript/obs/终端转储)
+        ag = root / "agent" / "0_recon" / "obs"
+        ag.mkdir(parents=True)
+        (ag / "step001_read_file.txt").write_text("password = 'agent-log-hit'\n",
+                                                  encoding="utf-8")
 
         t = make_tools(ToolContext(process_dir=root))["search_code"]
 
@@ -370,6 +383,32 @@ def test_search_code() -> list[str]:
             fails.append(f"无命中应 ok=True: {r6.text[:120]}")
         if "边车" not in r6.text or "文本" not in r6.text:
             fails.append(f"无命中应报搜索统计: {r6.text[:120]}")
+
+        # --- 范围守卫(2026-09-03 target/1 卡死修复) ---
+        # 默认范围不得命中 .cve_cache/agent 内容(防范围扩张回归 + 证据污染)
+        rg = t.execute(keyword="password")
+        if "cache-hit" in rg.text or "agent-log-hit" in rg.text:
+            fails.append(f"默认范围不得命中 .cve_cache/agent: {rg.text[:160]}")
+        # 守卫范围一律 ok=False:错误带指引且回显 directory 值(断言契约
+        # 而非完整文案,同 2026-09-03 encoding 踩坑教训)
+        for bad in (".", "./", "extracted/..", "extracted/sub/../..",
+                    ".cve_cache", ".cve_cache/cve-bin-tool",
+                    "agent", "agent/0_recon"):
+            rb = t.execute(keyword="password", directory=bad)
+            if rb.ok:
+                fails.append(f"守卫范围应拒绝 directory={bad!r}: {rb.text[:120]}")
+            elif "不可搜索" not in (rb.error or ""):
+                fails.append(f"守卫拒绝应带指引 directory={bad!r}: {rb.error}")
+            elif str(bad) not in (rb.error or ""):
+                fails.append(f"守卫错误应回显 directory={bad!r}: {rb.error}")
+        # 绕过回归:边车命中已满 max_results 时守卫仍须拦截(code-review 补)
+        rb2 = t.execute(keyword="password", directory=".", max_results=1)
+        if rb2.ok:
+            fails.append(f"边车满 n 时守卫目录仍应拒绝: {rb2.text[:120]}")
+        # 合法范围不受影响:analysis 子目录仍可 grep
+        ra = t.execute(keyword="password", directory="analysis")
+        if not ra.ok or "idlc.strings.json" not in ra.text:
+            fails.append(f"analysis 范围应可搜索: {ra.error or ra.text[:120]}")
     return fails
 
 

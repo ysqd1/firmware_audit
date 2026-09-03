@@ -336,6 +336,8 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 * **Windows 下** **`subprocess.run(text=True)`** **必须显式** **`encoding="utf-8", errors="replace"`**(2026-09-03,semgrep\_scan/gitleaks\_scan 实测):不指定 encoding 按进程 locale(gbk)解码容器输出,非法字节让 readerthread 抛 `UnicodeDecodeError` **后主进程拿到 stdout=None** → 下游 `json.loads(None)` TypeError。修复点:`docker_utils.run_docker`/`docker_available` + `test_decompile.py`;回归测试 `test_docker_utils.py::test_*_utf8_decode`(monkeypatch 捕获 kwargs 断言显式 encoding + 真实子进程输出非法字节验证不崩)。注意 Anaconda 默认 UTF-8 mode 与系统 gbk 两种 locale 形态崩的编码名不同,断言契约而非错误文本才能都抓红
 
+* **search\_code 范围守卫:`directory` 拒绝根目录/`agent/`/`.cve_cache`**(2026-09-03,target/1 卡死事故实测根因):verification 实例因 finding 的 file 路径缺 `extracted/` 前缀连撞"目录不存在"后,改调 `search_code(directory=".")` 自救——`resolve_within` 按 containment 语义放行根目录,grep 范围扩成整个 `process/`,把 `.cve_cache`(cve-bin-tool 预热缓存卷,**10.7万 json/yml,两个扩展名都在 \_TEXT\_EXTS 白名单**)卷进逐文件 open+读+正则,实测热缓存 ~2000 文件/s、Defender 放大后崩到 ~50 文件/s,数十分钟无输出被人工 Ctrl+C。修复:`_resolve_scope` 三类范围返回拒绝原因,`_run` 对拒绝**无条件报错**(有边车命中也不静默吞),错误信息带"请指定 extracted/ 或其子目录"指引;回归测试 `test_step5_tools.py::test_search_code` 守卫段。教训两条:①终端转储等运行文件**别存进 `process/agent/`**(在 grep 树里会命中 Agent 自身日志,本次诊断中它还让复现 harness 撞满 max\_results 提前返回、造成假阴性);②上游触发器(analysis finding 的 file 字段路径前缀不统一,导致 verification 反复撞"目录不存在"浪费轮次)另行处理
+
 ### 第二批工具(后续)
 
 * ~~`binwalk_rescan`~~ ~~/~~ ~~`semgrep_scan`~~ ~~/~~ ~~`web_search`~~ 已落地(2026-08-18,见上表)
