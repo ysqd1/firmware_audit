@@ -14,8 +14,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # 同一条 finding 的字段:新实例有值且已有为空 → 补;verification 的复核权威字段直接覆盖
-# (ADR-0003:verification 可修改 confidence——存疑项降级保留,故 confidence 也在覆盖集)
-_OVERRIDE_KEYS = ("verified", "rationale", "confidence")
+# (ADR-0003:verification 可修改 confidence 与 severity——存疑项降级保留,
+#  故两者均在覆盖集,2026-09-03 补 severity,与 orchestrator 锚点回填对齐防分叉)
+_OVERRIDE_KEYS = ("verified", "rationale", "confidence", "severity")
 
 
 @dataclass
@@ -46,7 +47,7 @@ class FindingAggregator:
     def ingest(self, sub) -> None:
         """把子 Agent findings 并入聚合;命中重复键时**合并**而非丢弃(深化版本
         保留:已有 evidence 保留,新实例补 confidence/evidence 空位;
-        verification 是复核权威,其 verified/rationale 直接覆盖)。
+        verification 是复核权威,其 verified/rationale/confidence/severity 直接覆盖)。
         recon(recon v3 survey)跳过:recon 只铺面不判级、无 findings;
         即便磁盘遗留旧 findings 残留也显式忽略不聚合(recon 判级移交 analysis)。"""
         if sub.agent_name == "recon":

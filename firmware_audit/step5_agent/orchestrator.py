@@ -725,10 +725,11 @@ class Orchestrator:
             # 聚合:全量 N 条(K 覆盖复核结论,N-K 原样 verified=None + confidence 初值)
             # 锚点=各实例对应的原 analysis finding(按实例序与 top 对齐):复核结果
             # 回填到原槽位——实例返回的 finding 常缺 addr/func,按 dedup_key 会错位
-            # 成新条目;以原 finding 的键锚定,verified/rationale/confidence 覆盖,
-            # 未进前 K 的条目原样保留(verified=None,confidence 保留 analysis 初值)。
-            # 复核结论回填:只覆盖复核权威字段(verified/rationale/confidence),不
-            # 重排锚点——实例返回的 finding 可能缺 addr/func 或改 title,一律忽略
+            # 成新条目;以原 finding 的键锚定,verified/rationale/confidence/severity
+            # 覆盖,未进前 K 的条目原样保留(verified=None,confidence 保留 analysis
+            # 初值)。
+            # 复核结论回填:只覆盖复核权威字段(verified/rationale/confidence/severity),
+            # 不重排锚点——实例返回的 finding 可能缺 addr/func 或改 title,一律忽略
             # 身份字段,防"换成别的 finding"混入(VERIFY_SYSTEM 单条必达红线 + 代码兜底)。
             by_key = {self._agg.dedup_key(f): f for f in ranked}
             verified_n = 0
@@ -742,6 +743,10 @@ class Orchestrator:
                     merged["rationale"] = vf["rationale"]    # 存疑项可能留空
                 if vf.get("confidence"):
                     merged["confidence"] = vf["confidence"]  # 存疑降级;无则留初值
+                if vf.get("severity"):
+                    merged["severity"] = vf["severity"]      # 判级降级(2026-09-03:
+                    # verification 是判级权威,实例 9 死代码降级 low 曾被丢弃,
+                    # 聚合产物 severity=high 与 rationale 自相矛盾;ADR-0003 精神延伸)
                 merged["source_agent"] = "verification"
                 merged["instance_seq"] = v.seq
                 by_key[self._agg.dedup_key(anchor)] = merged
@@ -833,17 +838,33 @@ class Orchestrator:
         # 单实例不进主 dispatch_log(ADR-0003:逐实例留痕在其自身 transcript/obs +
         # result.json 的 verification_instances;主 dispatch_log 只记编排调度(阶段))
         try:
-            # 断点续跑(单实例):该实例 .json 工件已存在且未 force → skipped
+            # 断点续跑(单实例):该实例 .json 工件已存在且未 force → skipped。
+            # 身份校验(2026-09-03 错位 bug):目录名是全局 seq 位置而非 finding
+            # 身份,续跑时编排路径变化(如 analysis 补跑次数不同)会让 seq 前移,
+            # 本条 finding 可能命中**前一条** finding 的旧工件——只判文件存在
+            # 就加载会把别人的复核结论错配进来(target/1 实测 9/10 条整体错位,
+            # 新[N].rationale==旧[N-1],无任何告警)。故加载后比对工件 finding
+            # 与当前锚点身份:不一致或工件无 findings → 弃用工件真跑(如实上报
+            # 不冒充;真跑产物写回同一路径,错位旧工件随之被覆盖)。
+            # 匹配键=file+title 归一化(2026-09-03 review 修复):实例工件常缺
+            # func/addr(上方锚点回填注释自注),完整 dedup_key 四元组全等会把
+            # 合法工件误拒 → 每次续跑全部真跑、静默烧预算;file+title 是必填
+            # 身份字段,区分度足够(错位场景里 file/title 必然是别的 finding 的)。
             if out_path.is_file() and not self.force:
                 loaded = load_artifact(out_path) or {}
                 vfs = [f for f in (loaded.get("findings") or [])
                        if isinstance(f, dict)]
                 self._lift_verify_verdict(loaded, vfs)
-                return SubAgentResult(
-                    seq=vseq, agent_name="verification", status=DispatchStatus.SKIPPED,
-                    artifact_path=out_path, summary=loaded.get("summary", ""),
-                    findings=vfs, request=request,
-                    duration_ms=int((time.time() - t0) * 1000))
+                if vfs and all(
+                        self._agg.norm_text(vfs[0].get(k, ""))
+                        == self._agg.norm_text(finding.get(k, ""))
+                        for k in ("file", "title")):
+                    return SubAgentResult(
+                        seq=vseq, agent_name="verification",
+                        status=DispatchStatus.SKIPPED,
+                        artifact_path=out_path, summary=loaded.get("summary", ""),
+                        findings=vfs, request=request,
+                        duration_ms=int((time.time() - t0) * 1000))
             ares = run_agent(cfg, self.process_dir, self.base_llm, upstream,
                              output_dir=out_dir,
                              extra_brief=build_verify_single_brief(

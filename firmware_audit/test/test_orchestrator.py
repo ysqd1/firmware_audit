@@ -751,6 +751,204 @@ def test_verify_toplevel_verdict_merged() -> list[str]:
     return fails
 
 
+def test_verify_severity_downgrade_preserved() -> list[str]:
+    """severity 覆盖 bug(2026-09-03):verification 实例的降级判级(severity)
+    在聚合时被丢弃——锚点回填循环与 aggregator ingest 的复核权威覆盖集都
+    只有 verified/rationale/confidence,缺 severity。现场 target/1 实例 9:
+    pet_go 判死代码降级 severity=low,聚合产物却保留 analysis 初值 high,
+    与 rationale"从 severity high 降为 low"自相矛盾。修复:两处覆盖集补
+    severity(verification 是判级权威,ADR-0003 精神延伸)。"""
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    ANALYSIS1 = ('Final Answer: {"summary": "取证", "findings": [{"title": "f1", '
+                 '"severity": "high", "file": "unitree/bin/idlc", "confidence": "medium"}]}')
+    # 实例复核结论:降级 severity=low/confidence=low(现场形态:target/1 实例 9)
+    VF_DOWNGRADE = ('Final Answer: {"summary": "复核f1:降级", "findings": [{"title": "f1", '
+                    '"severity": "low", "file": "unitree/bin/idlc", "confidence": "low", '
+                    '"verified": true, "rationale": "无可达攻击路径,从 severity high 降为 low"}]}')
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        _make_process(td)
+        llm = ScriptedLLM([
+            D % "recon", TOOL, RECON_FINAL,        # 0/1/2
+            D % "analysis", TOOL, ANALYSIS1,       # 3/4/5
+            D % "verification",                    # 6 阶段(1 条 finding → 1 实例)
+            VTOOL, VF_DOWNGRADE,                   # 7/8 复核 f1(降级 low)
+            SUM,                                   # 9 summarize 取素材
+            'Final Answer: {"summary": "完成", "conclusion": "ok"}',  # 10
+        ])
+        orch = _orch(td, llm)
+        orch.run()
+
+        agent = td / "process" / "agent"
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is None:
+            fails.append("verified_findings.json 缺失(verification 每疑点一实例聚合)")
+        else:
+            by_title = {f.get("title"): f for f in vf["findings"]}
+            f1 = by_title.get("f1")
+            if f1 is None:
+                fails.append("f1 应保留在聚合 findings")
+            else:
+                if f1.get("severity") != "low":
+                    fails.append(f"复核降级 severity=low 应覆盖 analysis 初值 high: {f1.get('severity')}")
+                if f1.get("confidence") != "low":
+                    fails.append(f"复核降级 confidence=low 应覆盖初值 medium: {f1.get('confidence')}")
+                if f1.get("verified") is not True:
+                    fails.append(f"verified 应取自实例: {f1.get('verified')}")
+                if "降为 low" not in (f1.get("rationale") or ""):
+                    fails.append(f"rationale 应取自实例: {f1.get('rationale')}")
+    return fails
+
+
+def test_verify_resume_artifact_identity_guard() -> list[str]:
+    """续跑实例工件错位 bug(2026-09-03):实例目录按全局 seq 命名(<seq>_verification),
+    续跑时编排调度路径与原跑不一致(原跑 analysis×2 消耗 2 个 seq,续跑 analysis×1),
+    seq 整体前移 → 第 N 条 finding 找到 <N-1>_verification 目录里**前一条 finding**
+    的旧复核工件,skip 分支只判文件存在就加载,zip 位置配对把复核结论整体错配到
+    相邻 finding(新[N].rationale==旧[N-1].rationale),全程无告警。
+
+    修复:_run_verify_one skip 加载前校验工件 finding 身份与当前锚点一致
+    (dedup_key 比对);不一致 → 弃用工件,真实重跑该实例(如实上报不冒充)。"""
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    # 2 条 findings:analysis 初值(f1 high / f2 medium),K=2 全复核
+    ANALYSIS2 = ('Final Answer: {"summary": "取证2", "findings": ['
+                 '{"title": "f1", "severity": "high", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f2", "severity": "medium", "file": "unitree/bin/netswitch", "confidence": "high"}]}')
+    # 现场形态(target/1 实测):原跑 analysis×2 → 实例目录 4_/5_;续跑 analysis×1,
+    # seq 前移一位——本次实例 f1→3_(不存在,真跑)、f2→4_(存在,但躺着的是
+    # **f1** 的旧复核工件)→ 修复前 f2 静默拿到 f1 的结论(rationale/verified 全错配)。
+    # 最小复现只需预设 4_verification = f1 的旧工件(带可辨识 rationale)。
+
+    # 实例真跑时的 Scripted 回复(f1/f2 各一组:工具调用+结论)
+    VF1 = ('Final Answer: {"summary": "复核f1", "findings": [{"title": "f1", '
+           '"severity": "high", "file": "unitree/bin/idlc", "verified": true, "rationale": "f1-真跑结论"}]}')
+    VF2 = ('Final Answer: {"summary": "复核f2", "findings": [{"title": "f2", '
+           '"severity": "medium", "file": "unitree/bin/netswitch", "verified": false, "rationale": "f2-真跑结论"}]}')
+
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        _make_process(td)
+        old = td / "process" / "agent" / "4_verification" / "verified_findings.json"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text(json.dumps({
+            "schema": 2, "agent": "verification", "summary": "旧复核(f1)",
+            "findings": [{"title": "f1", "severity": "high",
+                          "file": "unitree/bin/idlc",
+                          "verified": True, "rationale": "f1-旧工件结论"}],
+        }, ensure_ascii=False), encoding="utf-8")
+        llm = ScriptedLLM([
+            D % "recon", TOOL, RECON_FINAL,        # 0/1/2 recon(真跑,seq 0)
+            D % "analysis", TOOL, ANALYSIS2,       # 3/4/5(真跑,seq 1)
+            D % "verification",                    # 6 阶段(seq 2)
+            VTOOL, VF1,                            # 7/8 f1→3_ 不存在,真跑(seq 3)
+            VTOOL, VF2,                            # 9/10 f2→4_ 存在 f1 旧工件:
+                                                   #   修复前静默错配(skip,不消耗);
+                                                   #   修复后弃用重跑(seq 4)
+            SUM,                                   # 11
+            'Final Answer: {"summary": "完成", "conclusion": "ok"}',  # 12
+        ])
+        orch = _orch(td, llm)
+        orch.run()
+
+        agent = td / "process" / "agent"
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is None:
+            fails.append("verified_findings.json 缺失")
+            return fails
+        by_title = {f.get("title"): f for f in vf["findings"]}
+        f1 = by_title.get("f1")
+        f2 = by_title.get("f2")
+        if f1 is None or f2 is None:
+            fails.append(f"f1/f2 应保留在聚合: {sorted(by_title)}")
+            return fails
+        # 核心断言:结论归属正确,f2 不得错配 f1 旧工件的结论
+        if "f1-旧工件结论" in (f2.get("rationale") or ""):
+            fails.append(f"f2 拿到了 f1 旧工件的复核结论(错位): {f2.get('rationale')}")
+        if f1.get("rationale") != "f1-真跑结论":
+            fails.append(f"f1 应为真跑结论: {f1.get('rationale')}")
+        if f2.get("rationale") != "f2-真跑结论":
+            fails.append(f"f2 应为真跑结论(弃用错位工件重跑): {f2.get('rationale')}")
+    return fails
+
+
+def test_verify_resume_identity_tolerant_match() -> list[str]:
+    """身份校验宽松匹配(2026-09-03 review 修复):实例工件 finding 常缺
+    func/addr(锚点回填注释 L727 自注,anchor finding 有 func 而实例工件没有),
+    完整 dedup_key 四元组全等会把合法工件误拒 → 每次续跑全部真跑、静默烧预算。
+    修复:身份匹配只比 file+title(归一化),容忍实例工件缺 func/addr。"""
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    # 2 条 findings:锚点带 func(analysis 取证形态)
+    ANALYSIS2 = ('Final Answer: {"summary": "取证2", "findings": ['
+                 '{"title": "f1", "severity": "high", "file": "unitree/bin/idlc", '
+                 '"func": "perform_cmd", "confidence": "high"},'
+                 '{"title": "f2", "severity": "medium", "file": "unitree/bin/netswitch", '
+                 '"func": "run_command", "confidence": "high"}]}')
+    # 实例真跑回复(若被误拒重跑会消耗这两组;修复后 f1/f2 都应 skip 不真跑)
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    VF1 = ('Final Answer: {"summary": "复核f1", "findings": [{"title": "f1", '
+           '"severity": "high", "file": "unitree/bin/idlc", "verified": true, "rationale": "r1"}]}')
+    VF2 = ('Final Answer: {"summary": "复核f2", "findings": [{"title": "f2", '
+           '"severity": "medium", "file": "unitree/bin/netswitch", "verified": false, "rationale": "r2"}]}')
+
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        _make_process(td)
+        # 预设合法旧工件:file+title 与锚点一致但**缺 func/addr**(target/1 实例
+        # 工件真实形态);目录 3_/4_ 与本次编排实例序号对齐(recon 0→analysis 1→
+        # 阶段 2→实例 3,4)
+        for seq, title, file_, verdict, rat in (
+                (3, "f1", "unitree/bin/idlc", True, "f1-旧工件结论"),
+                (4, "f2", "unitree/bin/netswitch", False, "f2-旧工件结论")):
+            p = td / "process" / "agent" / f"{seq}_verification" / "verified_findings.json"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({
+                "schema": 2, "agent": "verification", "summary": "旧复核",
+                "findings": [{"title": title, "severity": "high", "file": file_,
+                              "verified": verdict, "rationale": rat}],
+            }, ensure_ascii=False), encoding="utf-8")
+        # ScriptedLLM 只提供编排自身轮次;若实例被误拒重跑会耗尽脚本触发失败
+        llm = ScriptedLLM([
+            D % "recon", TOOL, RECON_FINAL,        # 0/1/2
+            D % "analysis", TOOL, ANALYSIS2,       # 3/4/5
+            D % "verification",                    # 6 阶段
+            SUM,                                   # 7 summarize(实例应全 skip,零实例轮次)
+            'Final Answer: {"summary": "完成", "conclusion": "ok"}',  # 8
+        ])
+        orch = _orch(td, llm)
+        orch.run()
+
+        agent = td / "process" / "agent"
+        vf = load_artifact(agent / "verified_findings.json")
+        if vf is None:
+            fails.append("verified_findings.json 缺失")
+            return fails
+        by_title = {f.get("title"): f for f in vf["findings"]}
+        f1 = by_title.get("f1")
+        f2 = by_title.get("f2")
+        if f1 is None or f2 is None:
+            fails.append(f"f1/f2 应保留在聚合: {sorted(by_title)}")
+            return fails
+        # 缺 func/addr 的合法工件应被复用(skip),不得重跑丢结论
+        if f1.get("rationale") != "f1-旧工件结论":
+            fails.append(f"f1 旧工件(file+title 匹配,缺 func)应被 skip 复用: {f1.get('rationale')}")
+        if f1.get("verified") is not True:
+            fails.append(f"f1 旧工件 verified 应被保留: {f1.get('verified')}")
+        if f2.get("rationale") != "f2-旧工件结论":
+            fails.append(f"f2 旧工件应被 skip 复用: {f2.get('rationale')}")
+        if f2.get("verified") is not False:
+            fails.append(f"f2 旧工件 verified=false 应被保留: {f2.get('verified')}")
+        # 编排轮次自证:9 个编排回复恰好走完且总请求数==9(实例全 skip,零实例轮次;
+        # 若被误拒重跑,脚本会在第 10 次调用耗尽抛错)
+        if len(llm.calls) != 9:
+            fails.append(f"实例应全 skip,总 LLM 请求数应恰为 9: {len(llm.calls)}")
+    return fails
+
+
 def test_report_absent_without_summarize() -> list[str]:
     """未调用 summarize 直接 finish → 不出报告(不静默降级)。"""
     fails: list[str] = []
@@ -1047,7 +1245,7 @@ def test_artifact_instance_seq_backfilled() -> list[str]:
 
 
 def test_ingest_verification_overrides() -> list[str]:
-    """复核权威字段:verification 实例的 verified/rationale 覆盖聚合中旧值。"""
+    """复核权威字段:verification 实例的 verified/rationale/severity 覆盖聚合中旧值。"""
     fails: list[str] = []
     with tempfile.TemporaryDirectory() as _td:
         td = Path(_td)
@@ -1055,9 +1253,11 @@ def test_ingest_verification_overrides() -> list[str]:
         llm = ScriptedLLM([])
         orch = _orch(td, llm)
         f1 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
-              "addr": "0x1000", "verified": True, "rationale": "初判成立"}
+              "addr": "0x1000", "severity": "high", "confidence": "medium",
+              "verified": True, "rationale": "初判成立"}
         f2 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
-              "addr": "0x1000", "verified": False, "rationale": "证据与工件不符"}
+              "addr": "0x1000", "severity": "low", "confidence": "low",
+              "verified": False, "rationale": "证据与工件不符"}
         from firmware_audit.step5_agent.orchestrator import SubAgentResult
         orch._register(SubAgentResult(seq=0, agent_name="analysis", status="success",
                                       findings=[f1], request={}))
@@ -1066,6 +1266,10 @@ def test_ingest_verification_overrides() -> list[str]:
         m = orch.all_findings[0]
         if m.get("verified") is not False or m.get("rationale") != "证据与工件不符":
             fails.append(f"verification 的复核结论应覆盖前段: {m.get('verified')}/{m.get('rationale')}")
+        if m.get("severity") != "low":
+            fails.append(f"ingest 路径 severity 降级应覆盖(_OVERRIDE_KEYS): {m.get('severity')}")
+        if m.get("confidence") != "low":
+            fails.append(f"ingest 路径 confidence 降级应覆盖: {m.get('confidence')}")
     return fails
 
 

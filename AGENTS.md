@@ -96,7 +96,7 @@
 
 * **报告(v3,生成主体=orchestrator)**:verification 完成后调用 `summarize` 取素材(已复核 findings 全量字段+阶段统计),Final Answer 即报告正文,**原样落盘** **`orchestrator/report.md`**(同时含可解析 JSON 时另存 report.json 副产品);未产出时明确告警不静默降级。原 `render_report` 已删除——verification 只产 verified\_findings.json,不产报告
 
-* **verification 每疑点一实例(2026-09-01,ADR-0003,ticket 03/04)**:verification 从"单实例多疑点(24 轮内逐条复核)"改为**每 finding 一个独立复核实例**。analysis 产出 findings 后按 severity(critical>high>medium>low>info)主排序 + confidence(high>medium>low)次排序,取前 K 条(env `STEP5_VERIFY_K`,默认 10);对每条派独立实例,输入=单条 finding + 相关工件指针,**max_iters=8**,逐条产单条 verified finding,聚合回 `verified_findings.json`(**全量 N 保留**:前 K 带 verified/rationale/confidence,未进 K 的 `verified=None`、confidence 保留 analysis 初值)。**补跑逻辑整体取消**——verification 只调度一次,自动对前 K 各派实例,不再适用"同类型最多 3 次"上限(代码注释 `orchestrator.py` `_verify_k` 明示)。报告据此把 `verified=None` 划进**独立未复核区段**(⚠ 未经复核,见下 summarize 素材)。上下文隔离铁律不破(每实例只从工件读,不传对话历史)
+* **verification 每疑点一实例(2026-09-01,ADR-0003,ticket 03/04)**:verification 从"单实例多疑点(24 轮内逐条复核)"改为**每 finding 一个独立复核实例**。analysis 产出 findings 后按 severity(critical>high>medium>low>info)主排序 + confidence(high>medium>low)次排序,取前 K 条(env `STEP5_VERIFY_K`,默认 10);对每条派独立实例,输入=单条 finding + 相关工件指针,**max\_iters=8**,逐条产单条 verified finding,聚合回 `verified_findings.json`(**全量 N 保留**:前 K 带 verified/rationale/confidence/severity——复核降级判级同覆盖,2026-09-03 两处覆盖集补 severity:orchestrator 锚点回填 + aggregator `_OVERRIDE_KEYS`,防工件 severity=high 与 rationale"降为 low"自相矛盾;未进 K 的 `verified=None`、confidence 保留 analysis 初值)。**补跑逻辑整体取消**——verification 只调度一次,自动对前 K 各派实例,不再适用"同类型最多 3 次"上限(代码注释 `orchestrator.py` `_verify_k` 明示)。**单实例断点续跑带身份校验(2026-09-03)**:实例目录名是全局 seq 位置而非 finding 身份,续跑时编排路径变化(如 analysis 补跑次数不同)会让 seq 前移、命中前一条 finding 的旧工件——skip 分支按 file+title 归一化比对工件 finding 与当前锚点(完整 dedup_key 会因实例工件常缺 func/addr 误拒合法工件),不一致即弃用工件真实重跑,防复核结论整体错配无告警(target/1 实测 9/10 条右移一格)。报告据此把 `verified=None` 划进**独立未复核区段**(⚠ 未经复核,见下 summarize 素材)。上下文隔离铁律不破(每实例只从工件读,不传对话历史)
 
 * **recon v3:权限收敛+工件重构(2026-08-29)**:移除 `strings_query`/`imports_query`/`checksec`(深挖归 analysis/verification),新集 6 件套:`list_files, read_file, cve_bin_tool_scan, semgrep_scan, gitleaks_scan, binwalk_rescan`;`max_iters` 保持 20;工件改名 `survey.json`(schema v3):`arch_snapshot`(top\_level\_dirs/components\_grouped\[name+size,role 推断必附 role\_evidence]/os\_or\_runtime)+`components`(只收 cve\_bin\_tool\_scan Observation 实况)+`entry_points`+`high_risk_areas`(观察点,无判级)+`recommended_actions`(priority+action)+`summary`;**禁止** findings 数组与任意层级 severity/confidence/verified/evidence/rationale(解析层守护:违规键整条降级为 high\_risk\_areas 观察点)——判级与证据链移交 analysis;提示词防幻觉红线:high\_risk\_areas 只标工具 Observation 原文、components 版本/CVE 不凭记忆(v2 兼容层已移除,只读 survey.json)
 
@@ -128,11 +128,11 @@ def step5_run(ctx):
 
 ### Agent 职责与工具分配(v3)
 
-| Agent            | 职责                              | 工具                                                                                                                                                                                | 轮上限 | 输入              | 输出工件                                                                                                                                     |
-| ---------------- | ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| **recon**        | 广度侦察:枚举铺面不判级(判级/证据链移交 analysis) | list\_files, read\_file, cve\_bin\_tool\_scan(可选), semgrep\_scan, gitleaks\_scan, binwalk\_rescan                                                                                 | 20  | Step4 工件清单+目录概览 | `survey.json`(v3:arch\_snapshot 架构快照、components 组件 CVE 实况、entry\_points、high\_risk\_areas 观察点、recommended\_actions 扫描建议;无 findings/判级字段) |
-| **analysis**     | 深度分析:对疑点逐个取证+判级                 | list\_files, search\_code, find\_decompiled\_function, xref\_query, strings\_query, imports\_query, read\_file, cve\_lookup, checksec, semgrep\_scan, gitleaks\_scan, web\_search | 30  | survey.json     | `findings.json`(候选漏洞,含证据链:路径+地址+代码片段+严重度)                                                                                                |
-| **verification** | 复核过滤误报(不产报告);**每疑点一独立实例(ADR-0003)**,仅复核前 K 条 | list\_files, search\_code, find\_decompiled\_function, xref\_query, cve\_lookup, checksec, read\_file, strings\_query, imports\_query, sandbox\_verify                         | 8/实例 | 单条 finding(前 K 条之一)+ 工件指针 | `verified_findings.json`(唯一产物;全量 N 保留,前 K 带 verified/rationale;未进 K 的 verified=None 进报告未复核区)                                                                 |
+| Agent            | 职责                                           | 工具                                                                                                                                                                                | 轮上限  | 输入                        | 输出工件                                                                                                                                     |
+| ---------------- | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| **recon**        | 广度侦察:枚举铺面不判级(判级/证据链移交 analysis)              | list\_files, read\_file, cve\_bin\_tool\_scan(可选), semgrep\_scan, gitleaks\_scan, binwalk\_rescan                                                                                 | 20   | Step4 工件清单+目录概览           | `survey.json`(v3:arch\_snapshot 架构快照、components 组件 CVE 实况、entry\_points、high\_risk\_areas 观察点、recommended\_actions 扫描建议;无 findings/判级字段) |
+| **analysis**     | 深度分析:对疑点逐个取证+判级                              | list\_files, search\_code, find\_decompiled\_function, xref\_query, strings\_query, imports\_query, read\_file, cve\_lookup, checksec, semgrep\_scan, gitleaks\_scan, web\_search | 30   | survey.json               | `findings.json`(候选漏洞,含证据链:路径+地址+代码片段+严重度)                                                                                                |
+| **verification** | 复核过滤误报(不产报告);**每疑点一独立实例(ADR-0003)**,仅复核前 K 条 | list\_files, search\_code, find\_decompiled\_function, xref\_query, cve\_lookup, checksec, read\_file, strings\_query, imports\_query, sandbox\_verify                            | 8/实例 | 单条 finding(前 K 条之一)+ 工件指针 | `verified_findings.json`(唯一产物;全量 N 保留,前 K 带 verified/rationale/confidence/severity;未进 K 的 verified=None 进报告未复核区)                                             |
 
 ### ReAct 循环约定
 
@@ -248,11 +248,11 @@ class AgentTool(ABC):
 
 **工具分两类,填袋方式不同,但袋子一样:**
 
-| 类型     | 工具                                                         | 数据来源                                | `ok` 判据  | `text`    | `data`                             |
-| ------ | ---------------------------------------------------------- | ----------------------------------- | -------- | --------- | ---------------------------------- |
-| CLI 工具 | checksec, cve\_bin\_tool\_scan, xref\_query, semgrep\_scan, gitleaks\_scan, sandbox\_verify, binwalk\_rescan | `subprocess` 调 Docker 沙箱 / binwalk 专用镜像 | 退出码 0    | stdout 截断 | JSON 解析(有 `--json` 就 `json.loads`) |
-| 读盘工具   | strings\_query, imports\_query, find\_decompiled\_function, read\_file, list\_files, search\_code | Step4 产出的 `analysis/*.json` / `*.c`,或 `process/` 下文件 | 文件存在且读成功 | 文件内容截断    | None(文本即内容)                        |
-| API 工具 | cve\_lookup, web\_search                                    | `urllib` 调 NVD / DDG HTML             | HTTP 200 | 格式化摘要     | 原始 JSON / 检索结果                    |
+| 类型     | 工具                                                                                                           | 数据来源                                                 | `ok` 判据  | `text`    | `data`                             |
+| ------ | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------- | -------- | --------- | ---------------------------------- |
+| CLI 工具 | checksec, cve\_bin\_tool\_scan, xref\_query, semgrep\_scan, gitleaks\_scan, sandbox\_verify, binwalk\_rescan | `subprocess` 调 Docker 沙箱 / binwalk 专用镜像              | 退出码 0    | stdout 截断 | JSON 解析(有 `--json` 就 `json.loads`) |
+| 读盘工具   | strings\_query, imports\_query, find\_decompiled\_function, read\_file, list\_files, search\_code            | Step4 产出的 `analysis/*.json` / `*.c`,或 `process/` 下文件 | 文件存在且读成功 | 文件内容截断    | None(文本即内容)                        |
+| API 工具 | cve\_lookup, web\_search                                                                                     | `urllib` 调 NVD / DDG HTML                            | HTTP 200 | 格式化摘要     | 原始 JSON / 检索结果                     |
 
 **关键:find\_decompiled\_function 不重新调 Ghidra。** Step4 已经把反编译 C 代码落到 `analysis/<rel>.c`,find\_decompiled\_function 的 `execute(file_ref, func_name)` 只需要:
 
@@ -264,12 +264,12 @@ ReAct 循环不感知数据来源。它对 LLM 说的永远是:"给你一个 Obs
 
 ### 接入模型(按运行位置分层)
 
-| 层     | 工具                                                                                          | 运行位置                                    | 镜像                                                                   |
-| ----- | ------------------------------------------------------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------- |
+| 层     | 工具                                                                                                | 运行位置                                                     | 镜像                                                                   |
+| ----- | ------------------------------------------------------------------------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------------- |
 | 读盘层   | strings\_query, imports\_query, find\_decompiled\_function, read\_file, list\_files, search\_code | 宿主机 Python(读 `analysis/*.json` / `*.c` 或 `process/` 下文件) | 无                                                                    |
-| API 层 | cve\_lookup, web\_search                                                                    | 宿主机 Python(`urllib`)                    | 无                                                                    |
-| CLI 层 | checksec, cve\_bin\_tool\_scan, xref\_query, semgrep\_scan, gitleaks\_scan, sandbox\_verify | `firm_audit/sandbox` 容器                 | sandbox(已装 checksec/cve-bin-tool/r2/semgrep 1.100.0/gitleaks 8.18.2) |
-| CLI 层 | binwalk\_rescan                                                                             | `binwalk` 容器(extracted 只读挂载扫签名)         | binwalk(专用,保留不动)                                                     |
+| API 层 | cve\_lookup, web\_search                                                                          | 宿主机 Python(`urllib`)                                     | 无                                                                    |
+| CLI 层 | checksec, cve\_bin\_tool\_scan, xref\_query, semgrep\_scan, gitleaks\_scan, sandbox\_verify       | `firm_audit/sandbox` 容器                                  | sandbox(已装 checksec/cve-bin-tool/r2/semgrep 1.100.0/gitleaks 8.18.2) |
+| CLI 层 | binwalk\_rescan                                                                                   | `binwalk` 容器(extracted 只读挂载扫签名)                          | binwalk(专用,保留不动)                                                     |
 
 沙箱安全基线(2026-08-18 落实):`run_docker` 支持挂载第三段 `ro/rw` 与 `network` 参数;Step5 全部 Agent 工具调用统一 **extracted** **`:ro`** **挂载 +** **`--network none`** **断网**(run\_in\_sandbox/binwalk\_rescan 已接线;extra\_mounts 保持 rw——cve\_bin\_tool\_scan 的 CVE 缓存卷需写锁)。Step3/Step4 调用不受影响(默认 rw + 默认网络)。
 
@@ -304,8 +304,8 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 | 工具                         | 类型  | 底层                                                                        | 输出                         | 归属 Agent               |
 | -------------------------- | --- | ------------------------------------------------------------------------- | -------------------------- | ---------------------- |
-| `list_files`               | 读盘  | pathlib 枚举目录(白名单 + SDK 目录排除 + max\_files 截断)                           | 目录/文件清单                    | recon 首动铺面;全 Agent      |
-| `search_code`              | 读盘  | 边车索引(strings/imports/text.json)+ extracted 文本 grep 双路检索                 | 命中列表(带地址/行锚点)               | analysis, verification |
+| `list_files`               | 读盘  | pathlib 枚举目录(白名单 + SDK 目录排除 + max\_files 截断)                              | 目录/文件清单                    | recon 首动铺面;全 Agent     |
+| `search_code`              | 读盘  | 边车索引(strings/imports/text.json)+ extracted 文本 grep 双路检索                   | 命中列表(带地址/行锚点)              | analysis, verification |
 | `checksec`                 | CLI | slimm609/checksec `--format=json`                                         | RELRO/NX/PIE/Canary JSON   | recon, verification    |
 | `cve_bin_tool_scan`        | CLI | cve-bin-tool `--format json -o -`                                         | 已知 CVE 清单                  | recon(**可选**,见下)       |
 | `strings_query`            | 读盘  | 读 `analysis/*.strings.json` + 正则                                          | URL/IP/密钥/口令命中             | recon, analysis        |
@@ -334,7 +334,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 * CLI 工具传参必须先经 `container_path` 换算成 `/work/extracted/...` 容器绝对路径(容器 workdir 不在挂载点,相对路径必挂)
 
-* **Windows 下 `subprocess.run(text=True)` 必须显式 `encoding="utf-8", errors="replace"`**(2026-09-03,semgrep\_scan/gitleaks\_scan 实测):不指定 encoding 按进程 locale(gbk)解码容器输出,非法字节让 readerthread 抛 `UnicodeDecodeError` **后主进程拿到 stdout=None** → 下游 `json.loads(None)` TypeError。修复点:`docker_utils.run_docker`/`docker_available` + `test_decompile.py`;回归测试 `test_docker_utils.py::test_*_utf8_decode`(monkeypatch 捕获 kwargs 断言显式 encoding + 真实子进程输出非法字节验证不崩)。注意 Anaconda 默认 UTF-8 mode 与系统 gbk 两种 locale 形态崩的编码名不同,断言契约而非错误文本才能都抓红
+* **Windows 下** **`subprocess.run(text=True)`** **必须显式** **`encoding="utf-8", errors="replace"`**(2026-09-03,semgrep\_scan/gitleaks\_scan 实测):不指定 encoding 按进程 locale(gbk)解码容器输出,非法字节让 readerthread 抛 `UnicodeDecodeError` **后主进程拿到 stdout=None** → 下游 `json.loads(None)` TypeError。修复点:`docker_utils.run_docker`/`docker_available` + `test_decompile.py`;回归测试 `test_docker_utils.py::test_*_utf8_decode`(monkeypatch 捕获 kwargs 断言显式 encoding + 真实子进程输出非法字节验证不崩)。注意 Anaconda 默认 UTF-8 mode 与系统 gbk 两种 locale 形态崩的编码名不同,断言契约而非错误文本才能都抓红
 
 ### 第二批工具(后续)
 
@@ -382,7 +382,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 * 重试机制(2026-08-18):首次失败按错误类型分流——可重试(网络瞬断/超时/HTTP 5xx/429/空回复/响应非 JSON)按 `RETRY_INTERVALS=(10,15,20)s` 间隔自动重试至多 `MAX_RETRIES=3` 次,每次向 stderr 输出带时间戳日志(`[llm-retry]` 前缀:错误类型+重试次数+等待时长),重试后成功也打点;不可重试(HTTP 400/401/403/404)立即抛不重试;全部失败抛携带最终错误详情的 LLMError(→ Step5 终止)。单测 `test_step5_llm.py` 打桩 urlopen/sleep 零真实等待
 
-* **token 预算与截断续写(2026-09-01,ADR-0005,ticket 02)**:`DEFAULT_MAX_TOKENS` 由 16384 提至 **32768**(env `LLM_MAX_TOKENS` 可覆盖,`_client()` 读取)。deepseek-v4-flash 是推理模型,`reasoning_content`(思考)与 `content`(正文)分占 token 预算——思考烧满时 content 为空、`finish_reason=stop`,`chat()` 不再当空回复硬重试,而是**截断续写**:把 reasoning 拼回 assistant 消息回传 API + "直接给最终答复,别展开思考"提示,用原 max_tokens 再调一次;续写只回传 API 接续,**不进 ReAct 上下文/长期记忆**(对上层透明,上层仍只拿 content);续写请求失败(400 等)→ 降级为普通重试,不阻塞。单测 `test_step5_llm.py::test_empty_content_with_reasoning_continuation` / `test_continuation_failure_degrades_to_retry`。见 `docs/adr/0005-step5-llm-token-and-continuation.md`
+* **token 预算与截断续写(2026-09-01,ADR-0005,ticket 02)**:`DEFAULT_MAX_TOKENS` 由 16384 提至 **32768**(env `LLM_MAX_TOKENS` 可覆盖,`_client()` 读取)。deepseek-v4-flash 是推理模型,`reasoning_content`(思考)与 `content`(正文)分占 token 预算——思考烧满时 content 为空、`finish_reason=stop`,`chat()` 不再当空回复硬重试,而是**截断续写**:把 reasoning 拼回 assistant 消息回传 API + "直接给最终答复,别展开思考"提示,用原 max\_tokens 再调一次;续写只回传 API 接续,**不进 ReAct 上下文/长期记忆**(对上层透明,上层仍只拿 content);续写请求失败(400 等)→ 降级为普通重试,不阻塞。单测 `test_step5_llm.py::test_empty_content_with_reasoning_continuation` / `test_continuation_failure_degrades_to_retry`。见 `docs/adr/0005-step5-llm-token-and-continuation.md`
 
 * key 永不写入代码或提交仓库;测试用 key 已在对话中暴露,建议测试期结束后在 DeepSeek 后台轮换
 
@@ -412,7 +412,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 **不拆三个 Agent 子类**——三个 agent 只差 system prompt / 工具集 / 输入输出工件,循环逻辑完全一致,用一个 `run_react_agent(cfg: AgentConfig, ctx)` 函数 + 三个 `AgentConfig` 实例即可。未来某 agent 演化出不同循环行为时再拆子类。
 
-**工具层:AgentTool 基类 + 每工具一个子类**。基类保留 name / description / **结构化 `params`**(参数名→type/required/default/enum 声明)+ 渲染的 `params_doc` 属性 + `execute(**kw) -> ToolResult` 统一入口(先 `validate_params` 校验、计时/异常捕获/结果截断)。子类分 CLI/读盘/API 三种,**各自只实现 `_run`**(CLI 构建命令/解析在 `cli_base` 与 `_run` 内;读盘直读工件;API urllib)。详见[三、工具层实现](#三工具层实现)。
+**工具层:AgentTool 基类 + 每工具一个子类**。基类保留 name / description / **结构化** **`params`**(参数名→type/required/default/enum 声明)+ 渲染的 `params_doc` 属性 + `execute(**kw) -> ToolResult` 统一入口(先 `validate_params` 校验、计时/异常捕获/结果截断)。子类分 CLI/读盘/API 三种,**各自只实现** **`_run`**(CLI 构建命令/解析在 `cli_base` 与 `_run` 内;读盘直读工件;API urllib)。详见[三、工具层实现](#三工具层实现)。
 
 **Agent 间传递:JSON 工件文件是唯一契约**,dataclass 是 Python 侧的宽容访问层:
 
