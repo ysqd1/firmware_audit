@@ -334,6 +334,8 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 * CLI 工具传参必须先经 `container_path` 换算成 `/work/extracted/...` 容器绝对路径(容器 workdir 不在挂载点,相对路径必挂)
 
+* **Windows 下 `subprocess.run(text=True)` 必须显式 `encoding="utf-8", errors="replace"`**(2026-09-03,semgrep\_scan/gitleaks\_scan 实测):不指定 encoding 按进程 locale(gbk)解码容器输出,非法字节让 readerthread 抛 `UnicodeDecodeError` **后主进程拿到 stdout=None** → 下游 `json.loads(None)` TypeError。修复点:`docker_utils.run_docker`/`docker_available` + `test_decompile.py`;回归测试 `test_docker_utils.py::test_*_utf8_decode`(monkeypatch 捕获 kwargs 断言显式 encoding + 真实子进程输出非法字节验证不崩)。注意 Anaconda 默认 UTF-8 mode 与系统 gbk 两种 locale 形态崩的编码名不同,断言契约而非错误文本才能都抓红
+
 ### 第二批工具(后续)
 
 * ~~`binwalk_rescan`~~ ~~/~~ ~~`semgrep_scan`~~ ~~/~~ ~~`web_search`~~ 已落地(2026-08-18,见上表)

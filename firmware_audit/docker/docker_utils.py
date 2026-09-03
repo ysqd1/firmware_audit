@@ -66,6 +66,8 @@ def run_docker(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",   # 显式 utf-8:Windows 下 text=True 默认用 locale(gbk)
+            errors="replace",   # 非法字节降级 U+FFFD,防 readerthread 崩溃/stdout=None
             timeout=timeout,
         )
         return proc.returncode, proc.stdout, proc.stderr
@@ -108,6 +110,8 @@ def docker_available(image: str) -> bool:
             ["docker", "image", "inspect", _ensure_tag(image)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
         return proc.returncode == 0

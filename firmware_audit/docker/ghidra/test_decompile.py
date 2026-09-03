@@ -60,7 +60,8 @@ def main():
         ] + args
 
         print("[测试] 运行: docker run --rm -v ... ghidra analyzeHeadless ...")
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=600)
 
         print(f"[测试] 退出码: {proc.returncode}")
         if proc.returncode != 0:
