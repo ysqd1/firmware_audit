@@ -949,6 +949,63 @@ def test_verify_resume_identity_tolerant_match() -> list[str]:
     return fails
 
 
+def test_verification_phase_display_summary() -> list[str]:
+    """#6 显示层(2026-09-03):verification 每疑点一实例(ADR-0003)后,每实例
+    各打一行"verification 完成 · 1 findings"(单实例计数,误导为全阶段只复核
+    1 条;target/1 实际 10 实例)。修复:阶段聚合落盘后经 display 打**阶段级**
+    汇总行(K 实例/已复核 x/N/steps 合计);每实例完成行标注实例序号可辨识。"""
+    import io
+    import os
+    from unittest.mock import patch
+    from firmware_audit.step5_agent.engine.display import TerminalDisplay
+    fails: list[str] = []
+    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
+    # 3 条 findings,K=3 → 3 个实例
+    ANALYSIS3 = ('Final Answer: {"summary": "取证3", "findings": ['
+                 '{"title": "f1", "severity": "high", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f2", "severity": "medium", "file": "unitree/bin/idlc", "confidence": "high"},'
+                 '{"title": "f3", "severity": "low", "file": "unitree/bin/idlc", "confidence": "high"}]}')
+    VF = ['Final Answer: {"summary": "复核", "findings": [{"title": "f1", '
+          '"severity": "high", "file": "unitree/bin/idlc", "verified": true}]}'] * 3
+    sink = io.StringIO()
+    cap_disp = TerminalDisplay(mode="compact", use_color=False,
+                               width=200, out=sink)
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        _make_process(td)
+        os.environ["STEP5_VERIFY_K"] = "3"
+        try:
+            with patch("firmware_audit.step5_agent.orchestrator.make_display",
+                       return_value=cap_disp):
+                llm = ScriptedLLM([
+                    D % "recon", TOOL, RECON_FINAL,        # 0/1/2
+                    D % "analysis", TOOL, ANALYSIS3,       # 3/4/5
+                    D % "verification",                    # 6 阶段
+                    VTOOL, VF[0],                          # 7/8 实例1
+                    VTOOL, VF[1],                          # 9/10 实例2
+                    VTOOL, VF[2],                          # 11/12 实例3
+                    SUM,                                   # 13
+                    'Final Answer: {"summary": "完成", "conclusion": "ok"}',  # 14
+                ])
+                orch = _orch(td, llm)
+                orch.run()
+        finally:
+            del os.environ["STEP5_VERIFY_K"]
+
+        out = sink.getvalue()
+        # 阶段级汇总行:实例数/已复核 x/N(修复核心)
+        for want in ("verification 阶段完成", "3 实例", "已复核 3/3"):
+            if want not in out:
+                fails.append(f"阶段汇总行缺 '{want}':\n{out}")
+        # 实例序号标注(实例 i/N):阶段层派发前逐实例打出(run_agent 内部
+        # done 行走各自 display 进 stdout,不在本 sink,不在此断言)
+        for i in (1, 2, 3):
+            if f"实例 {i}/3" not in out:
+                fails.append(f"实例序号标注缺 '实例 {i}/3':\n{out}")
+    return fails
+
+
 def test_report_absent_without_summarize() -> list[str]:
     """未调用 summarize 直接 finish → 不出报告(不静默降级)。"""
     fails: list[str] = []

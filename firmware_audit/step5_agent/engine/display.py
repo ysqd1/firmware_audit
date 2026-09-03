@@ -57,6 +57,8 @@ class NullDisplay:
     def system(self, *a, **k): ...
     def final(self, *a, **k): ...
     def done(self, *a, **k): ...
+    def phase_done(self, *a, **k): ...
+    def instance_tag(self, *a, **k): ...
 
 
 class TerminalDisplay:
@@ -172,6 +174,23 @@ class TerminalDisplay:
         self._emit(self._c(
             _GREEN, f"── {name} 完成 · {artifact} · {findings} findings · "
                     f"{steps} 轮 · {dt:.1f}s · {tokens} tokens"))
+
+    def phase_done(self, name: str, artifact: str, instances: int,
+                   verified: int, total: int, steps: int, usage: dict,
+                   elapsed_s: float = 0.0) -> None:
+        """阶段级汇总行(#6,2026-09-03):verification 每疑点一实例后,单实例
+        done 行(恒 1 findings)会误导为全阶段只复核 1 条——阶段聚合落盘后
+        由 orchestrator 调本方法打真实全貌(实例数/已复核 x/N/合计)。
+        耗时由调用方传入(阶段层 display 无 stage 计时起点,不能用 _t0)。"""
+        tokens = sum(usage.get(k, 0) for k in ("prompt_tokens", "completion_tokens"))
+        self._emit(self._c(
+            _GREEN, f"── {name} 阶段完成 · {artifact} · {instances} 实例 · "
+                    f"已复核 {verified}/{total} 条 · {steps} 轮 · "
+                    f"{elapsed_s:.1f}s · {tokens} tokens"))
+
+    def instance_tag(self, idx: int, total: int) -> None:
+        """单实例完成前的序号标注(实例 i/N),让逐实例 done 行可辨识归属。"""
+        self._emit(self._c(_DIM, f"── 实例 {idx}/{total}"))
 
     # ---- 内部 ----
 

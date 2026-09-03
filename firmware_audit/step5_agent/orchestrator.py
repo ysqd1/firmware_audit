@@ -716,10 +716,17 @@ class Orchestrator:
                         str(f.get("confidence", "")).lower(), 9)))
             top = ranked[: _verify_k()]
 
-            # 逐条派独立实例(每条必跑;补跑逻辑整体取消)
-            instances = [self._run_verify_one(self._next_seq(), f, upstream,
-                                              task, request)
-                         for f in top]
+            # 逐条派独立实例(每条必跑;补跑逻辑整体取消);每实例启动前标
+            # "实例 i/N"(#6):单实例 done 行恒 1 findings,不标序号会误导为
+            # 全阶段只复核 1 条(阶段全貌由 phase_done 汇总行兜底)
+            disp = make_display()
+            instances = []
+            for i, f in enumerate(top, 1):
+                if disp.enabled:
+                    disp.instance_tag(i, len(top))
+                instances.append(
+                    self._run_verify_one(self._next_seq(), f, upstream,
+                                         task, request))
             self._verification_instances = instances
 
             # 聚合:全量 N 条(K 覆盖复核结论,N-K 原样 verified=None + confidence 初值)
@@ -790,6 +797,18 @@ class Orchestrator:
                              artifact=str(out_path), summary=phase_summary,
                              error=phase.error,
                              budget_state=self._budget_state("verification"))
+            # 阶段级汇总行(#6,2026-09-03):每实例 done 行是单实例计数(恒
+            # 1 findings),阶段真实全貌(实例数/已复核 x/N/合计)在此汇总,
+            # 不再误导"只复核了 1 条"
+            if disp.enabled:
+                usage_sum = {}
+                for v in instances:
+                    for k, n in (v.usage or {}).items():
+                        usage_sum[k] = usage_sum.get(k, 0) + n
+                disp.phase_done("verification", out_path.name,
+                                len(instances), verified_n, len(ranked),
+                                phase.steps, usage_sum,
+                                elapsed_s=phase.duration_ms / 1000)
             if status == DispatchStatus.SUCCESS:
                 return ToolResult(ok=True, text=(
                     f"## verification Agent 结果(每疑点一实例,成功,实例 {seq})\n"
