@@ -1818,15 +1818,18 @@ def _recon_check(result: dict, title: str, field: str) -> dict:
 
 def test_reconcile_report() -> list[str]:
     """ADR-0007 对账纯函数(reconcile_report):解析 report.md 正文 → 与
-    verified_findings 逐条比对三枚举值 + rationale 关键句包含 → 差异清单。
+    verified_findings 逐条比对确定性事实(file + severity/confidence/verified
+    三枚举)→ 差异清单。
 
-    验收(对照 ADR 三处失真 + 显式报出):
+    (2026-09-03 用户决策:rationale/evidence 内容不检查,理由溯源回归人工,
+    故本测试只核 file + 枚举值。)
+    验收:
     1. 失真 1 置信度错报:JWT 条目工件 confidence=medium、报告写 high → mismatch(error)
-    2. 失真 3 理由被换:pet_go 条目报告详情'硬编码命令常量拼接'(net_switcher 的话),
-       与工件 rationale(死代码/不可达/无攻击面)无 12 字符连续重合 → rationale warning
-    3. 正常转述 net_switcher(详情与 rationale 重合)→ ok,不误报
-    4. 未复核条目(⚠)与工件 verified=None 对齐 → verified 检查 ok
-    5. index 序号、URL 源、字段值原样携带(差异清单可读)
+    2. file 一致性:位置行(含 :: func 剥离)与工件 file 全等 → ok
+    3. 正常转述 net_switcher:file + 三枚举全对齐 → ok,不误报
+    4. 未复核条目(⚠)与工件 verified=None 对齐 → verified 检查 ok;
+       severity 提取失败(未复核区无分区)→ unparsed(显式报出,不静默)
+    5. index 序号、字段原值携带(差异清单可读)
     """
     fails: list[str] = []
     from firmware_audit.step5_agent.orchestrator import reconcile_report
@@ -1852,33 +1855,85 @@ def test_reconcile_report() -> list[str]:
         fails.append(f"pet_go confidence 应为 mismatch(工件 low/报告 high): {pconf}")
     if _recon_check(result, "pet_go perform_cmd 同源命令注入模式", "severity").get("ok") is not True:
         fails.append("pet_go 分区 LOW 与工件 severity=low 应一致")
-    # 失真 3:pet_go 理由被换 → rationale warning(关键句包含失败)
-    prat = _recon_check(result, "pet_go perform_cmd 同源命令注入模式", "rationale")
-    if not prat or prat.get("ok") is not False:
-        fails.append(f"pet_go 详情与工件 rationale 无重合应报 rationale warning: {prat}")
-    # 正常转述 net_switcher:三枚举 ok + rationale ok,整条 ok,不误报
+    # file 一致性:位置行剥离 :: func 后与工件 file 全等
+    pfile = _recon_check(result, "pet_go perform_cmd 同源命令注入模式", "file")
+    if not pfile or pfile.get("ok") is not True:
+        fails.append(f"pet_go 位置行(含 :: func)应剥离并匹配工件 file: {pfile}")
+    # 正常转述 net_switcher:file + 三枚举全对齐 → ok,不误报
     nconf = _recon_check(result, "net_switcher shell=True run_command（硬编码命令常量）",
                          "confidence")
     if not nconf or not nconf.get("ok"):
         fails.append(f"net_switcher 正常转述应 ok: {nconf}")
-    nrat = _recon_check(result, "net_switcher shell=True run_command（硬编码命令常量）",
-                        "rationale")
-    if not nrat or nrat.get("ok") is not True:
-        fails.append(f"net_switcher 详情含 rationale 长片段应通过关键句包含: {nrat}")
+    nfile = _recon_check(result, "net_switcher shell=True run_command（硬编码命令常量）",
+                         "file")
+    if not nfile or nfile.get("ok") is not True:
+        fails.append(f"net_switcher 位置行应匹配工件 file: {nfile}")
     if _recon_statuses_by_title(result).get(
             "net_switcher shell=True run_command（硬编码命令常量）") != "ok":
         fails.append("net_switcher 整体状态应为 ok")
-    # 未复核条目:工件 verified=None vs 报告 ⚠ → verified 检查一致
+    # 未复核条目:工件 verified=None vs 报告 ⚠ → verified 检查一致;
+    # severity 提取失败(⚠ 区无分区)→ unparsed(显式报出,不静默)
     vcheck = _recon_check(result, "multicast_responder shell=True（WebRTC 入口）", "verified")
     if not vcheck or vcheck.get("ok") is not True or vcheck.get("report") is not None:
         fails.append(f"未复核条目 verified 检查应 ok(None==None): {vcheck}")
-    # 差异清单可读性:index 序号 + 各条目 opinion 原样携带
+    if _recon_statuses_by_title(result).get(
+            "multicast_responder shell=True（WebRTC 入口）") != "unparsed":
+        fails.append("未复核条目 severity 提取失败应显式标 unparsed(不静默)")
+    # 差异清单可读性:index 序号 + 文件全名携带;清单含 summary
     it = items[1]
     if it.get("index") != 2 or it.get("file") != "unitree/module/pet_go/shell_manger.py":
         fails.append(f"条目应带 index/文件全名: {it}")
-    convention = result
-    if "summary" not in convention:
+    if "summary" not in result:
         fails.append("结果应带 summary 汇总")
+    return fails
+
+
+def test_reconcile_file_check() -> list[str]:
+    """file 存在性检查(2026-09-03 用户决策新增):位置行一致 → ok;无位置行 →
+    提取失败(ok=None→unparsed);位置写错 → mismatch。理由内容不再检查。"""
+    fails: list[str] = []
+    from firmware_audit.step5_agent.orchestrator import reconcile_report
+    md = """# 报告
+### HIGH
+#### 1. 正常条目
+- **位置：** unitree/bin/a.py
+- **置信度：** high → **复核结论：** ✓ 已证实
+#### 2. 位置写错条目
+- **位置：** unitree/bin/typo.py
+- **置信度：** high → **复核结论：** ✓ 已证实
+#### 3. 无位置条目
+- **置信度：** high → **复核结论：** ✓ 已证实
+"""
+    findings = [
+        {"title": "正常条目", "severity": "high", "file": "unitree/bin/a.py",
+         "confidence": "high", "verified": True},
+        {"title": "位置写错条目", "severity": "high", "file": "unitree/bin/b.py",
+         "confidence": "high", "verified": True},
+        {"title": "无位置条目", "severity": "high", "file": "unitree/bin/c.py",
+         "confidence": "high", "verified": True},
+    ]
+    result = reconcile_report(md, findings)
+    by_title = {it.get("title"): it for it in result.get("items", [])}
+    a = by_title.get("正常条目", {}).get("checks", {}).get("file", {})
+    if a.get("ok") is not True:
+        fails.append(f"位置一致应 file ok=True: {a}")
+    b = by_title.get("位置写错条目", {}).get("checks", {}).get("file", {})
+    if b.get("ok") is not False or b.get("artifact") != "unitree/bin/b.py" \
+            or b.get("report") != "unitree/bin/typo.py":
+        fails.append(f"位置错配应 file ok=False 并带双方原值: {b}")
+    if by_title.get("位置写错条目", {}).get("status") != "mismatch":
+        fails.append("位置错配条目整体状态应为 mismatch")
+    c = by_title.get("无位置条目", {}).get("checks", {}).get("file", {})
+    if c.get("ok") is not None:
+        fails.append(f"无位置行应 file ok=None(提取失败): {c}")
+    if by_title.get("无位置条目", {}).get("status") != "unparsed":
+        fails.append("无位置条目应显式标 unparsed")
+    # 契约:理由内容不再检查(无 rationale_warnings 键,无 rationale check)
+    items = result.get("items", [])
+    if any("rationale" in (it.get("checks") or {}) for it in items):
+        fails.append("按用户决策,不应再产出 rationale 检查结果")
+    if "rationale_warnings" in result.get("summary", {}):
+        fails.append("summary 不应再含 rationale_warnings")
     return fails
 
 
@@ -1996,7 +2051,8 @@ def test_orchestrator_prompt_reconcile_redlines() -> list[str]:
     prompt = build_orchestrator_prompt({}, max_iters=10)
     for needle in ("逐字抄写", "唯一真值", "禁止引用或", "转述其他条目的 rationale",
                    "跨条目串条", "保留工件 rationale 的核心事实与限定", "**位置：**",
-                   "**置信度：**", "**复核结论：**", "初值"):
+                   "**severity：**", "**置信度：**", "**复核结论：**", "初值",
+                   "不得只写在详情散文里"):
         if needle not in prompt:
             fails.append(f"提示词应含对账红线 '{needle}'")
     return fails
@@ -2007,7 +2063,7 @@ def test_reconcile_edge_robustness() -> list[str]:
     1. `### N. 标题`(3# 带编号)必须识别为条目,不得被当分区吞掉(静默丢条)
     2. 条目内 `severity: critical|info` 标签行必须解析 5 值(此前 regex 只认 3 值
        high/medium/low,critical/info 静默失效)
-    3. 已复核条目缺详情行 → 计入 rationale_warnings(此前 ok=None 不计入,静默)
+    3. 条目缺详情行不影响对账(2026-09-03 起 rationale 内容不检查)
     """
     fails: list[str] = []
     from firmware_audit.step5_agent.orchestrator import reconcile_report
@@ -2016,27 +2072,22 @@ def test_reconcile_edge_robustness() -> list[str]:
 ### HIGH
 ### 1. 三级井号编号条目（未被 #### 约束）
 - **位置：** unitree/bin/a.py
-- **置信度：** high → **复核结论：✓ 已证实**
-- **详情：** 与工件 rationale 连续片段重合，正常转述。
+- **置信度：** high → **复核结论：** ✓ 已证实
 ### 2. severity 标签五值条目
 - **位置：** unitree/bin/b.c
 - **severity：** critical
-- **置信度：** high → **复核结论：✓ 已证实**
-- **详情：** 与工件 rationale 连续片段重合，正常转述。
+- **置信度：** high → **复核结论：** ✓ 已证实
 #### 3. 详情缺失条目
 - **位置：** unitree/bin/c.py
-- **置信度：** high → **复核结论：✓ 已证实**
+- **置信度：** high → **复核结论：** ✓ 已证实
 """
     findings = [
         {"title": "三级井号编号条目（未被 #### 约束）", "severity": "high",
-         "file": "unitree/bin/a.py", "confidence": "high", "verified": True,
-         "rationale": "与工件 rationale 连续片段重合，正常转述确认。"},
+         "file": "unitree/bin/a.py", "confidence": "high", "verified": True},
         {"title": "severity 标签五值条目", "severity": "critical",
-         "file": "unitree/bin/b.c", "confidence": "high", "verified": True,
-         "rationale": "与工件 rationale 连续片段重合，正常转述确认。"},
+         "file": "unitree/bin/b.c", "confidence": "high", "verified": True},
         {"title": "详情缺失条目", "severity": "high",
-         "file": "unitree/bin/c.py", "confidence": "high", "verified": True,
-         "rationale": "结论依据充分。"},
+         "file": "unitree/bin/c.py", "confidence": "high", "verified": True},
     ]
     result = reconcile_report(md, findings)
     by_title = {it.get("title"): it for it in result.get("items", [])}
@@ -2053,14 +2104,14 @@ def test_reconcile_edge_robustness() -> list[str]:
     elif b.get("checks", {}).get("severity", {}).get("ok") is not True:
         fails.append(f"severity: critical 标签行应解析为 critical 且一致: "
                      f"{b.get('checks', {}).get('severity')}")
-    # 3. 详情缺失 → rationale_warnings 计入(不再静默),但枚举全对齐仍为 ok
+    # 3. 详情缺失不影响对账:枚举+file 全对齐 → ok;无 rationale 检查(用户决策)
     s = result.get("summary", {})
-    if s.get("rationale_warnings") != 1:
-        fails.append(f"缺详情条目应计入 rationale_warnings=1: {s}")
     if s.get("ok") != 3:
-        fails.append(f"三条约坐枚举全对齐应为 ok(缺详情不降 error 级): {s}")
+        fails.append(f"三条枚举+file 全对齐应为 ok(缺详情不影响): {s}")
     if s.get("unparsed") != 0:
-        fails.append(f"HIGH 分区下三条约坐 severity 均应推断成功,不得 unparsed: {s}")
+        fails.append(f"HIGH 分区下三条 severity 均应提取成功,不得 unparsed: {s}")
+    if "rationale_warnings" in s:
+        fails.append("summary 不应再含 rationale_warnings(理由内容不检查)")
     return fails
 
 
@@ -2100,6 +2151,7 @@ def test_main() -> int:
         ("dynamic_dispatch_full_chain_budget", test_dynamic_dispatch_full_chain_budget),
         ("rerun_high_overlap_adapt", test_rerun_high_overlap_adapt),
         ("reconcile_report", test_reconcile_report),
+        ("reconcile_file_check", test_reconcile_file_check),
         ("reconcile_unparsed_mismatch_fields", test_reconcile_unparsed_mismatch_fields),
         ("report_reconciliation_integration", test_report_reconciliation_integration),
         ("orchestrator_prompt_reconcile_redlines", test_orchestrator_prompt_reconcile_redlines),
