@@ -4,6 +4,10 @@
 - summarize 动作: verification 完成后由 orchestrator LLM 编写最终总结报告,
   主产物 process/agent/orchestrator/report.md(Final Answer 原样落盘);
   同时含可解析 JSON 时另存 report.json(可选结构化副产品)
+- 报告对账(ADR-0007,2026-09-03):report.md 落盘后由 reconcile_report 纯函数
+  解析正文,与 verified_findings.json 逐条比对(severity/confidence/verified
+  三枚举 + rationale 关键句包含)→ 差异清单落盘 report_reconciliation.json +
+  stderr 警告;仅告警不重生成不阻塞。素材侧由提示词红线收敛(见本模块 _ORCH_TMPL)
 - degraded 状态: 断点续跑只认 .json 成功工件;.md 降级工件标记 degraded
   (ok=False),复跑默认重跑该实例(防"失败被跳过"冒充成功)
 - handoff 快照: 每次真实调度把交接结构化落盘 handoff_<seq>_<type>.json
@@ -17,7 +21,9 @@
 目录落盘 (以 process/agent/ 为根):
 - orchestrator/  : transcript.jsonl(编排 LLM 输出)、dispatch_log.json(全量
                    调度史,含被拒尝试)、handoff_<seq>_<type>.json(交接快照)、
-                   report.md(最终总结报告,summarize 产出)、result.json(终态)
+                   report.md(最终总结报告,summarize 产出)、
+                   report_reconciliation.json(ADR-0007 对账差异清单)、
+                   result.json(终态)
 - <seq>_<type>/  : 每次子 Agent 执行的 transcript.jsonl + obs/ + 产出工件
 
 断点续跑: force=False 且该实例 .json 工件已存在 → status=skipped,加载已有工件;
@@ -28,6 +34,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sys
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -193,6 +201,23 @@ Action Input: {"conclusion": "<审计结论>"}
 ## 编排判断与后续建议
 报告内容必须来自 summarize Observation 提供的素材与各子 Agent 工件,
 禁止编造未在素材中出现的 finding/路径/统计。
+
+报告写作纪律(ADR-0007 对账红线,逐条强制执行;系统会用机器对账核对):
+- 每条 finding 的 severity/confidence/verified 枚举值**逐字抄写**素材里的原值
+  (工件 verified_findings.json 是唯一真值),禁止改写或凭印象补写——素材
+  confidence=low 就写 low,不得写 high
+- 条目的标题/位置/详情/证据**只来自该条 finding 自己的素材字段**,禁止引用或
+  转述其他条目的 rationale(跨条目串条是最严重的失真,会被机器抓到)
+- 压缩详情时**保留工件 rationale 的核心事实与限定**(如"已过期/仅 tests 目录/
+  死代码不可达"),禁止省略会改变风险定性的限定语
+- 每条 finding 按下列标签行格式书写(便于对账定位;格式允许微调,枚举值不许):
+  - **位置：** <file 相对路径,可带 :: func / @ addr>
+  - **置信度：** <high|medium|low> → **复核结论：** ✓ 已证实 | ✗ 误报 | ⚠ 未经复核
+  - **详情：** <该条 rationale 的忠实转述/压缩>
+  - **证据：** <evidence 引用>
+  未复核条目(⚠)的置信度标注"（初值）"(confidence 为 analysis 初值,不是复核值);
+  每条 finding 用**带编号的标题**(如 `### 1. 标题` 或 `#### 2. 标题`,编号连续),
+  便于机器按条目定位(标题不带编号会无法对账)
 
 ## 6 红线与边界
 预算状态解读(budget_state):
@@ -1330,6 +1355,9 @@ class Orchestrator:
         # 报告落盘:summarize 已调用且 Final Answer 非空 → report.md(主产物);
         # JSON 结构可解析时另存 report.json(可选副产品)
         self._write_report()
+        # ADR-0007:报告落盘后立即事后对账(解析正文 vs verified_findings 真值),
+        # 差异清单落盘 + stderr 警告;仅告警不重生成不阻塞
+        self._reconcile_report()
         if disp.enabled:
             disp.done("orchestrator", self._report_path.name if self._report_path
                       else "result.json", len(self._agg.all_findings),
@@ -1376,6 +1404,47 @@ class Orchestrator:
         """最终总结报告路径(summarize 产出);未产出时 None。"""
         return self._report_path
 
+    def _reconcile_report(self) -> Path | None:
+        """ADR-0007 事后对账(报告落盘后):解析 report.md 正文与 verified_findings.json
+        逐条比对(reconcile_report 纯函数)→ 差异清单落盘 report_reconciliation.json
+        + stderr 警告。
+
+        仅告警:report.md 原样保留,不自动重生成、不阻塞(ADR-0006 精神"明确告警
+        不静默降级";自动重生成不保证收敛,修复交给人工复核后的重跑)。未满足
+        对账前置(report.md / verified_findings.json 缺失)时返回 None,不落盘。
+        """
+        if self._report_path is None:
+            return None
+        vf_path = self.agent_dir / "verified_findings.json"
+        if not vf_path.is_file():
+            return None
+        try:
+            report_md = self._report_path.read_text(encoding="utf-8")
+            loaded = load_artifact(vf_path) or {}
+            result = reconcile_report(report_md, loaded.get("findings", []) or [])
+        except OSError:
+            return None   # 读盘失败不阻塞:对账是旁路告警,不干扰主流程
+        out = self.orch_dir / "report_reconciliation.json"
+        payload = {
+            "ts": _now(),
+            "report_md": str(self._report_path),
+            "verified_findings": str(vf_path),
+            **result,
+        }
+        try:
+            out.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+        except OSError:
+            return None
+        s = result["summary"]
+        if s["mismatch"] or s["unparsed"] or s["unmatched"] or s["rationale_warnings"]:
+            print(f"[reconcile] report.md 与 verified_findings 对账发现差异: "
+                  f"mismatch={s['mismatch']} unparsed={s['unparsed']} "
+                  f"unmatched={s['unmatched']} rationale_warnings="
+                  f"{s['rationale_warnings']} 详见 {out}",
+                  file=sys.stderr)
+        return out
+
     @property
     def summarize_called(self) -> bool:
         return self._summarize_called
@@ -1402,5 +1471,215 @@ class Orchestrator:
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         return out
 
+# ---- ADR-0007(2026-09-03):report.md 事后对账(纯函数,零 LLM / 零 IO) ----
+
+# 报告呈现失真治理(方向 c:素材收敛 + 事后对账双保险)。失真的根因在转写环节
+# (LLM 把长 Observation 转写 markdown 出错),素材已逐字段喂全,提示词红线
+# 约束不了"跨条目串条"(失真 3),故对账必须靠机器:解析 report.md 正文(分区
+# 标题 + 标签行)与 verified_findings 逐条比对。产出差异清单(数字/原文),由
+# Orchestrator 落盘 report_reconciliation.json + stderr 警告;仅告警不自动
+# 重生成、不阻塞(ADR-0006 精神:明确告警不静默降级)。
+#
+# 轻提示词约定(_ORCH_TMPL 报告规范):每条已复核 finding 需带标签行
+#   - **位置：** <file>（可带 :: func / @ addr）
+#   - **置信度：** high|medium|low → **复核结论：** ✓（已证实）| ✗（误报）| ⚠（未经复核）
+#   未复核条目置信度标注"（初值）"。结构非契约(LLM 自由写 markdown),解析失败
+#   的条目在清单里显式标 unparsed(不静默)。
+
+# 标题行为条目还是分区:带编号(###/#### N. xxx)或 ≥4 个 # → 条目;否则(≤3 个 #
+# 且无编号,如 ### HIGH/## 未复核疑点)→ 分区(找 severity 枚举)。避免 LLM 用
+# 3# 写条目时被当分区吞掉(静默丢条,review 2026-09-03)
+_RECON_HDR_RE = re.compile(r"^(#{2,5})\s+(?:(\d+)\s*[.、)]?\s*)?(.+?)\s*$")
+# verified 提取哨兵:区分"解析出 None(⚠ 未复核)"与"根本没提取到(显式 unparsed)"
+_RECON_UNSET = object()
+# 标签行:'- **位置：** value' 或 '**置信度（初值）：** value' 等
+_RECON_LABEL_RE = re.compile(
+    r"^\s*(?:[-*+]\s*)?\*{1,2}\s*([^*:：]+?)\s*[:：](?:\*{1,2}\s*)?(.*)$")
+_RECON_SEV_RE = re.compile(r"(critical|high|medium|low|info)", re.IGNORECASE)
+_RECON_CONF_RE = re.compile(r"\b(high|medium|low)\b")
+
+
+def _recon_norm(s: str) -> str:
+    """归一化:小写 + 去全部非字母数字(空白/标点/反引号),中文保留。
+    用于标题匹配与关键句重合检测(容忍报告与工件在空格/标点上的差异)。"""
+    return "".join(c for c in str(s or "").lower() if c.isalnum())
+
+
+def _recon_windows(text: str, width: int = 12) -> set[str]:
+    """rubric 关键句的连续片段窗口集(长度 width)。报告详情须命中其一——
+    即"详情是工件 rationale 的子文本(有 width 字符连续重合)",抓跨条目串条
+    与限定被吞,放行合理缩句(net_switcher 逐字转述命中、pet_go 理由被换成
+    别条文案的 0 命中)。"""
+    t = _recon_norm(text)
+    if len(t) < width:
+        return {t} if t else set()
+    return {t[i:i + width] for i in range(len(t) - width + 1)}
+
+
+def _recon_section_severity(section: str) -> str | None:
+    """分区标题(### HIGH / ### INFO（已复核）)→ severity;无枚举返回 None。"""
+    m = _RECON_SEV_RE.search(section)
+    return m.group(1).lower() if m else None
+
+
+def _recon_parse_enum(text: str) -> str | None:
+    """从文本提取 3 值枚举(high/medium/low,confidence 用;severity 走 _RECON_SEV_RE)。"""
+    m = _RECON_CONF_RE.search(text)
+    return m.group(1).lower() if m else None
+
+
+def _recon_parse_verdict(text: str):
+    """复核结论文本 → True(已证实)/ False(误报)/ None(⚠ 未经复核)。"""
+    t = str(text or "")
+    if "⚠" in t or "未经复核" in t or "未进入" in t:
+        return None
+    return not ("✗" in t or "误报" in t or "不成立" in t)
+
+
+def _recon_parse_report(report_md: str) -> list[dict]:
+    """report.md 正文 → 条目列表[{index,title,section,file,severity,confidence,
+    verified,detail}]。标题行带编号或 ≥4# → 条目;其余(≤3# 无编号)→ 分区
+    (severity 推断用)。labels 标签行拾取字段。"""
+    items: list[dict] = []
+    cur: dict | None = None
+    section = ""
+    for raw in report_md.splitlines():
+        line = raw.strip()
+        hdr = _RECON_HDR_RE.match(line)
+        if hdr:
+            numbered = hdr.group(2)
+            if numbered or len(hdr.group(1)) >= 4:
+                if cur is not None:
+                    items.append(cur)
+                cur = {
+                    "index": int(numbered) if numbered else None,
+                    "title": hdr.group(3).strip(),
+                    "section": section,
+                    "file": "", "severity": None, "confidence": None,
+                    "verified": _RECON_UNSET, "detail": "",
+                }
+            else:
+                section = hdr.group(3)
+            continue
+        if cur is None:
+            continue
+        lb = _RECON_LABEL_RE.match(line)
+        if not lb:
+            continue
+        label = lb.group(1).strip().replace("（初值）", "").replace("(初值)", "")
+        value = lb.group(2).strip()
+        if label == "位置":
+            cur["file"] = value.replace("`", "").replace("\\", "/")
+            # 剥离 :: func 与 @ addr(比对用 file;func/addr 不进清单首行)
+            cur["file"] = re.split(r"\s*::\s*|\s*@\s*", cur["file"])[0].strip()
+        elif label in ("置信度",):
+            cur["confidence"] = _recon_parse_enum(value) or cur["confidence"]
+            if cur["verified"] is _RECON_UNSET:   # 复核结论常与置信度同行
+                cur["verified"] = _recon_parse_verdict(value)
+        elif label == "复核结论":
+            cur["verified"] = _recon_parse_verdict(value)
+        elif label == "详情":
+            cur["detail"] = value.strip("`")
+        elif label in ("severity", "严重度", "严重级别"):
+            sev_m = _RECON_SEV_RE.search(value)   # 5 值:critical|high|medium|low|info
+            cur["severity"] = sev_m.group(1).lower() if sev_m else cur["severity"]
+    if cur is not None:
+        items.append(cur)
+    # 分区推断 severity(条目自带标签优先)
+    for it in items:
+        if it["severity"] is None:
+            it["severity"] = _recon_section_severity(it.get("section", ""))
+    return items
+
+
+def reconcile_report(report_md: str, verified_findings: list[dict]) -> dict:
+    """report.md 与 verified_findings 对账(ADR-0007) → 差异清单 dict。
+
+    逐条(按标题归一化匹配工件 finding):
+    - severity/confidence/verified 三枚举值比对:提取到 → ok=True/False(error 级);
+      提取不到 → ok=None(显式 unparsed,不静默)
+    - rationale 关键句包含:已复核条目用它,报告详情须命中工件 rationale 的
+      ≥12 字符连续片段(warning 级,单独计数,不拉高整体 mismatch)
+    - 报告有条目但工件对不上 → unmatched
+    清单含 summary 汇总与 each item{index,title,file,matched,checks,status}。
+    纯函数零 IO/零 LLM:时间戳与落盘由调用方(Orchestrator._reconcile_report)
+    负责,测试可直接断言返回值。
+    """
+    findings_by_norm: dict[str, dict] = {}
+    for f in verified_findings or []:
+        if isinstance(f, dict):
+            findings_by_norm.setdefault(_recon_norm(f.get("title", "")), f)
+
+    items: list[dict] = []
+    for it in _recon_parse_report(report_md):
+        norm_title = _recon_norm(it["title"])
+        finding = findings_by_norm.get(norm_title)
+        checks: dict = {}
+        if finding is None:
+            items.append({
+                "index": it["index"], "title": it["title"], "file": it["file"],
+                "matched": False, "checks": {}, "status": "unmatched",
+            })
+            continue
+
+        # ---- 三枚举比对(取值方:工件 = 唯一真值) ----
+        # 提取失败判定:severity/confidence 用 None;verified 用哨兵(⚠ 解析出的
+        # None 是"未复核"的有效值,须与"没提取到"区分)
+        for key, art_val, rep_val, unset in (
+                ("severity", finding.get("severity"), it["severity"], None),
+                ("confidence", finding.get("confidence"), it["confidence"], None),
+                ("verified", finding.get("verified"), it["verified"], _RECON_UNSET)):
+            if rep_val is unset:
+                checks[key] = {"ok": None, "artifact": art_val, "report": None}
+            else:
+                checks[key] = {
+                    "ok": _recon_norm(str(art_val)) == _recon_norm(str(rep_val)),
+                    "artifact": art_val, "report": rep_val,
+                }
+
+        # ---- rationale 关键句包含(warning 级,只查已复核条目) ----
+        if finding.get("verified") is not None:
+            if not it["detail"]:
+                checks["rationale"] = {"ok": None, "detail": "报告条目缺详情行(提取失败)"}
+            else:
+                detail_norm = _recon_norm(it["detail"])
+                hit = any(w in detail_norm for w in _recon_windows(
+                    finding.get("rationale", "")))
+                checks["rationale"] = {
+                    "ok": hit,
+                    "detail": ("" if hit
+                               else "报告详情与工件 rationale 无 ≥12 字符连续重合(理由被换或被吞?)"),
+                }
+        else:
+            checks["rationale"] = {"ok": True, "detail": "(未复核条目,不检查理由)"}
+
+        # ---- 状态聚合:unparsed(提取失败)> mismatch > ok ----
+        enum_oks = [checks[k]["ok"] for k in ("severity", "confidence", "verified")
+                    if k in checks]
+        if any(o is None for o in enum_oks):
+            status = "unparsed"                      # 提取不到枚举,显式报出(不静默)
+        elif any(o is False for o in enum_oks):
+            status = "mismatch"                      # 三枚举有不符(误差级告警)
+        else:
+            status = "ok"
+        items.append({
+            "index": it["index"], "title": it["title"], "file": it["file"],
+            "matched": True, "checks": checks, "status": status,
+        })
+
+    summary = {
+        "report_items": len(items),
+        "matched": sum(1 for i in items if i["matched"]),
+        "ok": sum(1 for i in items if i["status"] == "ok"),
+        "mismatch": sum(1 for i in items if i["status"] == "mismatch"),
+        "unparsed": sum(1 for i in items if i["status"] == "unparsed"),
+        "unmatched": sum(1 for i in items if i["status"] == "unmatched"),
+        "rationale_warnings": sum(
+            1 for i in items
+            if i["matched"] and i["checks"].get("rationale", {}).get("ok") is not True),
+    }
+    return {"summary": summary, "items": items}
+
+
 __all__ = ["Orchestrator", "SubAgentResult", "DispatchAgentTool",
-           "SummarizeTool", "FinishTool", "DispatchStatus"]
+           "SummarizeTool", "FinishTool", "DispatchStatus", "reconcile_report"]
