@@ -331,6 +331,10 @@ def test_search_code() -> list[str]:
         ag.mkdir(parents=True)
         (ag / "step001_read_file.txt").write_text("password = 'agent-log-hit'\n",
                                                   encoding="utf-8")
+        # analysis 下的非边车文本(.c):并集语义的判别器——边车路永远扫
+        # analysis,只有文本 grep 也能命中它才证明并集真的进了 analysis 树
+        (ana / "decompiled.c").write_text("void f(){ system(union_grep_marker); }\n",
+                                          encoding="utf-8")
 
         t = make_tools(ToolContext(process_dir=root))["search_code"]
 
@@ -384,31 +388,93 @@ def test_search_code() -> list[str]:
         if "边车" not in r6.text or "文本" not in r6.text:
             fails.append(f"无命中应报搜索统计: {r6.text[:120]}")
 
-        # --- 范围守卫(2026-09-03 target/1 卡死修复) ---
-        # 默认范围不得命中 .cve_cache/agent 内容(防范围扩张回归 + 证据污染)
+        # --- 范围语义(2026-09-04 重定义:根/默认 = extracted+analysis 并集) ---
+        # 并集不得命中 .cve_cache/agent 内容(防范围扩张回归 + 证据污染)
         rg = t.execute(keyword="password")
         if "cache-hit" in rg.text or "agent-log-hit" in rg.text:
-            fails.append(f"默认范围不得命中 .cve_cache/agent: {rg.text[:160]}")
+            fails.append(f"并集范围不得命中 .cve_cache/agent: {rg.text[:160]}")
+        # 根/默认/一切解析到根的形态:全部合法且等价(并集),文本 grep 两棵子树都进
+        for alias in (None, ".", "./", "extracted/.."):
+            ru = t.execute(keyword="union_grep_marker",
+                           **({} if alias is None else {"directory": alias}))
+            if not ru.ok:
+                fails.append(f"根/默认应合法 directory={alias!r}: {ru.error}")
+            elif "decompiled.c" not in ru.text:
+                fails.append(f"并集文本 grep 应含 analysis 子树 directory={alias!r}: {ru.text[:120]}")
+        ru2 = t.execute(keyword="password")
+        if "net_switcher.py" not in ru2.text:
+            fails.append(f"并集应含 extracted 文本命中: {ru2.text[:120]}")
+        # 树名 = 该树根(收窄,非并集别名):analysis 树名能查到 analysis 文本,
+        # extracted 树名查不到(2026-09-04 修复:树名不得拼成 extracted/extracted)
+        ra1 = t.execute(keyword="union_grep_marker", directory="analysis")
+        if not ra1.ok or "decompiled.c" not in ra1.text:
+            fails.append(f"analysis 树名应命中其下文本: {ra1.text[:120]}")
+        ra2 = t.execute(keyword="union_grep_marker", directory="extracted")
+        if not ra2.ok or "未找到匹配" not in ra2.text:
+            fails.append(f"extracted 树名收窄不得命中 analysis 文本: {ra2.text[:120]}")
         # 守卫范围一律 ok=False:错误带指引且回显 directory 值(断言契约
-        # 而非完整文案,同 2026-09-03 encoding 踩坑教训)
-        for bad in (".", "./", "extracted/..", "extracted/sub/../..",
-                    ".cve_cache", ".cve_cache/cve-bin-tool",
-                    "agent", "agent/0_recon"):
+        # 而非完整文案,同 2026-09-03 encoding 踩坑教训)。
+        # 含 .. 穿越形态(2026-09-04 code-review 实证漏洞:字符串前缀匹配
+        # 放行 "extracted/../.cve_cache",必须按解析后物理位置判 containment)
+        for bad in (".cve_cache", ".cve_cache/cve-bin-tool",
+                    "agent", "agent/0_recon",
+                    "extracted/../.cve_cache", "analysis/../agent",
+                    "extracted/../../.cve_cache"):
             rb = t.execute(keyword="password", directory=bad)
             if rb.ok:
                 fails.append(f"守卫范围应拒绝 directory={bad!r}: {rb.text[:120]}")
-            elif "不可搜索" not in (rb.error or ""):
-                fails.append(f"守卫拒绝应带指引 directory={bad!r}: {rb.error}")
             elif str(bad) not in (rb.error or ""):
                 fails.append(f"守卫错误应回显 directory={bad!r}: {rb.error}")
         # 绕过回归:边车命中已满 max_results 时守卫仍须拦截(code-review 补)
-        rb2 = t.execute(keyword="password", directory=".", max_results=1)
+        rb2 = t.execute(keyword="password", directory="agent", max_results=1)
         if rb2.ok:
             fails.append(f"边车满 n 时守卫目录仍应拒绝: {rb2.text[:120]}")
-        # 合法范围不受影响:analysis 子目录仍可 grep
-        ra = t.execute(keyword="password", directory="analysis")
-        if not ra.ok or "idlc.strings.json" not in ra.text:
-            fails.append(f"analysis 范围应可搜索: {ra.error or ra.text[:120]}")
+        # 显式收窄约束两路:extracted 子树查询不带 analysis 文本与边车命中
+        # (2026-09-04 code-review:旧版边车路无视收窄)
+        r7 = t.execute(keyword="password", directory="extracted/module")
+        if not r7.ok:
+            fails.append(f"extracted 收窄应合法: {r7.error}")
+        else:
+            if "union_grep_marker" in r7.text:
+                fails.append(f"extracted 收窄不得命中 analysis 文本: {r7.text[:120]}")
+            if "idlc.strings.json" in r7.text or "srv.text.json" in r7.text:
+                fails.append(f"extracted 收窄不得命中 analysis 边车: {r7.text[:120]}")
+            if "net_switcher.py" not in r7.text:
+                fails.append(f"extracted 收窄应命中本树文本: {r7.text[:120]}")
+        # analysis 子树收窄:边车照常(在范围内)
+        r8 = t.execute(keyword="password", directory="analysis")
+        if not r8.ok or "idlc.strings.json" not in r8.text:
+            fails.append(f"analysis 收窄应命中边车: {r8.error or r8.text[:120]}")
+    return fails
+
+
+def test_resolve_analysis_file_tolerant() -> list[str]:
+    """resolve_analysis_file 宽容解析(ADR-0008):file_ref 带 extracted/ 前缀
+    也能命中 analysis/ 下 sidecar(剥前缀),防止 file 统一成工具路径后
+    Agent 把 extracted/ 带进 file_ref 白吃一轮"产物缺失"。"""
+    from firmware_audit.step5_agent.providers.tools.base import (
+        ToolContext, resolve_analysis_file)
+
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        side = root / "analysis" / "unitree" / "bin"
+        side.mkdir(parents=True)
+        (side / "idlc.c").write_text("int main(){}\n", encoding="utf-8")
+        ctx = ToolContext(process_dir=root)
+        r1 = resolve_analysis_file(ctx, "unitree/bin/idlc", ".c")
+        r2 = resolve_analysis_file(ctx, "extracted/unitree/bin/idlc", ".c")
+        if r1 is None:
+            fails.append("基线:逻辑路径 file_ref 应命中")
+        elif r2 != r1:
+            fails.append(f"extracted/ 前缀应宽容解析等价: {r2} != {r1}")
+        # 后缀误带 + 前缀组合
+        r3 = resolve_analysis_file(ctx, "extracted/unitree/bin/idlc.c", ".c")
+        if r3 != r1:
+            fails.append(f"前缀+误带后缀组合应解析: {r3}")
+        # 越界仍拒绝(宽容不放松安全约束)
+        if resolve_analysis_file(ctx, "../../etc/passwd", ".c") is not None:
+            fails.append("越界 file_ref 仍应拒绝")
     return fails
 
 
@@ -432,6 +498,7 @@ def test_main() -> int:
         ("make_tools_exclude", test_make_tools_exclude),
         ("list_files", test_list_files),
         ("search_code", test_search_code),
+        ("resolve_analysis_file_tolerant", test_resolve_analysis_file_tolerant),
     ]:
         fl = fn()
         if fl:

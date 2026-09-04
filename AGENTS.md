@@ -100,6 +100,8 @@
 
 * **recon v3:权限收敛+工件重构(2026-08-29)**:移除 `strings_query`/`imports_query`/`checksec`(深挖归 analysis/verification),新集 6 件套:`list_files, read_file, cve_bin_tool_scan, semgrep_scan, gitleaks_scan, binwalk_rescan`;`max_iters` 保持 20;工件改名 `survey.json`(schema v3):`arch_snapshot`(top\_level\_dirs/components\_grouped\[name+size,role 推断必附 role\_evidence]/os\_or\_runtime)+`components`(只收 cve\_bin\_tool\_scan Observation 实况)+`entry_points`+`high_risk_areas`(观察点,无判级)+`recommended_actions`(priority+action)+`summary`;**禁止** findings 数组与任意层级 severity/confidence/verified/evidence/rationale(解析层守护:违规键整条降级为 high\_risk\_areas 观察点)——判级与证据链移交 analysis;提示词防幻觉红线:high\_risk\_areas 只标工具 Observation 原文、components 版本/CVE 不凭记忆(v2 兼容层已移除,只读 survey.json)
 
+* **路径口径统一为工具路径(2026-09-03,ADR-0008,target/1 事故上游修复)**:LLM 可见的一切路径(survey.high\_risk\_areas/findings 的 file 字段、verification 简报指针、提示词示例)统一为**工具路径**(相对工作区根,`extracted/...`/`analysis/...`);逻辑路径(`unitree/...`)降级为纯内部键(Step2-4/边车命名),`process/` 前缀形态(无任何工具能解析,旧简报指针与提示词示例均带此前缀——实例 6 连撞 6 次"文件不存在"烧光预算的直接元凶)全量消灭。四处落点:①semgrep/gitleaks 工具输出层给固件路径加 `extracted/` 前缀(`cli_base.extracted_tool_path`,recon"照抄原文"红线不动,原文本身变对);②findings 落盘归一兜底(`aggregator.normalize_file_paths`,仅 analysis 实例,缺前缀且 `extracted/<file>` 存在则补并回写——verification 不归一,title/file 不得改是硬纪律);③verification 单实例简报指针修前缀 + 新增源文件指针与 `.text.json` 边车(全部经 `is_file` 检查,LLM 零猜测);④提示词文档口径清扫(ANALYSIS\_DIR\_DOC/schema 模板/recon 简报)。配套:`resolve_analysis_file` 对 `extracted/` 前缀宽容解析(剥前缀再找边车,防 Agent 把新口径带进 file\_ref 白吃一轮)。旧工件跨版本不兼容——续跑身份校验(file+title)对新锚点判不一致即弃旧重跑,与 extractinfo\_version 失效同款先例。回归:`test_orchestrator.py::test_normalize_file_paths/test_verify_single_brief_pointers`、`test_step5_cli_tools.py::test_extracted_tool_path`+semgrep/gitleaks 前缀断言、`test_step5_tools.py::test_resolve_analysis_file_tolerant`
+
 * **终止策略**:无 API key 或 API 调用失败时立即终止(抛 `LLMError`),不产出降级工件、不执行规则模式
 
 * **接入**:main.py Step1-4 后自动跑 Step5(`--no-step5` 跳过);`step5_run` 接受 target/<N> 或工作区目录(分区子工作区通用);也可 `python -m firmware_audit.step5_agent.run_step5 <dir> [--force]` 独立补跑
@@ -305,7 +307,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 | 工具                         | 类型  | 底层                                                                        | 输出                         | 归属 Agent               |
 | -------------------------- | --- | ------------------------------------------------------------------------- | -------------------------- | ---------------------- |
 | `list_files`               | 读盘  | pathlib 枚举目录(白名单 + SDK 目录排除 + max\_files 截断)                              | 目录/文件清单                    | recon 首动铺面;全 Agent     |
-| `search_code`              | 读盘  | 边车索引(strings/imports/text.json)+ extracted 文本 grep 双路检索                   | 命中列表(带地址/行锚点)              | analysis, verification |
+| `search_code`              | 读盘  | 边车索引(strings/imports/text.json)+ extracted+analysis 文本 grep 双路检索('.'/缺省=两棵内容树并集;agent//.cve\_cache 拒绝) | 命中列表(带地址/行锚点)              | analysis, verification |
 | `checksec`                 | CLI | slimm609/checksec `--format=json`                                         | RELRO/NX/PIE/Canary JSON   | recon, verification    |
 | `cve_bin_tool_scan`        | CLI | cve-bin-tool `--format json -o -`                                         | 已知 CVE 清单                  | recon(**可选**,见下)       |
 | `strings_query`            | 读盘  | 读 `analysis/*.strings.json` + 正则                                          | URL/IP/密钥/口令命中             | recon, analysis        |
@@ -314,7 +316,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 | `xref_query`               | CLI | radare2 `axtj`(JSON 输出)                                                   | 交叉引用链                      | analysis, verification |
 | `cve_lookup`               | API | NVD REST API 2.0                                                          | CVSS/POC 可用性               | analysis, verification |
 | `read_file`                | 读盘  | pathlib 读 `process/` 下文件(路径白名单)                                           | 工件细节片段 ≤8KB                | 全部(跨 Agent 回查机制)       |
-| `semgrep_scan`             | CLI | semgrep 1.100.0 + 本地规则 `tools/rules/semgrep_security.yaml`(离线,不用 p/ 网络规则) | 脚本语义漏洞(命令注入/SQLi/反序列化)     | recon, analysis        |
+| `semgrep_scan`             | CLI | semgrep 1.100.0 + 本地规则 `tools/rules/semgrep_security.yaml`(离线,不用 p/ 网络规则) | 脚本语义漏洞(命令注入/SQLi/反序列化);'.' 双扫 analysis 反编译 C 危险调用(strcpy/sprintf/gets/system 等,仅 \*.c) | recon, analysis        |
 | `gitleaks_scan`            | CLI | gitleaks 8.18.2 `detect --no-git`(单容器 detect+cat 报告)                      | 硬编码密钥/凭据                   | recon, analysis        |
 | `sandbox_verify`           | CLI | 沙箱跑复核脚本(仅 python3/node/php 白名单解释器,网络隔离,extracted 只读)                      | Fuzzing Harness/PoC 动态验证输出 | verification           |
 | `binwalk_rescan`           | CLI | binwalk 专用镜像签名复扫(只识别不落盘解包)                                                | 嵌套容器签名表                    | recon                  |
@@ -336,7 +338,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 * **Windows 下** **`subprocess.run(text=True)`** **必须显式** **`encoding="utf-8", errors="replace"`**(2026-09-03,semgrep\_scan/gitleaks\_scan 实测):不指定 encoding 按进程 locale(gbk)解码容器输出,非法字节让 readerthread 抛 `UnicodeDecodeError` **后主进程拿到 stdout=None** → 下游 `json.loads(None)` TypeError。修复点:`docker_utils.run_docker`/`docker_available` + `test_decompile.py`;回归测试 `test_docker_utils.py::test_*_utf8_decode`(monkeypatch 捕获 kwargs 断言显式 encoding + 真实子进程输出非法字节验证不崩)。注意 Anaconda 默认 UTF-8 mode 与系统 gbk 两种 locale 形态崩的编码名不同,断言契约而非错误文本才能都抓红
 
-* **search\_code 范围守卫:`directory` 拒绝根目录/`agent/`/`.cve_cache`**(2026-09-03,target/1 卡死事故实测根因):verification 实例因 finding 的 file 路径缺 `extracted/` 前缀连撞"目录不存在"后,改调 `search_code(directory=".")` 自救——`resolve_within` 按 containment 语义放行根目录,grep 范围扩成整个 `process/`,把 `.cve_cache`(cve-bin-tool 预热缓存卷,**10.7万 json/yml,两个扩展名都在 \_TEXT\_EXTS 白名单**)卷进逐文件 open+读+正则,实测热缓存 ~2000 文件/s、Defender 放大后崩到 ~50 文件/s,数十分钟无输出被人工 Ctrl+C。修复:`_resolve_scope` 三类范围返回拒绝原因,`_run` 对拒绝**无条件报错**(有边车命中也不静默吞),错误信息带"请指定 extracted/ 或其子目录"指引;回归测试 `test_step5_tools.py::test_search_code` 守卫段。教训两条:①终端转储等运行文件**别存进 `process/agent/`**(在 grep 树里会命中 Agent 自身日志,本次诊断中它还让复现 harness 撞满 max\_results 提前返回、造成假阴性);②上游触发器(analysis finding 的 file 字段路径前缀不统一,导致 verification 反复撞"目录不存在"浪费轮次)另行处理
+* **search\_code 范围守卫:`directory` 拒绝根目录/`agent/`/`.cve_cache`**(2026-09-03,target/1 卡死事故实测根因):verification 实例因 finding 的 file 路径缺 `extracted/` 前缀连撞"目录不存在"后,改调 `search_code(directory=".")` 自救——`resolve_within` 按 containment 语义放行根目录,grep 范围扩成整个 `process/`,把 `.cve_cache`(cve-bin-tool 预热缓存卷,**10.7万 json/yml,两个扩展名都在 \_TEXT\_EXTS 白名单**)卷进逐文件 open+读+正则,实测热缓存 ~2000 文件/s、Defender 放大后崩到 ~50 文件/s,数十分钟无输出被人工 Ctrl+C。修复:`_resolve_scope` 三类范围返回拒绝原因,`_run` 对拒绝**无条件报错**(有边车命中也不静默吞),错误信息带"请指定 extracted/ 或其子目录"指引;回归测试 `test_step5_tools.py::test_search_code` 守卫段。**2026-09-04 语义重定义(用户定稿)**:根目录/缺省不再拒绝,改为 **extracted/ + analysis/ 两棵内容树的并集**(白名单并集替代黑名单,`.` 从此=全部审计内容,.cve\_cache/agent 结构性不可达);显式子目录限两棵树内(树名 `extracted`/`analysis` 即该树根);agent//.cve\_cache 显式指定仍拒绝。配套 semgrep\_scan '.' 双扫(见上表)。教训两条:①终端转储等运行文件**别存进 `process/agent/`**(在 grep 树里会命中 Agent 自身日志,本次诊断中它还让复现 harness 撞满 max\_results 提前返回、造成假阴性);②上游触发器(verification 反复撞"目录不存在"浪费轮次)**已由 ADR-0008 处理**(见 Step5 章节"路径口径统一为工具路径",2026-09-03 同日落地)
 
 ### 第二批工具(后续)
 
@@ -432,4 +434,18 @@ class Finding:
 * dataclass = `from_json` 缺字段给默认值、只降级不崩溃(不引 pydantic,守住零新依赖)
 
 * 下游 Agent 初始 prompt 只注入摘要 + 工件路径,细节用 read\_file 工具按需拉取(不把整个 survey.json 塞进对话)
+
+## Agent skills
+
+### Issue tracker
+
+工单以本地 markdown 存放:`.scratch/<feature>/issues/`(一票一文件,编号从 01 起;`Status:` 行记 triage 状态,评论追加在文件底部 `## Comments` 下)。详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+默认五角色词表,标签字符串=角色名:needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix。详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+单上下文布局:根 `CONTEXT.md` + `docs/adr/`。详见 `docs/agents/domain.md`。
 

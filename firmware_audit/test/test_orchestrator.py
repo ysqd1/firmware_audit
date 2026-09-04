@@ -2115,6 +2115,82 @@ def test_reconcile_edge_robustness() -> list[str]:
     return fails
 
 
+# ---- ADR-0008 路径口径:file 字段归一 + verification 简报指针 ----
+
+def test_normalize_file_paths() -> list[str]:
+    """normalize_file_paths 三态:逻辑路径且 extracted/ 下存在 → 补前缀;
+    已是工具路径前缀 → 不动;指向不存在的文件 → 保持原样(不猜)。"""
+    from firmware_audit.step5_agent.aggregator import normalize_file_paths
+
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "extracted" / "unitree" / "module").mkdir(parents=True)
+        (root / "extracted" / "unitree" / "module" / "a.py").write_text("x=1\n",
+                                                                        encoding="utf-8")
+        findings = [
+            {"title": "逻辑路径命中", "file": "unitree/module/a.py"},
+            {"title": "已合规", "file": "extracted/unitree/module/a.py"},
+            {"title": "analysis 形态", "file": "analysis/unitree/bin/a"},
+            {"title": "不存在不猜", "file": "unitree/module/ghost.py"},
+            {"title": "空 file", "file": ""},
+            "不是 dict 的项",
+        ]
+        changed = normalize_file_paths(findings, root)
+        if changed != 1:
+            fails.append(f"应恰好归一 1 条, got {changed}")
+        if findings[0]["file"] != "extracted/unitree/module/a.py":
+            fails.append(f"逻辑路径且存在应补前缀: {findings[0]['file']}")
+        if findings[1]["file"] != "extracted/unitree/module/a.py":
+            fails.append(f"已合规应原样: {findings[1]['file']}")
+        if findings[2]["file"] != "analysis/unitree/bin/a":
+            fails.append(f"analysis 形态应原样: {findings[2]['file']}")
+        if findings[3]["file"] != "unitree/module/ghost.py":
+            fails.append(f"不存在的文件不得猜: {findings[3]['file']}")
+    return fails
+
+
+def test_verify_single_brief_pointers() -> list[str]:
+    """verification 单实例简报指针(ADR-0008):全是工具路径(禁 process/ 前缀)、
+    源文件与 sidecar 均存在性检查、旧逻辑路径 file 也能剥前缀推导 sidecar。"""
+    from firmware_audit.step5_agent.data.prompts import build_verify_single_brief
+
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "extracted" / "unitree" / "module").mkdir(parents=True)
+        (root / "extracted" / "unitree" / "module" / "a.py").write_text("x=1\n",
+                                                                        encoding="utf-8")
+        (root / "analysis" / "unitree" / "module").mkdir(parents=True)
+        (root / "analysis" / "unitree" / "module" / "a.py.text.json").write_text(
+            '{"findings": []}', encoding="utf-8")
+        # 工具路径 file:源文件指针 + sidecar 指针,零 process/ 前缀
+        brief = build_verify_single_brief(root, {
+            "title": "t", "file": "extracted/unitree/module/a.py"})
+        if "process/" in brief:
+            fails.append(f"简报不得含 process/ 前缀指针: {brief[:200]}")
+        if "- extracted/unitree/module/a.py" not in brief:
+            fails.append(f"应注入存在的源文件指针: {brief[:200]}")
+        if "- analysis/unitree/module/a.py.text.json" not in brief:
+            fails.append(f"应注入存在的 sidecar 指针: {brief[:200]}")
+        # ELF(无 extracted 源文件,只有边车):不给假源文件指针,sidecar 照给
+        bin_dir = root / "analysis" / "unitree" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "svc.c").write_text("int g(){}", encoding="utf-8")
+        brief2 = build_verify_single_brief(root, {
+            "title": "t2", "file": "unitree/bin/svc"})
+        if "- extracted/unitree/bin/svc" in brief2:
+            fails.append(f"不存在的源文件不得注入指针: {brief2[:200]}")
+        if "- analysis/unitree/bin/svc.c" not in brief2:
+            fails.append(f"逻辑路径 file 应剥前缀后命中 sidecar: {brief2[:200]}")
+        # 全都不存在:不给指针段
+        brief3 = build_verify_single_brief(root, {
+            "title": "t3", "file": "extracted/no/such.py"})
+        if "相关工件指针" in brief3:
+            fails.append(f"无任何存在工件时不应给指针段: {brief3[:200]}")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -2156,6 +2232,8 @@ def test_main() -> int:
         ("report_reconciliation_integration", test_report_reconciliation_integration),
         ("orchestrator_prompt_reconcile_redlines", test_orchestrator_prompt_reconcile_redlines),
         ("reconcile_edge_robustness", test_reconcile_edge_robustness),
+        ("normalize_file_paths", test_normalize_file_paths),
+        ("verify_single_brief_pointers", test_verify_single_brief_pointers),
     ]:
         fl = fn()
         if fl:

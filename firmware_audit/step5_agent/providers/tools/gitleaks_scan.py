@@ -10,7 +10,8 @@ import json
 import shlex
 
 from .base import AgentTool, ToolResult
-from .cli_base import EXTRACTED_MOUNT, container_path, run_in_sandbox
+from .cli_base import (EXTRACTED_MOUNT, container_path, extracted_tool_path,
+                       run_in_sandbox)
 
 
 def build_gitleaks_cmd(source: str) -> str:
@@ -76,16 +77,19 @@ class GitleaksScanTool(AgentTool):
         if not isinstance(findings, list):
             return ToolResult(ok=False, text="", error=f"gitleaks 报告结构异常: {type(findings)}")
 
+        # 路径换算成工具路径(ADR-0008):报告 File 是容器挂载根相对口径,
+        # LLM 会照抄进 findings.file,必须在输出层统一 extracted/ 前缀
         lines = [f"{path} 命中 {len(findings)} 处密钥泄露:"]
         for f in findings[:60]:
             rule = f.get("RuleID", "?")
-            fp = f.get("File", "?")
+            fp = extracted_tool_path(path, f.get("File", "?"))
             line = f.get("StartLine", 0)
             secret = f.get("Secret", "")
             masked = (secret[:4] + "*" * 8) if len(secret) > 4 else "****"
             lines.append(f"[{rule}] {fp}:{line}  {masked}")
         return ToolResult(ok=True,
                           text="\n".join(lines),
-                          data=[{"rule": f.get("RuleID"), "file": f.get("File"),
+                          data=[{"rule": f.get("RuleID"),
+                                 "file": extracted_tool_path(path, f.get("File", "?")),
                                  "line": f.get("StartLine"), "secret": f.get("Secret")}
                                 for f in findings[:200]])

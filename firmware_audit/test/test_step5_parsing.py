@@ -337,20 +337,33 @@ def test_semgrep_exit_whitelist(ctx) -> list[str]:
         if not r.ok or r.data != []:
             fails.append(f"rc=0 无命中: {r.error or r.data}")
 
-    # rc=1 有命中(退出码白名单),重复结果按 (cid,path,line) 去重
+    # rc=1 有命中(退出码白名单),重复结果按 (cid,path,line) 去重。
+    # 双扫后 run_in_sandbox 被调两次,假件按路区分:extracted 路给命中,
+    # analysis C 路(--include)给空——命中只来自一路,去重语义不变。
+    import firmware_audit.step5_agent.providers.tools.semgrep_scan as ss2
     results = [
         {"check_id": "cmd-inject", "path": "a.py", "start": {"line": 1},
          "extra": {"severity": "ERROR", "message": "os.system user input"}},
         {"check_id": "cmd-inject", "path": "a.py", "start": {"line": 1},
          "extra": {"severity": "ERROR", "message": "dup"}},
     ]
-    with _mk_tool("semgrep_scan", "SemgrepScanTool", ctx,
-                  (1, json.dumps({"results": results}), "")) as t2:
+
+    def leg_aware_run(args, entrypoint, ctx, timeout=300, extra_mounts=None):
+        if "--include" in args:
+            return 0, json.dumps({"results": []}), ""
+        return 1, json.dumps({"results": results}), ""
+
+    orig2 = ss2.run_in_sandbox
+    ss2.run_in_sandbox = leg_aware_run
+    try:
+        t2 = ss2.SemgrepScanTool(ctx)
         r2 = t2.execute(path=".")
         if not r2.ok:
             fails.append(f"rc=1 有命中应 ok(白名单): {r2.error}")
         elif r2.text.count("cmd-inject") != 1:
             fails.append(f"text 应去重: {r2.text}")
+    finally:
+        ss2.run_in_sandbox = orig2
 
     # rc=2 错误
     with _mk_tool("semgrep_scan", "SemgrepScanTool", ctx,
@@ -535,7 +548,7 @@ def test_recon_brief_appends_overview() -> list[str]:
             json.dumps([{"rel_path": "unitree/bin/idlc", "type": "elf_exec"}]),
             encoding="utf-8")
         brief = build_recon_brief(root)
-        if "process/analysis/ 下共 1 个二进制" not in brief:
+        if "analysis/ 下共 1 个二进制" not in brief:
             fails.append(f"analysis 索引缺失: {brief[:80]}")
         if "过滤后目录概览" not in brief:
             fails.append("应追加过滤概览")
@@ -547,10 +560,10 @@ def test_semgrep_sdk_exclude(ctx) -> list[str]:
     import firmware_audit.step5_agent.providers.tools.semgrep_scan as ss
     from firmware_audit.step5_agent.providers.tools.cli_base import EXTRACTED_MOUNT
     fails: list[str] = []
-    captured: dict = {}
+    calls: list[list[str]] = []
 
     def fake_run_in_sandbox(args, entrypoint, ctx, timeout=300, extra_mounts=None):
-        captured["args"] = list(args)
+        calls.append(list(args))
         return 0, '{"results": []}', ""
 
     orig = ss.run_in_sandbox
@@ -559,12 +572,14 @@ def test_semgrep_sdk_exclude(ctx) -> list[str]:
         r = ss.SemgrepScanTool(ctx).execute(path=".")
         if not r.ok:
             fails.append(f"semgrep path=. 执行失败(应 mock 无障): {r.error}")
-        args = captured.get("args", [])
-        # sdk_exclude_flags 产出 "--exclude" + 值 两段(空格形态);断言首条 SDK 命中
-        if "--exclude" not in args:
-            fails.append("无任何 --exclude")
-        elif f"{EXTRACTED_MOUNT}/usr/local/lib" not in args:
-            fails.append(f"缺 SDK 排除目标 {EXTRACTED_MOUNT}/usr/local/lib; args={args}")
+        # 双扫(2026-09-04):extracted 路带 SDK --exclude;analysis C 路不带
+        ex_legs = [a for a in calls if "--exclude" in a]
+        if not ex_legs:
+            fails.append(f"无任何 --exclude(共 {len(calls)} 路调用)")
+        elif not any(f"{EXTRACTED_MOUNT}/usr/local/lib" in a for a in ex_legs):
+            fails.append(f"缺 SDK 排除目标 {EXTRACTED_MOUNT}/usr/local/lib")
+        if len(calls) != 2:
+            fails.append(f"path=. 应双扫两路(extracted+analysis),实际 {len(calls)} 路")
     finally:
         ss.run_in_sandbox = orig
     return fails

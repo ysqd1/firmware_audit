@@ -206,13 +206,17 @@ _KNOWN_SUFFIXES = (".strings.json", ".imports.json", ".functions.json", ".c", ".
 def resolve_analysis_file(ctx: ToolContext, file_ref: str, suffix: str) -> Path | None:
     """file_ref → process/analysis/<rel><suffix>,宽容解析,找不到返回 None。
 
-    接受引用:rel_path("unitree/bin/idlc")、误带后缀("idlc.c")。
+    接受引用:rel_path("unitree/bin/idlc")、误带后缀("idlc.c")、
+    前缀工具路径("extracted/unitree/bin/idlc"——ADR-0008 后 file 字段统一
+    工具路径,剥前缀再解析;"analysis/unitree/x.c"——semgrep C 双扫命中的
+    file 本身在 analysis 树下,剥掉后指向同树内边车/源文件)。
     安全约束(2026-08-27):解析后必须仍位于 process/analysis/ 之下——
     拒绝绝对路径与 .. 越界,防 Agent(或被污染的 file_ref)借 find/query 系列
     工具任意读宿主文件。越界一律返回 None。
     """
     base = (ctx.process_dir / "analysis").resolve()
-    ref = file_ref.strip().replace("\\", "/")
+    ref = (file_ref.strip().replace("\\", "/")
+           .removeprefix("extracted/").removeprefix("analysis/"))
     for ext in _KNOWN_SUFFIXES:
         if ref.endswith(ext):
             ref = ref[: -len(ext)]

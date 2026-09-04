@@ -21,7 +21,7 @@ FINDING_SCHEMA_DOC = """{
     {
       "title": "<发现标题>",
       "severity": "critical|high|medium|low|info",
-      "file": "<相对路径,如 unitree/bin/idlc>",
+      "file": "<工具路径,extracted/ 开头,如 extracted/unitree/bin/idlc>",
       "func": "<函数名,未知留空>",
       "addr": "<地址,未知留空>",
       "evidence": "<证据:字符串值/导入名/代码片段/checksec 结果>",
@@ -63,25 +63,28 @@ AGENT_DISCIPLINE = """纪律(违反会被系统拦截或强制干预):
 - 截断可回读: Observation 被截断时按末尾提示用 read_file 分页取回原文,不要凭截断片段推断被省略的内容
 - 预算优先级: 迭代有限,优先 critical/high 与网络可达入口;SDK 库/低危信号靠后,单个疑点最多 3-4 轮取证"""
 
-ANALYSIS_DIR_DOC = """工作区锚点:
-- process/analysis/<rel>/<name>.c           反编译 C(Step4 产出)
-- process/analysis/<rel>/<name>.imports.json  导入表 [{name, address, ref_count, call_sites}]
-- process/analysis/<rel>/<name>.strings.json  字符串 {strings: [{address, value, refs}]}
-- process/analysis/<rel>/<name>.functions.json 函数表 [{name, address, callers, callees}]
-- 工具参数里的 file 用相对路径(不含后缀),如 unitree/bin/idlc
-- **原始脚本/配置源码可读**: process/extracted/<相对路径> 下是固件原文件(.py/.sh/.conf 等),
-  用 read_file 以 "extracted/<相对路径>" 读取,如 {"path": "extracted/unitree/module/net_switcher/net_switcher.py"};
+ANALYSIS_DIR_DOC = """工作区锚点(所有路径都是**工具路径**——相对工作区根,不以 process/ 开头;ADR-0008):
+- analysis/<rel>/<name>.c           反编译 C(Step4 产出)
+- analysis/<rel>/<name>.imports.json  导入表 [{name, address, ref_count, call_sites}]
+- analysis/<rel>/<name>.strings.json  字符串 {strings: [{address, value, refs}]}
+- analysis/<rel>/<name>.functions.json 函数表 [{name, address, callers, callees}]
+- find_decompiled_function/strings_query/imports_query 的 file_ref 是 analysis/ 下的
+  相对路径(不含后缀),如 unitree/bin/idlc(不带 extracted/ 前缀,传了也会被宽容解析)
+- **原始脚本/配置源码可读**: extracted/<相对路径> 下是固件原文件(.py/.sh/.conf 等),
+  用 read_file 读取,如 {"path": "extracted/unitree/module/net_switcher/net_switcher.py"};
   semgrep/gitleaks 命中的 py 文件都这样复核源码(不要传绝对路径,会被路径越界拒绝)
-- process/agent/ 下跨 agent 工件按链传递: survey.json → findings.json → verified_findings.json;
+- agent/ 下跨 agent 工件按链传递: survey.json → findings.json → verified_findings.json;
   各文件实际路径以任务简报注入的为准(编排模式下位于 agent/<seq>_<type>/ 子目录;
   recon v3 工件名 survey.json,不再有旧 attack_surface.json 命名),
   简报没给路径时用 list_files 枚举 agent/ 目录确认,不要猜路径
-- list_files 可枚举任意 process/ 子目录(extracted/ 或 analysis/),铺面/定位文件均可用
+- list_files 可枚举任意工作区子目录(extracted/ 或 analysis/),铺面/定位文件均可用
+- **finding 的 file 必须写工具路径(extracted/ 开头)**,与 read_file 的 path 同口径,
+  照抄 search_code/semgrep/gitleaks 命中的路径即可,不要自行剥前缀
 
 函数命名规则(工具衔接,重要——用错名必失败):
 - find_decompiled_function 只认 Ghidra 命名: 真实符号名(如 main/CallSystem)或 FUN_<8位十六进制地址>
 - xref_query 返回 r2 命名: fcn.<hex> 或 mangled C++ 方法名,**不能直接**传给 find_decompiled_function
-- 从 xref 结果定位函数体的正确路径: read_file 读 process/analysis/<rel>/<name>.functions.json,
+- 从 xref 结果定位函数体的正确路径: read_file 读 analysis/<rel>/<name>.functions.json,
   按 callees 包含目标危险函数(system/popen/strcpy 等)反查真实函数名;该条目的 address 字段去掉 0x 补齐 8 位即 FUN_ 名
 - 禁止手工换算或拼凑函数名(如给 fcn.<hex> 加减基址猜 FUN_ 名,极易差一位导致反复失败);
   functions.json 里查不到对应函数就放弃该取证路径并如实记录"""
@@ -105,10 +108,10 @@ SURVEY_SCHEMA_DOC = """{
     {"name": "busybox", "version": "1.34", "cve": ["CVE-2021-xxxx"], "source": "cve_bin_tool_scan"}
   ],
   "entry_points": [
-    {"file": "etc/init.d/lighttpd", "reason": "web/cgi 入口"}
+    {"file": "extracted/etc/init.d/lighttpd", "reason": "web/cgi 入口"}
   ],
   "high_risk_areas": [
-    {"file": "unitree/bin/idlc", "metric": "注入模式命中", "detail": "semgrep R2 @ unitree/bin/idlc:42"}
+    {"file": "extracted/unitree/bin/idlc", "metric": "注入模式命中", "detail": "semgrep R2 @ extracted/unitree/bin/idlc:42"}
   ],
   "recommended_actions": [
     {"priority": "high", "action": "对 <file> 用 <工具> 取证,关注 <疑点>"}
@@ -124,7 +127,7 @@ RECON_SYSTEM = f"""## 1 角色与使命
 
 ## 3 输入与输出
 - 输入:全量工作区(extracted/ 原文件 + analysis/ Step4 产物),经 list_files/read_file/扫描工具访问
-- 输出:process/agent/<seq>_recon/survey.json(v3,无 findings/判级字段);结构模板见 ## 5
+- 输出:agent/<seq>_recon/survey.json(v3,无 findings/判级字段);结构模板见 ## 5
 
 ## 4 执行流程
 疑点优先级(从高到低,迭代预算按此分配,每类抓大放小):
@@ -137,7 +140,7 @@ RECON_SYSTEM = f"""## 1 角色与使命
 1. 首动用 list_files 枚举目录: directory="." 看顶层结构,按优先级下钻各目录
    (recursive=true 时 SDK/系统库目录已被自动排除);对重点脚本/配置文件用 read_file 抽查
 2. 重点二进制: cve_bin_tool_scan 识别组件与已知 CVE(版本/CVE 只收它 Observation 里的实况)
-3. 脚本目录: semgrep_scan 扫命令注入/SQL 注入/反序列化模式;gitleaks_scan 扫硬编码密钥
+3. 脚本目录: semgrep_scan 扫命令注入/SQL 注入/反序列化模式('.' 同时扫反编译 C 的危险调用形态);gitleaks_scan 扫硬编码密钥
    —— 命中只进 high_risk_areas(file+line 观察点),不展开证据链
 4. 不透明 .bin: binwalk_rescan 看内部是否藏嵌套容器(squashfs/cpio/gzip);只识别签名,不解包
 5. 汇总: 弱保护/危险函数热点/硬编码疑点/带 CVE 组件分类写入 high_risk_areas + components
@@ -152,7 +155,8 @@ Final Answer 为 survey.json 结构(schema_version=3,严格按此模板,无 find
 - components[]: 只收 cve_bin_tool_scan Observation 真实出现的组件名与版本串;
   版本识别不出就留空,禁止按文件名猜版本;cve 列表只填实际命中的 CVE,禁止凭记忆补 CVE
 - entry_points[]: 监听服务/web/cgi/守护进程入口(file+reason)
-- high_risk_areas[]: 高危区域标记(观察点,非判定);file 必须来自工具 Observation 原文,
+- high_risk_areas[]: 高危区域标记(观察点,非判定);file 必须来自工具 Observation 原文
+  (semgrep/gitleaks 命中已是 extracted/ 开头的工具路径,照抄即可;其他来源需补前缀),
   metric 用"弱势二进制保护|硬编码密钥|注入模式命中|危险函数邻近",detail 附 Observation 原文片段(file+line)
 - recommended_actions[]: 给 analysis 的扫描建议(priority=high|medium|low)
 
@@ -193,12 +197,12 @@ ANALYSIS_SYSTEM = f"""## 1 角色与使命
 
 ## 3 输入与输出
 - 输入:上游 recon 的 survey.json(简报已给摘要,细节用 read_file 分页拉取)——v3 无判级字段,由你判级
-- 输出:process/agent/<seq>_analysis/findings.json(findings 容器,结构模板见 ## 5)
+- 输出:agent/<seq>_analysis/findings.json(findings 容器,结构模板见 ## 5)
 
 ## 4 执行流程
 取证流程(每个疑点独立走完再换下一个):
 1. 读 survey.json: 按可达性与风险排序——网络入口与 recommended_actions 的 high/medium 优先,SDK 库误报高发区放后
-2. 定位代码: 先 search_code 按关键词/正则全局定位(边车索引覆盖 ELF 字符串/导入,extracted 文本按行 grep,一次拿全命中文件与行);再用 find_decompiled_function 看可疑函数逻辑 → xref_query 查调用链(入口可达性)→ imports_query/strings_query 补充上下文
+2. 定位代码: 先 search_code 按关键词/正则全局定位(边车索引覆盖 ELF 字符串/导入,extracted+analysis 文本按行 grep——缺省 '.' 即全部审计内容,一次拿全命中文件与行);再用 find_decompiled_function 看可疑函数逻辑 → xref_query 查调用链(入口可达性)→ imports_query/strings_query 补充上下文
 3. 判定三问(每问都要有 Observation 支撑):
    a. 危险操作真实存在?(反编译里确有 system/strcpy/拼接,而非同名符号或字符串)
    b. 外部可控?(参数来自网络输入/配置/命令行,而非编译期常量)
@@ -251,7 +255,7 @@ VERIFY_SYSTEM = f"""## 1 角色与使命
 
 ## 3 输入与输出
 - 输入:任务简报注入的**单条候选 finding**(含 title/severity/file/func/addr/evidence/confidence)与相关工件指针;细节用 read_file 按指针分页拉取
-- 输出:process/agent/<seq>_verification/verified_findings.json——**这一条 finding**(title/file 不得改)带 verified/rationale,结构见 ## 5
+- 输出:agent/<seq>_verification/verified_findings.json——**这一条 finding**(title/file 不得改)带 verified/rationale,结构见 ## 5
 
 ## 4 执行流程
 复核这一条 finding(独立判断):
@@ -313,7 +317,7 @@ Final Answer 的 JSON 结构(verified/rationale 是本阶段必填字段;**title
 Thought: 先按 finding 的 file 验证工件
 Action: read_file
 Action Input: {{"path": "<简报注入的工件指针>", "offset": 0, "limit": 200}}
-(简报没给指针时按 finding 的 file 推导 process/analysis/<rel>/ 下 sidecar,或先 list_files 枚举 agent/ 目录)
+(简报没给指针时按 finding 的 file 推导 analysis/<rel>/ 下 sidecar,或先 list_files 枚举 agent/ 目录)
 ❌ 错误形态(均禁止):
 - **Thought:** 复核开始(**Markdown 加粗**)
 - <Thought>复核</Thought>(XML 角括号包裹)
@@ -380,7 +384,7 @@ def build_filtered_overview(process_dir: Path, max_dirs: int = 15) -> str:
     """
     fi = process_dir / "fileinfo.json"
     if not fi.is_file():
-        return ("提示: process/fileinfo.json 缺失(未跑 Step2 或早期工作区)。"
+        return ("提示: fileinfo.json 缺失(工作区根,未跑 Step2 或早期工作区)。"
                 "需要目录概览请用 read_file 列 extracted;"
                 "注意 usr/local/lib、usr/lib 等 SDK/系统库目录低价值、优先跳过。")
     try:
@@ -525,7 +529,7 @@ def build_recon_brief(process_dir: Path, max_entries: int = 120) -> str:
     analysis = process_dir / "analysis"
     if not analysis.is_dir():
         base = (survey_head or ("任务:侦察固件攻击面。\n"  # noqa: MEM201 条件分支,不可提前拼接
-                                "(process/analysis/ 不存在——先确认 Step1-4 已跑完。)\n\n"))
+                                "(analysis/ 不存在——先确认 Step1-4 已跑完。)\n\n"))
         return base + build_filtered_overview(process_dir)
 
     groups: dict[str, list[str]] = {}
@@ -540,7 +544,7 @@ def build_recon_brief(process_dir: Path, max_entries: int = 120) -> str:
         rel = p.relative_to(analysis).as_posix()
         groups.setdefault(rel[: -len(".strings.json")], []).append("strings")
 
-    lines = [f"任务:侦察固件攻击面。process/analysis/ 下共 {len(groups)} 个二进制的工件:"]
+    lines = [f"任务:侦察固件攻击面。analysis/ 下共 {len(groups)} 个二进制的工件:"]
     for stem in sorted(groups):
         kinds = " ".join(sorted(groups[stem]))
         has_c = (analysis / (stem + ".c")).is_file()
@@ -646,24 +650,39 @@ def build_verify_single_brief(process_dir: Path, finding: dict) -> str:
     """verification 单实例简报(extra_brief):单条 finding 全字段 + 相关工件指针。
 
     上下文隔离铁律(ADR-0003):每实例只装这一条 finding 与其工件指针,不传对话
-    历史/其他 findings;工件指针列出该 file 在 process/analysis/ 下的 sidecar,
-    LLM 用 read_file 按相对 process/ 路径分页拉取细节。
+    历史/其他 findings。指针一律工具路径(ADR-0008),且经存在性检查——LLM
+    照抄指针必能打开,不再自行推导路径(2026-09-03:旧版指针带 process/ 前缀
+    导致实例 6 连撞 6 次"文件不存在"烧光预算)。
+
+    file 两种合法来源(2026-09-04):extracted/ 前缀(固件源/ELF,rel 用于
+    推导边车)与 analysis/ 前缀(semgrep C 双扫命中,指向的 .c 本身就是工件,
+    直接作为指针,不再推导边车)。
     """
-    rel = str(finding.get("file", "") or "").replace("\\", "/")
+    raw = str(finding.get("file", "") or "").replace("\\", "/").strip()
     lines = [
         "--- 待复核 finding(单条,本实例唯一对象) ---",
         json.dumps(finding, ensure_ascii=False, indent=2),
     ]
-    if rel:
-        ana = process_dir / "analysis"
-        pointers = [
-            f"- process/analysis/{rel}{suf}"
-            for suf in (".c", ".imports.json", ".strings.json", ".functions.json")
-            if (ana / f"{rel}{suf}").is_file()
-        ]
-        if pointers:
-            lines.append("相关工件指针(用 read_file 按相对 process/ 路径读取):")
-            lines.extend(pointers)
+    if raw.startswith("analysis/"):
+        if (process_dir / raw).is_file():
+            lines.append("相关工件指针(用 read_file 按此路径读取):")
+            lines.append(f"- {raw}")
+    else:
+        rel = raw.removeprefix("extracted/")
+        if rel:
+            pointers = []
+            if (process_dir / "extracted" / rel).is_file():
+                pointers.append(f"- extracted/{rel}")
+            ana = process_dir / "analysis"
+            pointers += [
+                f"- analysis/{rel}{suf}"
+                for suf in (".c", ".imports.json", ".strings.json",
+                            ".functions.json", ".text.json")
+                if (ana / f"{rel}{suf}").is_file()
+            ]
+            if pointers:
+                lines.append("相关工件指针(用 read_file 按此路径读取):")
+                lines.extend(pointers)
     lines.append("输出: Final Answer 输出**这一条 finding**(title/file 不得改)并附"
                  "verified + rationale,不允许换成别的 finding 或静默丢弃。")
     return "\n".join(lines)

@@ -41,7 +41,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
-from .aggregator import FindingAggregator
+from .aggregator import FindingAggregator, normalize_file_paths
 from .data.artifacts import load_artifact, load_survey
 from .data.prompts import build_system_prompt, build_verify_single_brief, save_system_prompt
 from .engine.display import make_display
@@ -475,6 +475,11 @@ class DispatchAgentTool(AgentTool):
             for f in loaded.get("findings", []) or []:
                 if isinstance(f, dict) and f.get("instance_seq") is None:
                     f["instance_seq"] = seq
+            if agent == "analysis":
+                # file 字段归一成工具路径(ADR-0008,LLM 回退逻辑路径时兜底);
+                # verification 不归一——title/file 不得改是它的硬纪律
+                normalize_file_paths(loaded.get("findings", []) or [],
+                                     orch.process_dir)
             try:  # noqa: SIM105 —— 保留 try-except:回填失败语义(pass + 注释)是明确意图
                 ares.artifact_path.write_text(
                     json.dumps(loaded, ensure_ascii=False, indent=2),

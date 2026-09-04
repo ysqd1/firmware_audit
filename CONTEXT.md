@@ -34,6 +34,14 @@ _Avoid_: 产出文件, 中间文件
 Step4 在 `process/analysis/` 下按文件相对路径产出的反编译 C 与程序信息 JSON(`.c / .functions.json / .imports.json / .symbols.json / .strings.json / .text.json / .meta.json`)——Agent 阶段读盘类工具(strings_query/imports_query/find_decompiled_function)的数据源。
 _Avoid_: 边车文件(实现细节), 反编译产物
 
+**工具路径 (tool path)**:
+相对工作区 `process/` 根的路径(`extracted/unitree/...`、`analysis/...`、`agent/...`)——LLM 工具(read_file/list_files/search_code)**唯一接受的入参形态**,也是 Agent 工件(survey/high_risk_areas、findings/verified_findings)中 file 字段的**唯一规范口径**(ADR-0008)。
+_Avoid_: process/ 前缀形态(`process/analysis/...` 没有任何工具能打开), 相对路径(歧义:相对谁)
+
+**逻辑路径 (logical path)**:
+相对固件根的路径(`unitree/...`,与 fileinfo.json 的 rel_path、analysis 边车命名同构)——**纯内部键**,只存在于 Step0-4 代码与 CLI 工具(semgrep/gitleaks)的原始容器输出里;进入任何 Agent 工件或工具入参前必须换算成工具路径。
+_Avoid_: 固件路径, 物理路径
+
 **文档声明(requirements.md / rules.md / agents.md)**:
 `requirements.md` 是 Step5 需求文档,`rules.md` 是代码规范铁律,`agents.md` 是 Agent 架构与工具层设计。这三份文档里的**部分条款已过时**,与代码现状不一致处以下文术语表和代码为准。
 _Avoid_: 把它们当现状说明书

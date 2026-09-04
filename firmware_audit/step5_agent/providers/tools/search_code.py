@@ -62,16 +62,17 @@ def _is_text(path: Path) -> bool:
 class SearchCodeTool(AgentTool):
     name = "search_code"
     description = ("按内容搜索关键词/正则,命中即 Observation 证据。双路混合:"
-                   "①ELF 字符串/导入/文本扫描边车(process/analysis/*.json);"
-                   "②extracted/ 文本文件按行 grep(自动跳过二进制与 SDK 目录)。"
-                   "返回 文件:锚点 命中行,可直接 read_file 回查。")
+                   "①ELF 字符串/导入/文本扫描边车(analysis/*.json);"
+                   "②文本文件按行 grep(extracted/ + analysis/ 并集,自动跳过"
+                   "二进制与 SDK 目录)。返回 文件:锚点 命中行,可直接 read_file 回查。")
     params = {
         "keyword": {"type": "str", "required": True,
                     "desc": "搜索关键词(非空);is_regex=True 时视为正则"},
         "file_pattern": {"type": "str", "default": "", "desc": "文件名 glob 过滤(仅文本 grep 路)"},
         "directory": {"type": "str", "default": "",
-                      "desc": "收窄搜索目录(相对 process/,默认 extracted/;"
-                              "根目录、agent/、.cve_cache 不可搜索)"},
+                      "desc": "收窄搜索目录(默认/.=extracted+analysis 全部审计内容;"
+                              "子目录如 extracted/unitree 或 analysis/unitree;"
+                              "agent/、.cve_cache 不可搜索)"},
         "is_regex": {"type": "bool", "default": False, "desc": "keyword 是否按正则解释"},
         "max_results": {"type": "int", "default": MAX_RESULTS_DEFAULT,
                         "desc": f"结果上限(≤{MAX_RESULTS_CAP})"},
@@ -96,7 +97,7 @@ class SearchCodeTool(AgentTool):
         root = self.ctx.process_dir.resolve()
         # 范围守卫先行(2026-09-03 code-review 补):被守卫拒绝的 directory
         # 无条件报错——不能因边车命中已满 max_results 跳过守卫检查(绕过漏洞)
-        scope, scope_err = self._resolve_scope(root, directory)
+        scopes, scope_err = self._resolve_scope(root, directory)
         if scope_err:
             return ToolResult(ok=False, text="", error=scope_err)
         matches: list[dict] = []            # {path, anchor, text}
@@ -108,14 +109,24 @@ class SearchCodeTool(AgentTool):
                             "text": (content or "").strip()[:160]})
             return len(matches) >= n
 
-        # ---- ① 边车索引路(总是扫 analysis/,快且幂等) ----
+        # ---- ① 边车索引路(边车全是 analysis 树产物;受范围收窄约束) ----
+        # 默认/并集(含 analysis)→ 全量;收窄到 extracted → 无边车可扫;
+        # 收窄到 analysis 子树 → 只扫该子树下的边车(2026-09-04 code-review:
+        # 旧版无视收窄,directory="extracted/..." 仍返回 analysis 边车命中)
         analysis_dir = root / "analysis"
-        if analysis_dir.is_dir():
+        sidecar_scopes = [s for s in (scopes or [])
+                          if s == analysis_dir or analysis_dir in s.parents]
+        if sidecar_scopes and analysis_dir.is_dir():
             for suffix in _SIDECARS:
                 # 按文件大小升序:小边车(imports/text)先扫,命中/无命中更快止损;
                 # 大字符串表放最后,避免无命中时先读超大文件
                 files = sorted(analysis_dir.rglob(f"*{suffix}"),
                                key=lambda p: p.stat().st_size)
+                if any(s != analysis_dir for s in sidecar_scopes):
+                    # 子树收窄:边车必须落在某个收窄范围内
+                    files = [p for p in files
+                             if any(s == p or s in p.parents
+                                    for s in sidecar_scopes)]
                 for p in files:
                     searched["sidecar"] += 1
                     if self._match_sidecar(p, suffix, pat, root, push):
@@ -123,13 +134,17 @@ class SearchCodeTool(AgentTool):
                 if len(matches) >= n:
                     break
 
-        # ---- ② 文本 grep 路(directory 收窄;默认 extracted/) ----
-        # scope 已在守卫段解析:scope=None 且 scope_err=None → 越界/不存在,
-        # 按既有语义(默认 extracted/ 缺失静默跳过;显式 directory 且无
-        # 命中明确报错,防静默空结果)
+        # ---- ② 文本 grep 路(directory 收窄;默认/. = 全内容并集) ----
+        # scopes 已在守卫段解析:scopes=[] 且无 err → 越界/不存在,
+        # 按既有语义(默认子树缺失静默跳过;显式 directory 且无命中明确
+        # 报错,防静默空结果)
         if len(matches) < n:
-            if scope is not None:
-                self._grep_text(scope, file_pattern, pat, root, push, searched)
+            if scopes:
+                for scope in scopes:
+                    self._grep_text(scope, file_pattern, pat, root, push,
+                                    searched)
+                    if len(matches) >= n:
+                        break
             elif directory and not matches:
                 return ToolResult(
                     ok=False, text="",
@@ -192,37 +207,50 @@ class SearchCodeTool(AgentTool):
     # ---- 文本 grep ----
 
     def _resolve_scope(self, root: Path,
-                       directory: str) -> tuple[Path | None, str | None]:
-        """grep 范围解析。返回 (scope, 拒绝原因)。
+                       directory: str) -> tuple[list[Path], str | None]:
+        """grep 范围解析。返回 (scopes, 拒绝原因)。
 
-        - scope=None 且原因=None → 目录越界/不存在,调用方按既有语义处理
-          (显式 directory 且无命中时报错,默认 extracted/ 缺失时静默跳过)
-        - scope=None 且原因非空 → 范围被守卫拒绝,调用方必须报错
+        - scopes 为空列表且原因=None → 目录越界/不存在,调用方按既有语义
+          处理(显式 directory 且无命中时报错,默认子树缺失时静默跳过)
+        - 原因非空 → 范围被守卫拒绝,调用方必须报错
 
-        守卫三类范围(2026-09-03 target/1 卡死根因修复):
-        根目录自身(".")按 C4 containment 语义合法但范围过大——会把
-        .cve_cache(cve-bin-tool 预热缓存卷,10万+ json/yml,全在 _TEXT_EXTS
-        白名单)卷进逐文件 grep,实测数十分钟无输出;agent/ 是运行工件
-        (transcript/obs/终端转储),grep 它会命中 Agent 自己的日志,证据污染。
+        范围语义(2026-09-04 重定义,ADR-0008 延伸):默认与根目录("."
+        及一切解析到工作区根的形态)= **extracted/ + analysis/ 全部审计
+        内容并集**——白名单并集替代黑名单拒绝,缓存卷与运行工件天然在
+        范围外(2026-09-03 卡死的 .cve_cache 结构上不可达);显式子目录
+        在两棵内容树下解析;agent/ 与 .cve_cache/ 显式指定仍拒绝。
         """
-        ref = (directory or "extracted").replace("\\", "/").strip("/")
-        target = resolve_within(root, ref) if ref else root
-        if target is None:
-            return None, None
-        if target == root:
-            return None, (f"目录不可搜索: {directory} (根目录会把 "
-                          ".cve_cache 缓存卷整个卷进 grep;请指定 extracted/ "
-                          "或其子目录)")
-        rel = target.relative_to(root).as_posix()
-        if rel == "agent" or rel.startswith("agent/"):
-            return None, (f"目录不可搜索: {directory} (agent/ 是运行工件,"
-                          "搜索会命中 Agent 自身日志;请指定 extracted/ 或"
-                          "其子目录)")
-        if rel == ".cve_cache" or rel.startswith(".cve_cache/"):
-            return None, (f"目录不可搜索: {directory} (.cve_cache 是 CVE "
-                          f"缓存卷,10万+ 文件,非固件内容;请指定 extracted/"
-                          " 或其子目录)")
-        return (target if target.is_dir() else None), None
+        ref = (directory or "").replace("\\", "/").strip().strip("/")
+        if ref in ("", ".") or resolve_within(root, ref) == root:
+            return self._content_trees(root), None
+        if ref == "agent" or ref.startswith("agent/"):
+            return [], (f"目录不可搜索: {directory} (agent/ 是运行工件,"
+                        "搜索会命中 Agent 自身日志;请指定 extracted/、"
+                        "analysis/ 或其子目录)")
+        if ref == ".cve_cache" or ref.startswith(".cve_cache/"):
+            return [], (f"目录不可搜索: {directory} (.cve_cache 是 CVE "
+                        f"缓存卷,10万+ 文件,非固件内容;请指定 extracted/"
+                        f" 或 analysis/ 或其子目录)")
+        # 显式子目录:先 extracted 树后 analysis 树,取首个存在的目录。
+        # 判定必须基于**解析后的物理位置** containment(base 在 cand.parents),
+        # 不能只看 ref 字符串前缀——"extracted/../.cve_cache" 前缀合法但
+        # 物理位置在树外(2026-09-04 code-review 实证穿越)。树名本身
+        # ("extracted"/"analysis")即该树根,不得拼成 extracted/extracted。
+        for tree in ("extracted", "analysis"):
+            base = root / tree
+            if ref == tree:
+                return [base], None
+            ref_in_tree = ref if ref.startswith(tree + "/") else f"{tree}/{ref}"
+            cand = resolve_within(root, ref_in_tree)
+            if (cand and cand.is_dir()
+                    and (cand == base or base in cand.parents)):
+                return [cand], None
+        return [], None
+
+    @staticmethod
+    def _content_trees(root: Path) -> list[Path]:
+        """全部审计内容子树(extracted + analysis);缺失的跳过。"""
+        return [d for d in (root / "extracted", root / "analysis") if d.is_dir()]
 
     def _grep_text(self, scope: Path, file_pattern: str, pat, root: Path,
                    push, searched: dict) -> None:

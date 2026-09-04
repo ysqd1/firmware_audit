@@ -12,11 +12,37 @@ findings 聚合(_ingest)与重合计分(_overlap_ratio)不依赖调度/LLM/文�
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # 同一条 finding 的字段:新实例有值且已有为空 → 补;verification 的复核权威字段直接覆盖
 # (ADR-0003:verification 可修改 confidence 与 severity——存疑项降级保留,
 #  故两者均在覆盖集,2026-09-03 补 severity,与 orchestrator 锚点回填对齐防分叉)
 _OVERRIDE_KEYS = ("verified", "rationale", "confidence", "severity")
+
+# 工件 file 字段的工具路径前缀(ADR-0008,已是这些开头视为合规,不再动)
+_TOOL_PATH_PREFIXES = ("extracted/", "analysis/", "agent/")
+
+
+def normalize_file_paths(findings: list, process_dir: Path) -> int:
+    """把 findings 的 file 字段归一成工具路径(ADR-0008,原地修改,返回改动数)。
+
+    LLM 写 findings 时可能回退成逻辑路径(unitree/...)——下游 verification
+    拿它去 read_file 必然"文件不存在",白烧轮次甚至零证据下结论(target/1
+    实测)。三态规则:已是工具路径前缀 → 不动;逻辑路径且 extracted/<file>
+    真实存在 → 补 extracted/ 前缀;其余(指向不存在文件/已是 analysis 形态
+    之外的怪值)保持原样——不猜,留给 verification 的存在性红线判定。
+    """
+    changed = 0
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        rel = str(f.get("file", "") or "").replace("\\", "/").strip().strip("/")
+        if not rel or rel.startswith(_TOOL_PATH_PREFIXES):
+            continue
+        if (Path(process_dir) / "extracted" / rel).is_file():
+            f["file"] = f"extracted/{rel}"
+            changed += 1
+    return changed
 
 
 @dataclass
@@ -103,4 +129,4 @@ class FindingAggregator:
         return hit / len(new_findings)
 
 
-__all__ = ["FindingAggregator"]
+__all__ = ["FindingAggregator", "normalize_file_paths"]

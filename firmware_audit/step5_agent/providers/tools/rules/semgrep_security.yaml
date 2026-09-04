@@ -86,3 +86,45 @@ rules:
     languages: [bash]
     severity: WARNING
     pattern: eval $VAR
+  # ---- C(Step4 反编译代码,semgrep 双扫的 analysis 路,2026-09-04)----
+  # Ghidra 产物变量名怪(local_x/param_x)但调用结构真实,模式规则可咬住;
+  # 命中=疑点信号(危险调用形态),交 xref/find_decompiled_function 复查,
+  # 不是漏洞判决。
+  - id: c-strcpy
+    message: "C strcpy 无界拷贝,源串超长可溢出(反编译疑点信号)"
+    languages: [c]
+    severity: WARNING
+    patterns:
+      - pattern: strcpy($DST, $SRC)
+  - id: c-strcat
+    message: "C strcat 无界追加,可溢出(反编译疑点信号)"
+    languages: [c]
+    severity: WARNING
+    patterns:
+      - pattern: strcat($DST, $SRC)
+  - id: c-sprintf
+    message: "C sprintf 无长度上限写缓冲,可溢出(反编译疑点信号)"
+    languages: [c]
+    severity: WARNING
+    patterns:
+      - pattern: sprintf($BUF, ...)
+  - id: c-gets
+    message: "C gets 无法限长,必为溢出风险(反编译疑点信号)"
+    languages: [c]
+    severity: WARNING
+    patterns:
+      - pattern: gets($BUF)
+  - id: c-system-popen
+    message: "C system/popen 执行外部命令,拼接外部输入可命令注入(反编译疑点信号)"
+    languages: [c]
+    severity: WARNING
+    pattern-either:
+      - pattern: system(...)
+      - pattern: popen(...)
+  - id: c-sscanfi-str
+    message: "C sscanf 以 %s 读取无长度上限,可溢出(反编译疑点信号)"
+    languages: [c]
+    severity: WARNING
+    pattern-either:
+      - pattern: 'sscanf($SRC, "%s", ...)'
+      - pattern: '__isoc99_sscanf($SRC, "%s", ...)'

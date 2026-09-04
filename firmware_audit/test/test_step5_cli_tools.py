@@ -98,6 +98,9 @@ def test_semgrep_scan(tools) -> list[str]:
         fails.append(f"semgrep_scan 失败: {r.error}")
     elif not isinstance(r.data, list):
         fails.append(f"semgrep data 应为 list, got {type(r.data)}")
+    elif r.data and not all(str(m.get("path", "")).startswith("extracted/")
+                            for m in r.data if isinstance(m, dict)):
+        fails.append(f"semgrep 命中路径应带 extracted/ 前缀(ADR-0008): {r.data[:2]}")
     # 越界路径拒绝
     if tools["semgrep_scan"].execute(path="../../etc").ok:
         fails.append("semgrep 越界路径应被拒绝")
@@ -111,6 +114,9 @@ def test_gitleaks_scan(tools) -> list[str]:
         fails.append(f"gitleaks_scan 失败: {r.error}")
     elif not isinstance(r.data, list):
         fails.append(f"gitleaks data 应为 list, got {type(r.data)}")
+    elif r.data and not all(str(m.get("file", "")).startswith("extracted/")
+                            for m in r.data if isinstance(m, dict)):
+        fails.append(f"gitleaks 命中路径应带 extracted/ 前缀(ADR-0008): {r.data[:2]}")
     # 不存在路径 → gitleaks 非零退出,应报错不崩
     r2 = tools["gitleaks_scan"].execute(path="no/such/dir")
     if r2.ok:
@@ -167,6 +173,79 @@ def test_web_search(tools) -> list[str]:
     return fails
 
 
+def test_extracted_tool_path() -> list[str]:
+    """extracted_tool_path(ADR-0008,纯函数):容器报告路径 → extracted/ 前缀
+    工具路径;覆盖相对/带挂载前缀/子目录扫描根/防重复前缀四种形态。"""
+    from firmware_audit.step5_agent.providers.tools.cli_base import extracted_tool_path
+
+    fails: list[str] = []
+    cases = [
+        # (scan_root, reported, 期望)
+        (".", "unitree/bin/idlc", "extracted/unitree/bin/idlc"),
+        ("", "unitree/bin/idlc", "extracted/unitree/bin/idlc"),
+        ("unitree/module", "pet_go/x.py", "extracted/unitree/module/pet_go/x.py"),
+        # semgrep 绝对形态:剥挂载前缀后已含扫描根,不得重复
+        ("unitree/module", "/work/extracted/unitree/module/pet_go/x.py",
+         "extracted/unitree/module/pet_go/x.py"),
+        # 全挂载根形态
+        (".", "/work/extracted/a.py", "extracted/a.py"),
+    ]
+    for root, reported, want in cases:
+        got = extracted_tool_path(root, reported)
+        if got != want:
+            fails.append(f"extracted_tool_path({root!r}, {reported!r}) = {got!r}, 期望 {want!r}")
+    return fails
+
+
+def test_semgrep_dual_scan() -> list[str]:
+    """semgrep 双扫(path="."):extracted 全规则 + analysis 仅 *.c(2026-09-04)。
+    小夹具临时目录(秒级):.py 命中走 extracted/ 前缀,.c 命中走 analysis/
+    前缀且是 C 规则;JSON 边车不被扫。"""
+    import json as _json
+    import tempfile
+    from firmware_audit.docker.docker_utils import docker_available
+    from firmware_audit.step5_agent.providers.tools.cli_base import SANDBOX_IMAGE
+    from firmware_audit.step5_agent.providers.tools.semgrep_scan import SemgrepScanTool
+    from firmware_audit.step5_agent.providers.tools.base import ToolContext
+
+    fails: list[str] = []
+    if not docker_available(SANDBOX_IMAGE):
+        pytest.skip(f"Docker 或镜像 {SANDBOX_IMAGE} 不可用")
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "extracted" / "mod").mkdir(parents=True)
+        (root / "extracted" / "mod" / "a.py").write_text(
+            "import os\nos.system(cmd)\n", encoding="utf-8")
+        (root / "analysis" / "mod").mkdir(parents=True)
+        (root / "analysis" / "mod" / "svc.c").write_text(
+            '#include <string.h>\nvoid f(char* a, char* b){ strcpy(a, b); }\n'
+            'void g(const char* c){ system(c); }\n',
+            encoding="utf-8")
+        (root / "analysis" / "mod" / "noise.json").write_text(
+            _json.dumps({"looks": "like strcpy(a, b) but is json"}), encoding="utf-8")
+        t = SemgrepScanTool(ToolContext(process_dir=root))
+        r = t.execute(path=".")
+        if not r.ok:
+            fails.append(f"双扫应成功: {r.error}")
+            return fails
+        paths = {m.get("path") for m in (r.data or [])}
+        cids = {m.get("check_id") for m in (r.data or [])}
+        if not any(p and p.startswith("extracted/") for p in paths):
+            fails.append(f"应含 extracted/ 前缀命中: {paths}")
+        if not any(p and p.startswith("analysis/") for p in paths):
+            fails.append(f"应含 analysis/ 前缀命中: {paths}")
+        if "rules.c-strcpy" not in cids:
+            fails.append(f"C 规则应命中 strcpy: {cids}")
+        if "rules.c-system-popen" not in cids:
+            fails.append(f"pattern-either 修复后 c-system-popen 应命中: {cids}")
+        if any(p and "noise.json" in p for p in paths):
+            fails.append(f"JSON 边车不得被扫: {paths}")
+        if any(p and "extracted/extracted" in p or "analysis/analysis" in p
+               for p in paths):
+            fails.append(f"路径不得双重前缀: {paths}")
+    return fails
+
+
 def test_main() -> int:
     if not _ready():
         return 0
@@ -180,6 +259,8 @@ def test_main() -> int:
         ("sandbox_verify", lambda: test_sandbox_verify(tools)),
         ("binwalk_rescan", lambda: test_binwalk_rescan(tools)),
         ("web_search", lambda: test_web_search(tools)),
+        ("extracted_tool_path", lambda: test_extracted_tool_path()),
+        ("semgrep_dual_scan", lambda: test_semgrep_dual_scan()),
     ]
     if os.environ.get("STEP5_TEST_CVE_BT") == "1":
         cases.append(("cve_bin_tool_scan", lambda: test_cve_bin_tool_scan(tools)))
