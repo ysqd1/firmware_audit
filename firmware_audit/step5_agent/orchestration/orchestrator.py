@@ -13,7 +13,8 @@
   (ok=False),复跑默认重跑该实例(防"失败被跳过"冒充成功)
 - handoff 快照: 每次真实调度把交接结构化落盘 handoff_<seq>_<type>.json
 - v2 保留: 多次调用(类型+任务唯一性)/严格顺序门/立即留痕 dispatch_log/
-  中断回填 interrupted
+  中断回填 interrupted(调度留痕 T3 起由本包 dispatch_log.DispatchLog 承担,
+  编排层只经 start/finish/interrupted/attempt 四动词消费)
 - 动态分配(2026-08-29,Task6+Task7): 同类型上限 2→3;dispatch/summarize
   Observation 尾部呈现结构化 budget_state(exhausted/steps/pending_focuses/
   overlap_ratio);analysis 预算耗尽且仍有未覆盖疑点时附补跑建议;补跑
@@ -41,6 +42,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
+from .dispatch_log import DispatchLog
 from .reconciliation import reconcile_report
 from ..aggregator import FindingAggregator, normalize_file_paths
 from ..data.artifacts import load_artifact, load_survey
@@ -373,13 +375,13 @@ class DispatchAgentTool(AgentTool):
         # ---- 1) 未知 agent ----
         if agent not in orch._sub_cfgs:
             msg = f"Agent '{agent}' 不存在,可用: recon, analysis, verification"
-            orch._log_attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
+            orch._dispatch_log.attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
             return ToolResult(ok=False, text="", error=msg)
 
         # ---- 2) 顺序门:单向工作流(不得跳序/回退) ----
         violation = orch._order_violation(agent)
         if violation:
-            orch._log_attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=violation)
+            orch._dispatch_log.attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=violation)
             return ToolResult(ok=False, text="", error=violation)
 
         # ---- 3) 类型+任务唯一性:相同任务不重复执行 ----
@@ -393,18 +395,18 @@ class DispatchAgentTool(AgentTool):
         if _PHASE[agent] > 0 and upstream is None:
             msg = (f"上游工件缺失,无法调度 {agent}"
                    "(单向工作流 recon→analysis→verification,请先完成前序阶段)")
-            orch._log_attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
+            orch._dispatch_log.attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
             return ToolResult(ok=False, text="", error=msg)
 
         # ---- 4) 调度次数上限:同类型最多 MAX_DISPATCH_PER_AGENT 次 ----
         # verification 例外(ADR-0003):每疑点一实例,K 上限取代同类型次数上限,
         # 补跑逻辑整体取消;recon/analysis 维持原上限(动态分配机制保留)
         if agent != "verification":
-            n_done = sum(1 for d in orch._dispatches if d.agent_name == agent)
+            n_done = orch._agent_call_count(agent)
             if n_done >= MAX_DISPATCH_PER_AGENT:
                 msg = (f"{agent} 已调度 {n_done} 次,达到上限 {MAX_DISPATCH_PER_AGENT},"
                        "不可再调度;请推进下一阶段、summarize 或 finish")
-                orch._log_attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
+                orch._dispatch_log.attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
                 return ToolResult(ok=False, text="", error=msg)
 
         seq = orch._next_seq()
@@ -415,7 +417,7 @@ class DispatchAgentTool(AgentTool):
                 msg = ("verification 已完成(每疑点一实例:已按 severity+confidence "
                        "取前 K 条逐条复核);单向顺序门不允许重复调度,"
                        "请调用 summarize 取报告素材或 finish")
-                orch._log_attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
+                orch._dispatch_log.attempt(agent, task, request, DispatchStatus.REJECTED, t0, error=msg)
                 return ToolResult(ok=False, text="", error=msg)
             assert upstream is not None  # 顺序门(上方)已保证 verification 有上游工件
             return orch._run_verification_phase(task, upstream, seq, request, t0)
@@ -440,25 +442,25 @@ class DispatchAgentTool(AgentTool):
                 return orch._resume_result(agent, task, request, seq, md_path,
                                            DispatchStatus.SKIPPED, t0)
             # 默认:重跑该实例(防"失败被跳过"冒充成功);degraded 留痕供审计
-            orch._log_attempt(agent, task, request, DispatchStatus.DEGRADED, t0,
-                              artifact=str(md_path),
-                              error="仅存在降级 .md 工件,默认复跑")
+            orch._dispatch_log.attempt(agent, task, request, DispatchStatus.DEGRADED, t0,
+                                       artifact=str(md_path),
+                                       error="仅存在降级 .md 工件,默认复跑")
 
         # ---- 7) 执行(交接块注入简报;发起即记 running,返回后回填终态) ----
         # 补跑(同类型第 2/3 次调度):交接块之外追加已覆盖清单 + 差分 task 提示,
         # 由 run_agent 经 extra_brief 透传给子 Agent 简报尾部(Task6.7)
         handoff = orch._build_handoff(agent, task, context)
-        if sum(1 for d in orch._dispatches if d.agent_name == agent) >= 1:
+        if orch._agent_call_count(agent) >= 1:
             handoff = orch._build_rerun_brief(agent, handoff)
         orch._save_handoff_snapshot(seq, agent, task, context, handoff)
-        rec = orch._log_start(seq, agent, task, request)
+        rec = orch._dispatch_log.start(seq, agent, task, request)
         try:
             ares = run_agent(cfg, orch.process_dir, orch.base_llm, upstream,
                              output_dir=out_dir, extra_brief=handoff)
         except BaseException:
             # 异常向上传播(LLMError 终止整个 Step5 等):running 记录回填为
             # interrupted,不留悬挂的运行中状态
-            orch._log_interrupted(rec)
+            orch._dispatch_log.interrupted(rec)
             raise
         elapsed = int((time.time() - t0) * 1000)
         if ares.ok and ares.artifact_path:
@@ -510,10 +512,10 @@ class DispatchAgentTool(AgentTool):
         # budget_state 于聚合后取(未覆盖疑点差分反映本实例产出后的最新状态),
         # overlap_ratio 为本实例 ingest 前与既有聚合的重合比例(_register 内算)
         bstate = orch._budget_state(agent)
-        orch._log_finish(rec, status, duration_ms=elapsed,
-                         artifact=str(sub.artifact_path) if sub.artifact_path else None,
-                         summary=sub.summary, error=sub.error,
-                         budget_state=bstate)
+        orch._dispatch_log.finish(rec, status, duration_ms=elapsed,
+                                  artifact=str(sub.artifact_path) if sub.artifact_path else None,
+                                  summary=sub.summary, error=sub.error,
+                                  budget_state=bstate)
         if status == DispatchStatus.SUCCESS:
             text = (f"## {agent} Agent 结果(成功,实例 {seq})\n"
                     f"发现数: {len(sub.findings)}\n摘要: {sub.summary}\n"
@@ -524,8 +526,7 @@ class DispatchAgentTool(AgentTool):
             if suggestion:
                 text += "\n" + suggestion
             return ToolResult(ok=True, text=text)
-        left = MAX_DISPATCH_PER_AGENT - sum(
-            1 for d in orch._dispatches if d.agent_name == agent)
+        left = MAX_DISPATCH_PER_AGENT - orch._agent_call_count(agent)
         return ToolResult(ok=False, text="",
                           error=(f"{agent} Agent 执行失败(实例 {seq}): {sub.error}\n"
                                  f"剩余可调度次数: {left} 次——可用**不同任务描述**"
@@ -562,8 +563,7 @@ class SummarizeTool(AgentTool):
             parts.append(f"(编排判断: {conclusion})")
 
         # ---- 各阶段统计 ----
-        done = [d for d in orch._dispatches
-                if d.status in DispatchStatus.EXECUTED]
+        done = orch._executed_dispatches()
         parts.append(f"\n### 调度统计(实际执行 {len(done)} 次)")
         for d in done:
             art = d.artifact_path.name if d.artifact_path else "无"
@@ -667,7 +667,8 @@ class Orchestrator:
         self._seq = 0
         self._agent_results: dict[str, SubAgentResult] = {}
         self._dispatches: list[SubAgentResult] = []   # 全部实际执行的调度(时序)
-        self._dispatch_log: list[dict] = []           # 全量调度尝试(含拒绝/重复)
+        # 调度留痕(T3 收类):记录管理/status_history/落盘全在 DispatchLog
+        self._dispatch_log = DispatchLog(self.orch_dir)
         self._agg = FindingAggregator()               # findings 聚合(去重/合并/重合计分)
         self._success = False
         self._final_answer = ""
@@ -698,6 +699,16 @@ class Orchestrator:
         self._agent_results[sub.agent_name] = sub
         self._agg.ingest(sub)
 
+    def _executed_dispatches(self) -> list[SubAgentResult]:
+        """已完成/实际执行的调度清单(单一出处,T3 收敛):summarize 统计、
+        交接块、交接快照三处共用同一过滤,不再各拼一遍列表推导。"""
+        return [d for d in self._dispatches if d.status in DispatchStatus.EXECUTED]
+
+    def _agent_call_count(self, agent: str) -> int:
+        """同类型已调度次数(单一出处,T3 收敛):次数上限、补跑判定/轮次、
+        剩余次数提示共用同一计数。"""
+        return sum(1 for d in self._dispatches if d.agent_name == agent)
+
     # ---- ADR-0003: verification 每疑点一实例 ----
 
     def _run_verification_phase(self, task: str, upstream: Path,
@@ -711,7 +722,7 @@ class Orchestrator:
         confidence 保留 analysis 初值)。补跑逻辑整体取消(每条必被验证)。
         """
         cfg = self._sub_cfgs["verification"]
-        rec = self._log_start(seq, "verification", task, request)
+        rec = self._dispatch_log.start(seq, "verification", task, request)
         try:
             # 断点续跑(阶段级):聚合工件已存在且未 force → skipped
             agg_path = self.agent_dir / cfg.output_name
@@ -726,9 +737,9 @@ class Orchestrator:
                     duration_ms=int((time.time() - t0) * 1000))
                 self._register(sub)
                 self._verification_done = True
-                self._log_finish(rec, DispatchStatus.SKIPPED,
-                                 artifact=str(agg_path), summary=sub.summary,
-                                 budget_state=self._budget_state("verification"))
+                self._dispatch_log.finish(rec, DispatchStatus.SKIPPED,
+                                          artifact=str(agg_path), summary=sub.summary,
+                                          budget_state=self._budget_state("verification"))
                 verified = sum(1 for f in sub.findings
                                if f.get("verified") is not None)
                 return ToolResult(ok=True, text=(
@@ -826,10 +837,10 @@ class Orchestrator:
                 budget_exhausted=any(v.budget_exhausted for v in instances))
             self._register(phase)
             self._verification_done = True
-            self._log_finish(rec, status, duration_ms=phase.duration_ms,
-                             artifact=str(out_path), summary=phase_summary,
-                             error=phase.error,
-                             budget_state=self._budget_state("verification"))
+            self._dispatch_log.finish(rec, status, duration_ms=phase.duration_ms,
+                                      artifact=str(out_path), summary=phase_summary,
+                                      error=phase.error,
+                                      budget_state=self._budget_state("verification"))
             # 阶段级汇总行(#6,2026-09-03):每实例 done 行是单实例计数(恒
             # 1 findings),阶段真实全貌(实例数/已复核 x/N/合计)在此汇总,
             # 不再误导"只复核了 1 条"
@@ -853,12 +864,12 @@ class Orchestrator:
             return ToolResult(ok=False, text="", error=(
                 f"verification 阶段失败(实例 {seq}): {phase.error}"))
         except LLMError:
-            self._log_interrupted(rec)
+            self._dispatch_log.interrupted(rec)
             raise
         except Exception as e:
-            self._log_finish(rec, DispatchStatus.FAILED,
-                             error=f"{type(e).__name__}: {e}",
-                             budget_state=self._budget_state("verification"))
+            self._dispatch_log.finish(rec, DispatchStatus.FAILED,
+                                      error=f"{type(e).__name__}: {e}",
+                                      budget_state=self._budget_state("verification"))
             return ToolResult(ok=False, text="", error=(
                 f"verification 阶段失败(实例 {seq}): {type(e).__name__}: {e}"))
 
@@ -1037,7 +1048,7 @@ class Orchestrator:
         """补跑建议段(Task6.6):仅 analysis 预算耗尽、仍有未覆盖疑点且
         调度次数未达上限时给出;其余场景返回空串(Observation 不附)。"""
         state = self._budget_state(agent)
-        n_done = sum(1 for d in self._dispatches if d.agent_name == agent)
+        n_done = self._agent_call_count(agent)
         if not (agent == "analysis" and state["exhausted"]
                 and state["pending_count"] > 0
                 and n_done < MAX_DISPATCH_PER_AGENT):
@@ -1058,8 +1069,7 @@ class Orchestrator:
         """补跑简报增补(Task6.7):既有交接块 + 已覆盖清单(all_findings 的
         title/file,前 30 条)+ 差分 task 提示;经 extra_brief 注入子 Agent
         简报尾部(run_agent 透传),配合 ANALYSIS_SYSTEM 补跑红线食用。"""
-        round_no = sum(1 for d in self._dispatches
-                       if d.agent_name == agent) + 1
+        round_no = self._agent_call_count(agent) + 1
         lines = [handoff, "",
                  f"--- 已覆盖清单(前 {max_findings} 条,编排器注入) ---"]
         if self._agg.all_findings:
@@ -1131,9 +1141,9 @@ class Orchestrator:
             duration_ms=int((time.time() - t0) * 1000),
         )
         self._register(sub)
-        self._log_attempt(agent, task, request, status, t0, seq=seq,
-                          artifact=str(path), summary=sub.summary,
-                          error=sub.error, budget_state=self._budget_state(agent))
+        self._dispatch_log.attempt(agent, task, request, status, t0, seq=seq,
+                                   artifact=str(path), summary=sub.summary,
+                                   error=sub.error, budget_state=self._budget_state(agent))
         label = _STATUS_LABEL.get(status, status)
         text = (f"## {agent} Agent 结果({label},实例 {seq})\n"
                 f"发现数: {len(sub.findings)}")
@@ -1145,8 +1155,7 @@ class Orchestrator:
     def _build_handoff(self, agent: str, task: str, context: str) -> str:
         """交接块(注入子 Agent 简报尾部):任务状态/前次结果/累计发现/上下文。"""
         lines = ["", "--- 交接信息(编排器自动注入) ---"]
-        done = [d for d in self._dispatches
-                if d.status in DispatchStatus.EXECUTED]
+        done = self._executed_dispatches()
         if done:
             lines.append("前序任务状态:")
             for d in done:
@@ -1174,8 +1183,7 @@ class Orchestrator:
                                context: str, handoff_text: str) -> None:
         """交接快照:结构化落盘 handoff_<seq>_<type>.json,文本块是其投影。
         交接从此可审计、可程序化消费(与 transcript 互补)。"""
-        done = [d for d in self._dispatches
-                if d.status in DispatchStatus.EXECUTED]
+        done = self._executed_dispatches()
         snapshot = {
             "seq": seq,
             "to_agent": agent,
@@ -1203,72 +1211,7 @@ class Orchestrator:
         except OSError:
             pass  # 快照失败不阻塞调度(handoff 文本块仍会注入)
 
-    # ---- 调度日志(请求/状态变迁/时间戳/错误;拒绝与重复同样留痕) ----
-
-    def _write_dispatch_log(self) -> None:
-        self.orch_dir.mkdir(parents=True, exist_ok=True)
-        (self.orch_dir / "dispatch_log.json").write_text(
-            json.dumps(self._dispatch_log, ensure_ascii=False, indent=2),
-            encoding="utf-8")
-
-    def _log_start(self, seq: int, agent: str, task: str, request: dict) -> dict:
-        """登记调度开始(running),返回记录引用供终态回填。"""
-        rec = {"seq": seq, "agent": agent, "task": task, "status": DispatchStatus.RUNNING,
-               "request": request, "started_at": _now(), "finished_at": None,
-               "duration_ms": None, "artifact_path": None, "summary": "",
-               "error": "", "status_history": [{"status": DispatchStatus.RUNNING, "ts": _now()}]}
-        self._dispatch_log.append(rec)
-        self._write_dispatch_log()
-        return rec
-
-    def _log_finish(self, rec: dict, status: str, *, duration_ms: int | None = None,
-                    artifact: str | None = None, summary: str = "",
-                    error: str = "", budget_state: dict | None = None) -> None:
-        """回填调度终态:状态变迁 running→success/degraded/failed 落痕。
-
-        budget_state(Task6.8)为该实例的结构化预算状态快照(聚合后取,
-        含 overlap_ratio/pending 差分),原样写入该条 dispatch_log 记录。"""
-        rec["status"] = status
-        rec["finished_at"] = _now()
-        rec["duration_ms"] = duration_ms
-        rec["artifact_path"] = artifact
-        rec["summary"] = summary
-        rec["error"] = error
-        if budget_state is not None:
-            rec["budget_state"] = budget_state
-        rec["status_history"].append({"status": status, "ts": _now()})
-        self._write_dispatch_log()
-
-    def _log_interrupted(self, rec: dict) -> None:
-        """执行中断兜底:run_agent 抛异常向上传播时,running 记录回填为
-        interrupted(LLMError 终止整个 Step5 的场景),不留悬挂的运行中状态。"""
-        if rec.get("status") == DispatchStatus.RUNNING:
-            rec["status"] = DispatchStatus.INTERRUPTED
-            rec["finished_at"] = _now()
-            rec["error"] = rec.get("error") or "子 Agent 执行中断(异常向上传播)"
-            rec["status_history"].append(
-                {"status": DispatchStatus.INTERRUPTED, "ts": _now()})
-            self._write_dispatch_log()
-
-    def _log_attempt(self, agent: str, task: str, request: dict, status: str,
-                     t0: float, *, seq: int | None = None,
-                     artifact: str | None = None, summary: str = "",
-                     error: str = "", duplicate_of: int | None = None,
-                     budget_state: dict | None = None) -> None:
-        """单次留痕:跳过/降级/拒绝/重复等不经过 running 阶段的调度尝试。
-
-        budget_state 仅在实例已登记(skipped/degraded 复跑等)时有值。"""
-        rec = {"seq": seq, "agent": agent, "task": task, "status": status,
-               "request": request, "started_at": _now(), "finished_at": _now(),
-               "duration_ms": int((time.time() - t0) * 1000),
-               "artifact_path": artifact, "summary": summary, "error": error,
-               "status_history": [{"status": status, "ts": _now()}]}
-        if duplicate_of is not None:
-            rec["duplicate_of"] = duplicate_of
-        if budget_state is not None:
-            rec["budget_state"] = budget_state
-        self._dispatch_log.append(rec)
-        self._write_dispatch_log()
+    # ---- 调度日志(T3 收类:记录/落盘在 dispatch_log.DispatchLog,四动词消费) ----
 
     def _duplicate_result(self, agent: str, task: str, request: dict,
                           dup: SubAgentResult, t0: float) -> ToolResult:
@@ -1282,14 +1225,14 @@ class Orchestrator:
                     f"工件: {art}(findings {len(dup.findings or [])} 条)\n"
                     "如确需补充工作,请给出**不同的任务描述**再次调度;"
                     "否则请推进下一阶段、summarize 或 finish。")
-            self._log_attempt(agent, task, request, DispatchStatus.DUPLICATE, t0,
-                              artifact=str(dup.artifact_path) if dup.artifact_path else None,
-                              summary=dup.summary, duplicate_of=dup.seq)
+            self._dispatch_log.attempt(agent, task, request, DispatchStatus.DUPLICATE, t0,
+                                       artifact=str(dup.artifact_path) if dup.artifact_path else None,
+                                       summary=dup.summary, duplicate_of=dup.seq)
             return ToolResult(ok=True, text=text)
         msg = (f"{agent} 相同任务此前已失败(实例 seq={dup.seq}): "
                f"{dup.error or '未知错误'};请改用不同任务描述,或基于已有结果收尾")
-        self._log_attempt(agent, task, request, DispatchStatus.DUPLICATE, t0,
-                          error=dup.error, duplicate_of=dup.seq)
+        self._dispatch_log.attempt(agent, task, request, DispatchStatus.DUPLICATE, t0,
+                                   error=dup.error, duplicate_of=dup.seq)
         return ToolResult(ok=False, text="", error=msg)
 
     # ---- 对外属性 ----
