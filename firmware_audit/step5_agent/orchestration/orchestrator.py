@@ -41,15 +41,15 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
-from .aggregator import FindingAggregator, normalize_file_paths
-from .data.artifacts import load_artifact, load_survey
-from .data.prompts import build_system_prompt, build_verify_single_brief, save_system_prompt
-from .engine.display import make_display
-from .engine.react_loop import run_react_agent
-from .providers.llm_client import LLMError
-from .providers.tools import ToolContext
-from .providers.tools.base import AgentTool, ToolResult, truncate_text
-from .runner import ALL_CONFIGS, resolve_max_iters, run_agent
+from ..aggregator import FindingAggregator, normalize_file_paths
+from ..data.artifacts import load_artifact, load_survey
+from ..data.prompts import build_system_prompt, build_verify_single_brief, save_system_prompt
+from ..engine.display import make_display
+from ..engine.react_loop import run_react_agent
+from ..providers.llm_client import LLMError
+from ..providers.tools import ToolContext
+from ..providers.tools.base import AgentTool, ToolResult, truncate_text
+from ..runner import ALL_CONFIGS, resolve_max_iters, run_agent
 
 # 多次调用下编排轮数上限:默认 3 次调度+summarize+收尾,余量留给补充调用
 ORCH_MAX_ITERS = 12
@@ -1391,7 +1391,7 @@ class Orchestrator:
         # 可选 JSON 副产品:宽容解析(剥围栏/找 JSON 对象),失败即不存;
         # 我方保留字段(schema/report_markdown)后写,LLM 同名键不覆盖
         try:
-            from .data.artifacts import strip_fence
+            from ..data.artifacts import strip_fence
             s = strip_fence(self._final_answer.strip())
             start, end = s.find("{"), s.rfind("}")
             if start != -1 and end > start:

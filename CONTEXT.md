@@ -71,7 +71,7 @@ _Avoid_: 取证 Agent(职责是取证但名是 analysis)
 _Avoid_: 复核阶段
 
 **orchestrator(编排器)**:
-Step5 顶层的 LLM 协调层(`orchestrator.py`),用 `dispatch_agent`/`summarize`/`finish` 三个动作调度子 Agent,校验顺序门与调度上限,并在 verification 完成后汇总素材、产出最终报告 `orchestrator/report.md`。
+Step5 顶层的 LLM 协调层(`orchestration/` 包,ADR-0009;主体在 `orchestration/orchestrator.py`),用 `dispatch_agent`/`summarize`/`finish` 三个动作调度子 Agent,校验顺序门与调度上限,并在 verification 完成后汇总素材、产出最终报告 `orchestrator/report.md`。
 _Avoid_: 协调器, 总调度
 
 **实例 (instance)**:

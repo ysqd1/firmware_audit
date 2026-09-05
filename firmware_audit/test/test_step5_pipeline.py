@@ -23,7 +23,7 @@ from firmware_audit.step5_agent.data.artifacts import (
     save_artifact,
 )
 from firmware_audit.step5_agent.engine.context import ContextManager, est_tokens
-from firmware_audit.step5_agent.orchestrator import DispatchAgentTool, Orchestrator
+from firmware_audit.step5_agent.orchestration.orchestrator import DispatchAgentTool, Orchestrator
 from firmware_audit.step5_agent.providers.tools import ToolContext
 from firmware_audit.test.scripted_llm import ScriptedLLM
 from firmware_audit.step5_agent.run_step5 import step5_run

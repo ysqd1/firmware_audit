@@ -28,7 +28,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .orchestrator import Orchestrator
+from .orchestration.orchestrator import Orchestrator
 from .providers.llm_client import LLMClient, LLMError
 
 

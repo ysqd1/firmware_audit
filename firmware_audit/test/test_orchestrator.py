@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from firmware_audit.step5_agent.orchestrator import (
+from firmware_audit.step5_agent.orchestration.orchestrator import (
     Orchestrator,
     SubAgentResult,
     DispatchAgentTool,
@@ -976,7 +976,7 @@ def test_verification_phase_display_summary() -> list[str]:
         _make_process(td)
         os.environ["STEP5_VERIFY_K"] = "3"
         try:
-            with patch("firmware_audit.step5_agent.orchestrator.make_display",
+            with patch("firmware_audit.step5_agent.orchestration.orchestrator.make_display",
                        return_value=cap_disp):
                 llm = ScriptedLLM([
                     D % "recon", TOOL, RECON_FINAL,        # 0/1/2
@@ -1112,7 +1112,7 @@ def test_handoff_snapshot_file() -> list[str]:
 def test_status_enum_closed() -> list[str]:
     """状态值域闭合:DispatchStatus.ALL 覆盖全部标签;_STATUS_LABEL 键一致。"""
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestrator import DispatchStatus, _STATUS_LABEL
+    from firmware_audit.step5_agent.orchestration.orchestrator import DispatchStatus, _STATUS_LABEL
     if len(set(DispatchStatus.ALL)) != len(DispatchStatus.ALL):
         fails.append("DispatchStatus.ALL 不应有重复值")
     if set(_STATUS_LABEL) != set(DispatchStatus.ALL):
@@ -1138,7 +1138,7 @@ def test_ingest_merge_dedup() -> list[str]:
               "addr": "0x1000", "evidence": "system(cmd)", "severity": "high"}
         f2 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
               "addr": "0x1000", "confidence": "high", "verified": True}
-        from firmware_audit.step5_agent.orchestrator import SubAgentResult
+        from firmware_audit.step5_agent.orchestration.orchestrator import SubAgentResult
         orch._register(SubAgentResult(seq=0, agent_name="analysis", status="success",
                                       findings=[f1], request={}))
         orch._register(SubAgentResult(seq=1, agent_name="analysis", status="success",
@@ -1161,7 +1161,7 @@ def test_aggregator_module() -> list[str]:
     重合计分/recon 跳过,纯逻辑可直接单测。"""
     fails: list[str] = []
     from firmware_audit.step5_agent.aggregator import FindingAggregator
-    from firmware_audit.step5_agent.orchestrator import SubAgentResult
+    from firmware_audit.step5_agent.orchestration.orchestrator import SubAgentResult
 
     # 1. 聚合 + 同键去重合并
     agg = FindingAggregator()
@@ -1315,7 +1315,7 @@ def test_ingest_verification_overrides() -> list[str]:
         f2 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
               "addr": "0x1000", "severity": "low", "confidence": "low",
               "verified": False, "rationale": "证据与工件不符"}
-        from firmware_audit.step5_agent.orchestrator import SubAgentResult
+        from firmware_audit.step5_agent.orchestration.orchestrator import SubAgentResult
         orch._register(SubAgentResult(seq=0, agent_name="analysis", status="success",
                                       findings=[f1], request={}))
         orch._register(SubAgentResult(seq=1, agent_name="verification", status="success",
@@ -1832,7 +1832,7 @@ def test_reconcile_report() -> list[str]:
     5. index 序号、字段原值携带(差异清单可读)
     """
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
     result = reconcile_report(RECONCILE_MD, RECONCILED_FINDINGS)
     items = result.get("items", [])
     if len(items) != 4:
@@ -1892,7 +1892,7 @@ def test_reconcile_file_check() -> list[str]:
     """file 存在性检查(2026-09-03 用户决策新增):位置行一致 → ok;无位置行 →
     提取失败(ok=None→unparsed);位置写错 → mismatch。理由内容不再检查。"""
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
     md = """# 报告
 ### HIGH
 #### 1. 正常条目
@@ -1946,7 +1946,7 @@ def test_reconcile_unparsed_mismatch_fields() -> list[str]:
     - 报告缺失的工件条目 → 不被报告(只对报告条目负责),不以篇幅回写
     """
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
     md = """# 固件安全审计报告
 ## 发现清单
 #### X. 只存在于报告的条目
@@ -2047,7 +2047,7 @@ def test_orchestrator_prompt_reconcile_redlines() -> list[str]:
     枚举值逐字抄写素材(唯一真值)、禁止跨条目串条、限定语不许吞、标签行约定。
     素材收敛不保真,但对账要能提取,标签行约定让对账解析稳定。"""
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestrator import build_orchestrator_prompt
+    from firmware_audit.step5_agent.orchestration.orchestrator import build_orchestrator_prompt
     prompt = build_orchestrator_prompt({}, max_iters=10)
     for needle in ("逐字抄写", "唯一真值", "禁止引用或", "转述其他条目的 rationale",
                    "跨条目串条", "保留工件 rationale 的核心事实与限定", "**位置：**",
@@ -2066,7 +2066,7 @@ def test_reconcile_edge_robustness() -> list[str]:
     3. 条目缺详情行不影响对账(2026-09-03 起 rationale 内容不检查)
     """
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
     md = """# 报告
 ## 发现清单
 ### HIGH
