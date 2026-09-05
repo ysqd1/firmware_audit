@@ -1,5 +1,13 @@
 # 流水线角色与 Agent 工具层
 
+## 工作流纪律(强制,2026-09-05 定稿)
+
+**项目工作必须严格按 Matt Pocock skills 的流程执行,不得跳过流程直接改代码。**
+
+* 非平凡任务(新功能/重构/成串修复)走完整链路:需求澄清与追问(brainstorming / grilling)→ 写规格(to-spec)→ 拆工单(to-tickets)→ triage 定级 → 逐工单实现(implement / tdd)→ 评审(code-review)。工单存放与状态字段按 [docs/agents/issue-tracker.md](./docs/agents/issue-tracker.md) 本地 markdown 约定,标签按 [docs/agents/triage-labels.md](./docs/agents/triage-labels.md)
+* **未经用户明确确认,不得自行开始修改代码**——先探索、提问、对齐方案,拿到用户点头再动手;领域事实先读 `CONTEXT.md` 与 `docs/adr/`(见 [docs/agents/domain.md](./docs/agents/domain.md))
+* 例外仅限用户当场明确指示"直接改"的琐碎修复(错字/单行);即便如此也要先一句话说明改什么,再动手
+
 固定 5 步流水线。Step1-4 已实现并验证通过(代码控制);Step5 架构现状(2026-08-28 起):**LLM orchestrator 编排**三个子 Agent(recon → analysis → verification),见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md) 与正文"Step5 Agent 审计"章节。早期(2026-08-16)"三 Agent 串行、无 orchestrator、控制流硬编码"的设计已演进。
 
 ## 一、已落地:Step1-4 流水线角色

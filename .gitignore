@@ -32,3 +32,6 @@ firmware_audit/docker/ghidra/ghidra*.zip.scratch/
 
 .scratch/
 firmware_audit/docker/ghidra/ghidra_11.3.2_PUBLIC.zip
+
+# ---- 本地会话/工具状态 ----
+.zcode/
