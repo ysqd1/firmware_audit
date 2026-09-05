@@ -57,7 +57,8 @@
 ## 状态
 
 已实现(2026-09-03,/tdd + code-review 缺口修复 + 用户决策修订)。对账纯函数
-`reconcile_report`(orchestrator.py)解析 report.md 正文与 verified\_findings.json
+`reconcile_report`(2026-09-05 T2 迁至 orchestration/reconciliation.py,原
+orchestrator.py)解析 report.md 正文与 verified\_findings.json
 逐条比对**确定性事实**:file(位置)+ severity/confidence/verified 三枚举值;
 Orchestrator.run 落盘 report.md 后自动对账,差异清单写 report\_reconciliation.json
 

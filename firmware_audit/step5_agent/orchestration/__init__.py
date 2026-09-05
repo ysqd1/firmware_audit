@@ -7,7 +7,8 @@ findings 聚合纯逻辑在 aggregator,ReAct 引擎与数据契约在 engine/dat
 
 T1(ADR-0009)整体迁入为单模块 orchestration/orchestrator.py;后续票
 按单一职责解体为 state/orchestrator/actions/handoff/dispatch_log/
-verify_phase/reconciliation。包内导入一律相对;依赖只准向下
+verify_phase/reconciliation——其中 reconciliation(报告对账纯函数群)
+已落地(T2)。包内导入一律相对;依赖只准向下
 (orchestration → runner/aggregator/engine/data/providers,守护测试
 test_step5_layer_guard.py 机器强制)。
 """

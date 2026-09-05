@@ -1832,7 +1832,7 @@ def test_reconcile_report() -> list[str]:
     5. index 序号、字段原值携带(差异清单可读)
     """
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.reconciliation import reconcile_report
     result = reconcile_report(RECONCILE_MD, RECONCILED_FINDINGS)
     items = result.get("items", [])
     if len(items) != 4:
@@ -1892,7 +1892,7 @@ def test_reconcile_file_check() -> list[str]:
     """file 存在性检查(2026-09-03 用户决策新增):位置行一致 → ok;无位置行 →
     提取失败(ok=None→unparsed);位置写错 → mismatch。理由内容不再检查。"""
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.reconciliation import reconcile_report
     md = """# 报告
 ### HIGH
 #### 1. 正常条目
@@ -1946,7 +1946,7 @@ def test_reconcile_unparsed_mismatch_fields() -> list[str]:
     - 报告缺失的工件条目 → 不被报告(只对报告条目负责),不以篇幅回写
     """
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.reconciliation import reconcile_report
     md = """# 固件安全审计报告
 ## 发现清单
 #### X. 只存在于报告的条目
@@ -2066,7 +2066,7 @@ def test_reconcile_edge_robustness() -> list[str]:
     3. 条目缺详情行不影响对账(2026-09-03 起 rationale 内容不检查)
     """
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestration.orchestrator import reconcile_report
+    from firmware_audit.step5_agent.orchestration.reconciliation import reconcile_report
     md = """# 报告
 ## 发现清单
 ### HIGH
