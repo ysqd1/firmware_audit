@@ -1,4 +1,4 @@
-"""verify_phase 聚焦单测(ADR-0009 T5:复核引擎下沉)。
+"""verify_phase 聚焦单测(ADR-0009 T5:复核引擎下沉;T6 补执行后状态判定)。
 
 排序取 K(rank_findings + verify_k)/ 单实例续跑身份校验
 (resume_identity_matches)/ 锚点回填聚合(merge_verdicts)三块核心逻辑
@@ -16,7 +16,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from firmware_audit.step5_agent.aggregator import FindingAggregator
-from firmware_audit.step5_agent.orchestration.state import SubAgentResult
+from firmware_audit.step5_agent.orchestration.state import (
+    DispatchStatus,
+    SubAgentResult,
+)
 from firmware_audit.step5_agent.orchestration.verify_phase import (
     DEFAULT_VERIFY_K,
     merge_verdicts,
@@ -24,6 +27,7 @@ from firmware_audit.step5_agent.orchestration.verify_phase import (
     resume_identity_matches,
     verify_k,
 )
+from firmware_audit.step5_agent.runner import VERIFY_CFG, AgentRunResult, post_run_status
 
 
 def test_rank_findings_and_k_budget() -> list[str]:
@@ -134,6 +138,33 @@ def test_merge_verdicts_authoritative_fields_only() -> list[str]:
     return fails
 
 
+def test_post_run_status_three_way() -> list[str]:
+    """执行后状态三岔判定单一出处(T6 收编到 runner.post_run_status):
+    success / degraded(仅 .md 降级工件)/ failed,判据与收编前两处
+    (actions 调度回填、verify_phase 单实例)内联 if/elif 逐字一致。"""
+    fails: list[str] = []
+    ok = AgentRunResult(cfg=VERIFY_CFG, artifact_path=Path("agent/0_recon/survey.json"))
+    if post_run_status(ok) != "success":
+        fails.append(f"ok+json 工件应为 success: {post_run_status(ok)}")
+    degraded = AgentRunResult(cfg=VERIFY_CFG, artifact_path=Path("agent/1_analysis/findings.md"),
+                              error="未产出可解析 Final Answer(工件已降级 .md)")
+    if post_run_status(degraded) != "degraded":
+        fails.append(f"仅 .md 降级工件应为 degraded: {post_run_status(degraded)}")
+    failed = AgentRunResult(cfg=VERIFY_CFG, artifact_path=None, error="boom")
+    if post_run_status(failed) != "failed":
+        fails.append(f"无工件应为 failed: {post_run_status(failed)}")
+    if post_run_status(AgentRunResult(cfg=VERIFY_CFG)) != "failed":
+        fails.append("缺省(无工件无错误)应按 failed 处理")
+    # 跨层字面量对齐(ADR-0009:runner 不 import orchestration,字符串契约
+    # 靠本断言机器锁定——state 值域变更时此处先红,防消费点相等比较静默失配)
+    for got, want in ((post_run_status(ok), DispatchStatus.SUCCESS),
+                      (post_run_status(degraded), DispatchStatus.DEGRADED),
+                      (post_run_status(failed), DispatchStatus.FAILED)):
+        if got != want:
+            fails.append(f"post_run_status 字面量应与 DispatchStatus 对齐: {got} != {want}")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -141,6 +172,7 @@ def test_main() -> int:
         ("resume_identity_check", test_resume_identity_check),
         ("merge_verdicts_authoritative_fields_only",
          test_merge_verdicts_authoritative_fields_only),
+        ("post_run_status_three_way", test_post_run_status_three_way),
     ]:
         fl = fn()
         if fl:

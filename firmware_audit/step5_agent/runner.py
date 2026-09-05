@@ -28,6 +28,7 @@ from .data.prompts import (
 )
 from .engine.display import make_display
 from .engine.react_loop import ReactResult, run_react_agent
+from .engine.transcript import reset_transcript
 from .providers.llm_client import LLMClient, LLMError
 from .providers.tools import ToolContext, make_tools
 
@@ -119,6 +120,22 @@ def make_llm(cfg: AgentConfig, base: LLMClient) -> LLMClient:
     return base
 
 
+def post_run_status(ares: AgentRunResult) -> str:
+    """执行后状态三岔判定(单一出处,T6 收编):success / degraded / failed。
+
+    判据:ok 且有工件 → success;仅 .md 降级工件(JSON 解析失败,ok=False)
+    → degraded;其余 → failed。返回 DispatchStatus 值域字符串(值即落盘值,
+    见 orchestration/state;runner 不 import orchestration——ADR-0009 分层,
+    故以字符串契约返回,消费方自行包装)。消费点:actions 调度回填、
+    verify_phase 单实例。
+    """
+    if ares.ok and ares.artifact_path:
+        return "success"
+    if ares.artifact_path and ares.artifact_path.suffix == ".md":
+        return "degraded"
+    return "failed"
+
+
 def run_agent(cfg: AgentConfig, process_dir: Path, base_llm: LLMClient,
               upstream_path: Path | None = None,
               output_dir: Path | None = None,
@@ -154,8 +171,7 @@ def run_agent(cfg: AgentConfig, process_dir: Path, base_llm: LLMClient,
         else:
             transcript = agent_dir / cfg.name / "transcript.jsonl"
             out_base = agent_dir
-        transcript.parent.mkdir(parents=True, exist_ok=True)
-        transcript.write_text("", encoding="utf-8")  # 重跑覆盖旧记录
+        reset_transcript(transcript)  # 重跑覆盖旧记录(engine 统一入口,T6 收编)
         save_system_prompt(transcript.parent, system_prompt)  # 系统提示词留档(复现用)
 
         llm = make_llm(cfg, base_llm)

@@ -4,7 +4,7 @@
 文档约定,靠自觉;本文件用 AST 扫描 step5_agent 全部 .py 的 import 边
 (含函数级延迟导入),把规则升级为断言,违规即红:
 
-    入口(run_step5 / 包根 __init__ / demo_display)
+    入口(run_step5 / 包根 __init__ / demos 演示子包)
       → orchestration(编排层包)
       → runner / aggregator(单实例执行 / 聚合纯逻辑)
       → engine / data / providers(叶子三包:互不 import、不向上)
@@ -36,7 +36,7 @@ _PREFIX = ["firmware_audit", "step5_agent"]
 TIER: dict[str, int] = {
     "": 0,               # step5_agent/__init__(对外只暴露 step5_run)
     "run_step5": 0,      # CLI 入口
-    "demo_display": 0,   # 演示脚本(入口同层;T6 迁 demos/)
+    "demos": 0,          # 演示脚本子包(入口同层;T6 自顶层 demo_display 迁入)
     "orchestration": 1,  # 编排层包(ADR-0009)
     "runner": 2,         # 单 Agent 执行
     "aggregator": 2,     # findings 聚合纯逻辑

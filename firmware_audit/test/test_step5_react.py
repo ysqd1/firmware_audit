@@ -17,6 +17,7 @@ from firmware_audit.step5_agent.engine.react_loop import (
     parse_reply,
     run_react_agent,
 )
+from firmware_audit.step5_agent.engine.transcript import reset_transcript
 from firmware_audit.step5_agent.providers.tools.base import AgentTool, ToolContext, ToolResult
 
 
@@ -626,6 +627,24 @@ def test_system_prompt_budget_injection() -> list[str]:
     return fails
 
 
+def test_reset_transcript_unified_entry() -> list[str]:
+    """跑前清空 transcript 统一入口(T6 收编):runner 与编排层两处
+    write_text("") 的同源知识收敛到 engine 层——旧记录清空 + 父目录自动建。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "agent" / "1_analysis" / "transcript.jsonl"
+        p.parent.mkdir(parents=True)
+        p.write_text("stale", encoding="utf-8")
+        reset_transcript(p)
+        if p.read_text(encoding="utf-8") != "":
+            fails.append("已有旧记录应被清空(重跑覆盖)")
+        p2 = Path(td) / "deep" / "nested" / "transcript.jsonl"
+        reset_transcript(p2)
+        if not p2.parent.is_dir() or p2.read_text(encoding="utf-8") != "":
+            fails.append("父目录缺失时应一并创建并清空")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -645,6 +664,7 @@ def test_main() -> int:
         ("last_round_notice_and_summary_force", test_last_round_notice_and_summary_force),
         ("force_final_30_rounds", test_force_final_30_rounds),
         ("system_prompt_budget_injection", test_system_prompt_budget_injection),
+        ("reset_transcript_unified_entry", test_reset_transcript_unified_entry),
     ]:
         fl = fn()
         if fl:

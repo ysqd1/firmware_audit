@@ -20,27 +20,25 @@ import 层单向 orchestrator → actions → handoff → state,环由 state 切
 - 状态写: summarize_called(property setter)
 不上 typing.Protocol——单 adapter,第二个消费者出现再转正。
 
-_VERIFY_SEVERITY_RANK/_VERIFY_CONFIDENCE_RANK 已随复核引擎迁 verify_phase
-(T5,转正为公开名 VERIFY_SEVERITY_RANK/VERIFY_CONFIDENCE_RANK):
-SummarizeTool 的 findings 排序呈现与复核引擎的取前 K 排序同源,从该模块
-导入,排序规则单一出处。
+findings 清单排序与复核引擎的取前 K 排序同源,统一用 data 层派生的
+SEVERITY_RANK(T6 收编:原 T5 起经 verify_phase 的 VERIFY_SEVERITY_RANK
+中转,现直接取单一出处)。
 """
 from __future__ import annotations
 
-import json
 import os
 import time
 from pathlib import Path
 
 from .handoff import build_handoff, build_rerun_brief, save_handoff_snapshot
 from .state import STATUS_LABEL, DispatchStatus, SubAgentResult
-from .verify_phase import VERIFY_SEVERITY_RANK
 from ..aggregator import normalize_file_paths
-from ..data.artifacts import load_artifact
+from ..data.artifacts import (SEVERITY_RANK, load_artifact, rewrite_artifact,
+                              stamp_provenance)
 from ..providers.llm_client import LLMError
 from ..providers.tools import ToolContext
 from ..providers.tools.base import AgentTool, ToolResult, truncate_text
-from ..runner import run_agent
+from ..runner import post_run_status, run_agent
 
 # 同一类型子 Agent 的调度次数上限(1 次默认 + 至多 2 次补跑;超出即拒绝)
 MAX_DISPATCH_PER_AGENT = 3
@@ -276,32 +274,22 @@ class DispatchAgentTool(AgentTool):
             orch.dispatch_log.interrupted(rec)
             raise
         elapsed = int((time.time() - t0) * 1000)
-        if ares.ok and ares.artifact_path:
-            status = DispatchStatus.SUCCESS
-        elif ares.artifact_path and ares.artifact_path.suffix == ".md":
-            status = DispatchStatus.DEGRADED   # 执行后仍只产出降级工件(ok=False)
-        else:
-            status = DispatchStatus.FAILED
+        status = post_run_status(ares)   # DispatchStatus 值域字符串(值即落盘值)
         loaded = load_artifact(ares.artifact_path) if ares.artifact_path else None
         # 工件级溯源回填(schema v2):orchestrator 知道 seq,save 层不知道;
         # 把 instance_seq 写回子 Agent 工件,单看工件即可定位产出实例。
         # recon(v3 survey)跳过:survey 无 findings 字段,load_artifact 会注入空的
         # findings 键并回写磁盘——Task5 收口,不往 recon 工件塞 findings:[]。
         if loaded is not None and ares.artifact_path and agent != "recon":
-            for f in loaded.get("findings", []) or []:
-                if isinstance(f, dict) and f.get("instance_seq") is None:
-                    f["instance_seq"] = seq
+            stamp_provenance(loaded.get("findings", []) or [], agent, seq,
+                             only_missing=True)
             if agent == "analysis":
                 # file 字段归一成工具路径(ADR-0008,LLM 回退逻辑路径时兜底);
                 # verification 不归一——title/file 不得改是它的硬纪律
                 normalize_file_paths(loaded.get("findings", []) or [],
                                      orch.process_dir)
-            try:  # noqa: SIM105 —— 保留 try-except:回填失败语义(pass + 注释)是明确意图
-                ares.artifact_path.write_text(
-                    json.dumps(loaded, ensure_ascii=False, indent=2),
-                    encoding="utf-8")
-            except OSError:
-                pass  # 回填失败不阻塞调度(聚合层 _ingest 仍会补)
+            # 回填失败不阻塞调度(聚合层 _ingest 仍会补)
+            rewrite_artifact(ares.artifact_path, loaded)
         react = ares.react
         # Task6.2 预算耗尽判定:steps 达到 max_iters(含最后一轮自主收尾/
         # FORCE_FINAL 强制收尾)或 react 未完成(finished=False,解析连续失败
@@ -446,7 +434,7 @@ class SummarizeTool(AgentTool):
         parts.append(f"\n### 累计 findings({len(orch.all_findings)} 条,已去重合并)")
         if orch.all_findings:
             for f in sorted(orch.all_findings,
-                            key=lambda x: VERIFY_SEVERITY_RANK.get(
+                            key=lambda x: SEVERITY_RANK.get(
                                 str(x.get("severity", "info")).lower(), 9)):
                 loc = f.get("file", "") + (f"::{f.get('func')}" if f.get("func") else "")
                 parts.append(f"- [{f.get('severity', 'info')}] {_verified_mark(f)} {f.get('title', '?')} @ {loc}")

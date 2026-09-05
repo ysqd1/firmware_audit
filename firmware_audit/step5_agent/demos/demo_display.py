@@ -1,9 +1,9 @@
 """终端监控显示演示(零 API 零 Docker,ScriptedLLM 回放)。
 
 用法:
-    python -m firmware_audit.step5_agent.demo_display            # 跟随环境变量
-    STEP5_COLOR=1 python -m firmware_audit.step5_agent.demo_display   # 强制彩色
-    STEP5_DISPLAY=full python -m firmware_audit.step5_agent.demo_display  # 完整模式
+    python -m firmware_audit.step5_agent.demos.demo_display            # 跟随环境变量
+    STEP5_COLOR=1 python -m firmware_audit.step5_agent.demos.demo_display   # 强制彩色
+    STEP5_DISPLAY=full python -m firmware_audit.step5_agent.demos.demo_display  # 完整模式
 
 演示场景(三个 mini Agent,覆盖全部六类事件):
   场景1  正常流程: 思考 → 调用 → OK 结果 → 超长截断(带全文指针)→ 结论
@@ -16,7 +16,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from firmware_audit.step5_agent.engine.display import make_display
 from firmware_audit.step5_agent.engine.react_loop import run_react_agent

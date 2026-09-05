@@ -30,6 +30,16 @@ def wrap_long_lines(text: str, width: int = 4000) -> str:
     return "\n".join(out)
 
 
+def reset_transcript(path: Path) -> None:
+    """跑前清空 transcript(T6 收编的统一入口):重跑覆盖旧记录。
+
+    runner(子 Agent)与编排层(orchestrator transcript)共用的同源知识——
+    父目录一并创建,清空后由 Transcript.log 以追加模式写事件。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("", encoding="utf-8")
+
+
 class Transcript:
     """一次 Agent 运行的落盘器。path=None 时全部调用变 no-op(测试/静默模式)。"""
 

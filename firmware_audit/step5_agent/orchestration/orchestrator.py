@@ -6,9 +6,10 @@
   同时含可解析 JSON 时另存 report.json(可选结构化副产品)
 - 报告对账(ADR-0007,2026-09-03):report.md 落盘后由 reconcile_report 纯函数
   (T2 迁至本包 reconciliation 模块,本类只留读盘/落盘/stderr 告警薄壳)
-  解析正文,与 verified_findings.json 逐条比对(severity/confidence/verified
-  三枚举 + rationale 关键句包含)→ 差异清单落盘 report_reconciliation.json +
-  stderr 警告;仅告警不重生成不阻塞。素材侧由提示词红线收敛(见本模块 _ORCH_TMPL)
+  解析正文,与 verified_findings.json 逐条比对确定性事实(severity/confidence/
+  verified 三枚举;rationale/详情内容不检查)→ 差异清单落盘
+  report_reconciliation.json + stderr 警告;仅告警不重生成不阻塞。
+  素材侧由提示词红线收敛(见本模块 _ORCH_TMPL)
 - degraded 状态: 断点续跑只认 .json 成功工件;.md 降级工件标记 degraded
   (ok=False),复跑默认重跑该实例(防"失败被跳过"冒充成功)
 - handoff 快照: 每次真实调度把交接结构化落盘 handoff_<seq>_<type>.json
@@ -52,10 +53,12 @@ from .reconciliation import reconcile_report
 from .state import SubAgentResult
 from .verify_phase import run_verify_phase, verify_k
 from ..aggregator import FindingAggregator
-from ..data.artifacts import load_artifact, load_survey
+from ..data.artifacts import (extract_json_object, load_artifact, load_survey,
+                              strip_fence)
 from ..data.prompts import build_system_prompt, save_system_prompt
 from ..engine.display import make_display
 from ..engine.react_loop import run_react_agent
+from ..engine.transcript import reset_transcript
 from ..providers.tools import ToolContext
 from ..providers.tools.base import ToolResult
 from ..runner import ALL_CONFIGS, resolve_max_iters
@@ -446,7 +449,7 @@ class Orchestrator:
         save_system_prompt(self.orch_dir, system_prompt)  # 编排器系统提示词留档(复现用)
         init = self._build_initial_message()
         transcript = self.orch_dir / "transcript.jsonl"
-        transcript.write_text("", encoding="utf-8")
+        reset_transcript(transcript)
 
         disp = make_display()
         if disp.enabled:
@@ -489,21 +492,18 @@ class Orchestrator:
         md = self.orch_dir / "report.md"
         md.write_text(self._final_answer + "\n", encoding="utf-8")
         self._report_path = md
-        # 可选 JSON 副产品:宽容解析(剥围栏/找 JSON 对象),失败即不存;
+        # 可选 JSON 副产品:宽容解析复用 data 层提取函数(剥围栏 + 取 dict,
+        # T6 收编,原手写"找大括号 + loads"翻版删除),失败(None)即不存;
         # 我方保留字段(schema/report_markdown)后写,LLM 同名键不覆盖
         try:
-            from ..data.artifacts import strip_fence
-            s = strip_fence(self._final_answer.strip())
-            start, end = s.find("{"), s.rfind("}")
-            if start != -1 and end > start:
-                obj = json.loads(s[start:end + 1])
-                if isinstance(obj, dict):
-                    (self.orch_dir / "report.json").write_text(
-                        json.dumps({**obj, "schema": 1,
-                                    "report_markdown": self._final_answer},
-                                   ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-        except (json.JSONDecodeError, OSError, ValueError):
+            obj = extract_json_object(strip_fence(self._final_answer.strip()))
+            if isinstance(obj, dict):
+                (self.orch_dir / "report.json").write_text(
+                    json.dumps({**obj, "schema": 1,
+                                "report_markdown": self._final_answer},
+                               ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+        except (OSError, ValueError):
             pass
         return md
 
@@ -523,7 +523,8 @@ class Orchestrator:
         """
         if self._report_path is None:
             return None
-        vf_path = self.agent_dir / "verified_findings.json"
+        # verified_findings 文件名走子 Agent 配置(单一出处,T6 收编,不再硬编码)
+        vf_path = self.agent_dir / self.sub_cfgs["verification"].output_name
         if not vf_path.is_file():
             return None
         try:

@@ -92,7 +92,7 @@
 
 ### Step5 — Agent 审计(已实现,2026-08-17;v3 编排升级 2026-08-28;recon v3/编排弹性 2026-08-29)
 
-* **实现与分层(2026-08-18 目录重组)**:`firmware_audit/step5_agent/` 子文件夹按并列/附属关系组织——顶层 `run_step5.py`(L0 入口,`python -m` 路径不变)+ `orchestrator.py`(LLM 编排层)+ `runner.py`(L1 单 Agent 执行)+ 三个自包含包:`engine/`(ReAct 执行引擎:react\_loop 状态机 + protocol 纯函数解析 + context 四分区 + transcript 落盘)、`data/`(数据契约:artifacts 工件 schema + prompts 提示词)、`providers/`(外部接入:llm\_client + tools/)。依赖只准向下:orchestrator/run\_step5 接线,engine/data/providers 互不 import、包内走相对导入
+* **实现与分层(2026-08-18 目录重组;2026-09-05 编排层包化定稿,ADR-0009)**:`firmware_audit/step5_agent/` 子文件夹按并列/附属关系组织——顶层 `run_step5.py`(L0 入口,`python -m` 路径不变)+ `orchestration/` 包(LLM 编排层,七模块:state 共享词汇 / orchestrator 编排主体 / actions 三动作+调度守卫 / handoff 交接 / dispatch\_log 调度留痕 / verify\_phase 每疑点一实例复核引擎 / reconciliation 报告对账)+ `runner.py`(L1 单 Agent 执行)+ `aggregator.py`(findings 聚合纯逻辑)+ 三个自包含包:`engine/`(ReAct 执行引擎:react\_loop 状态机 + protocol 纯函数解析 + context 四分区 + transcript 落盘 + display 监控)、`data/`(数据契约:artifacts 工件 schema/存取/溯源回写 + prompts 提示词)、`providers/`(外部接入:llm\_client + tools/)+ `demos/`(演示脚本子包)。依赖只准向下:run\_step5 → orchestration → runner/aggregator/engine/data/providers,engine/data/providers 互不 import、包内走相对导入;分层规则由 AST 守护测试机器强制(`test_step5_layer_guard.py`)
 
 * **编排(v3)**:`Orchestrator` 轻量 LLM 驱动(ReAct 循环,3 动作 `dispatch_agent`/`summarize`/`finish`),严格单向顺序门 recon→analysis→verification。调度上限按类型区分:recon/analysis 同类型最多 3 次(默认 1 次+至多 2 次补跑,动态分配机制保留);**verification 例外(2026-09-01 ADR-0003)——不再适用"同类型最多 3 次",补跑逻辑整体取消,改为每疑点一实例、按 finding 计数(K 上限,见下)**
 
@@ -104,7 +104,7 @@
 
 * **报告(v3,生成主体=orchestrator)**:verification 完成后调用 `summarize` 取素材(已复核 findings 全量字段+阶段统计),Final Answer 即报告正文,**原样落盘** **`orchestrator/report.md`**(同时含可解析 JSON 时另存 report.json 副产品);未产出时明确告警不静默降级。原 `render_report` 已删除——verification 只产 verified\_findings.json,不产报告
 
-* **verification 每疑点一实例(2026-09-01,ADR-0003,ticket 03/04)**:verification 从"单实例多疑点(24 轮内逐条复核)"改为**每 finding 一个独立复核实例**。analysis 产出 findings 后按 severity(critical>high>medium>low>info)主排序 + confidence(high>medium>low)次排序,取前 K 条(env `STEP5_VERIFY_K`,默认 10);对每条派独立实例,输入=单条 finding + 相关工件指针,**max\_iters=8**,逐条产单条 verified finding,聚合回 `verified_findings.json`(**全量 N 保留**:前 K 带 verified/rationale/confidence/severity——复核降级判级同覆盖,2026-09-03 两处覆盖集补 severity:orchestrator 锚点回填 + aggregator `_OVERRIDE_KEYS`,防工件 severity=high 与 rationale"降为 low"自相矛盾;未进 K 的 `verified=None`、confidence 保留 analysis 初值)。**补跑逻辑整体取消**——verification 只调度一次,自动对前 K 各派实例,不再适用"同类型最多 3 次"上限(代码注释 `orchestrator.py` `_verify_k` 明示)。**单实例断点续跑带身份校验(2026-09-03)**:实例目录名是全局 seq 位置而非 finding 身份,续跑时编排路径变化(如 analysis 补跑次数不同)会让 seq 前移、命中前一条 finding 的旧工件——skip 分支按 file+title 归一化比对工件 finding 与当前锚点(完整 dedup\_key 会因实例工件常缺 func/addr 误拒合法工件),不一致即弃用工件真实重跑,防复核结论整体错配无告警(target/1 实测 9/10 条右移一格)。报告据此把 `verified=None` 划进**独立未复核区段**(⚠ 未经复核,见下 summarize 素材)。上下文隔离铁律不破(每实例只从工件读,不传对话历史)
+* **verification 每疑点一实例(2026-09-01,ADR-0003,ticket 03/04)**:verification 从"单实例多疑点(24 轮内逐条复核)"改为**每 finding 一个独立复核实例**。analysis 产出 findings 后按 severity(critical>high>medium>low>info)主排序 + confidence(high>medium>low)次排序,取前 K 条(env `STEP5_VERIFY_K`,默认 10);对每条派独立实例,输入=单条 finding + 相关工件指针,**max\_iters=8**,逐条产单条 verified finding,聚合回 `verified_findings.json`(**全量 N 保留**:前 K 带 verified/rationale/confidence/severity——复核降级判级同覆盖,2026-09-03 两处覆盖集补 severity:orchestrator 锚点回填 + aggregator `_OVERRIDE_KEYS`,防工件 severity=high 与 rationale"降为 low"自相矛盾;未进 K 的 `verified=None`、confidence 保留 analysis 初值)。**补跑逻辑整体取消**——verification 只调度一次,自动对前 K 各派实例,不再适用"同类型最多 3 次"上限(代码注释 `orchestration/verify_phase.py` `verify_k` 明示)。**单实例断点续跑带身份校验(2026-09-03)**:实例目录名是全局 seq 位置而非 finding 身份,续跑时编排路径变化(如 analysis 补跑次数不同)会让 seq 前移、命中前一条 finding 的旧工件——skip 分支按 file+title 归一化比对工件 finding 与当前锚点(完整 dedup\_key 会因实例工件常缺 func/addr 误拒合法工件),不一致即弃用工件真实重跑,防复核结论整体错配无告警(target/1 实测 9/10 条右移一格)。报告据此把 `verified=None` 划进**独立未复核区段**(⚠ 未经复核,见下 summarize 素材)。上下文隔离铁律不破(每实例只从工件读,不传对话历史)
 
 * **recon v3:权限收敛+工件重构(2026-08-29)**:移除 `strings_query`/`imports_query`/`checksec`(深挖归 analysis/verification),新集 6 件套:`list_files, read_file, cve_bin_tool_scan, semgrep_scan, gitleaks_scan, binwalk_rescan`;`max_iters` 保持 20;工件改名 `survey.json`(schema v3):`arch_snapshot`(top\_level\_dirs/components\_grouped\[name+size,role 推断必附 role\_evidence]/os\_or\_runtime)+`components`(只收 cve\_bin\_tool\_scan Observation 实况)+`entry_points`+`high_risk_areas`(观察点,无判级)+`recommended_actions`(priority+action)+`summary`;**禁止** findings 数组与任意层级 severity/confidence/verified/evidence/rationale(解析层守护:违规键整条降级为 high\_risk\_areas 观察点)——判级与证据链移交 analysis;提示词防幻觉红线:high\_risk\_areas 只标工具 Observation 原文、components 版本/CVE 不凭记忆(v2 兼容层已移除,只读 survey.json)
 
@@ -162,7 +162,7 @@ def step5_run(ctx):
 
   * 防幻觉纪律入提示词: verification 硬规定"read\_file 报文件不存在 → 该 finding 必判 false\_positive,禁止猜路径";三 Agent 提示词对标 DeepAudit 五段式重写(角色/锚点/工作流+判定规则/协议+schema/纪律)
 
-* **终端监控显示(2026-08-19)**: `engine/display.py` 观察者层,react\_loop 7 个事件点 + runner stage/done 喂事件,Claude Code 风格打印思考/调用/结果/系统干预;`display=None`/NullDisplay 零侵入(有 `display_none_no_regression` 守护)。配置 `STEP5_DISPLAY=0|compact|full`、`STEP5_COLOR=0|1`(终端自动开色,管道自动无色)。demo:`python -m firmware_audit.step5_agent.demo_display`;详见 step5\_agent/DISPLAY.md
+* **终端监控显示(2026-08-19)**: `engine/display.py` 观察者层,react\_loop 7 个事件点 + runner stage/done 喂事件,Claude Code 风格打印思考/调用/结果/系统干预;`display=None`/NullDisplay 零侵入(有 `display_none_no_regression` 守护)。配置 `STEP5_DISPLAY=0|compact|full`、`STEP5_COLOR=0|1`(终端自动开色,管道自动无色)。demo:`python -m firmware_audit.step5_agent.demos.demo_display`;详见 step5\_agent/DISPLAY.md
 
 ### 交接约定
 
@@ -186,26 +186,42 @@ Step5 流程,不产出任何替代工件(无 survey/findings/report)。
 
 ## 三、工具层实现
 
-### 目录结构(2026-08-18 子文件夹重组:并列/附属关系入目录)
+### 目录结构(2026-09-05 编排层包化定稿,ADR-0009:并列/附属关系入目录)
 
 ```
 step5_agent/
   __init__.py              ← 对外只暴露 step5_run
   run_step5.py             ← L0 总控入口(python -m 路径不变;step5_run + resolve_workspace)
-  orchestrator.py          ← LLM 编排层(Orchestrator:调度门/每疑点一实例/报告落盘)
-  aggregator.py            ← findings 聚合纯逻辑(与 orchestrator 解耦)
-  runner.py                ← L1 单 Agent 执行(AgentConfig × 3 + run_agent)
-  demo_display.py          ← 终端显示演示脚本
+  aggregator.py            ← findings 聚合纯逻辑(与编排层解耦)
+  runner.py                ← L1 单 Agent 执行(AgentConfig × 3 + run_agent
+                             + post_run_status 执行后状态三岔判定单一出处)
+  orchestration/           ← LLM 编排层包(ADR-0009,T1-T6;包内依赖单向
+                             orchestrator → actions/verify_phase → handoff → state)
+    __init__.py            ← 包导出与分工说明
+    state.py               ← 共享词汇:调度状态枚举/中文标签/SubAgentResult(环的切断点)
+    orchestrator.py        ← 编排主体:Orchestrator 状态持有与登记/run() 主循环/
+                             budget 集群/报告与对账与终态落盘
+    actions.py             ← 三动作工具类(dispatch_agent/summarize/finish)
+                             + 调度守卫纯函数(顺序门/唯一性/上限/续跑判断)
+    handoff.py             ← 交接块构建 + 交接快照落盘
+    dispatch_log.py        ← DispatchLog 调度留痕(start/finish/interrupted/attempt 四动词)
+    verify_phase.py        ← verification 每疑点一实例引擎(排序取 K/续跑身份
+                             校验/锚点回填聚合/阶段终态)
+    reconciliation.py      ← 报告对账纯函数群(零 IO 零 LLM,ADR-0007)
   engine/                  ← ReAct 执行引擎(自包含,包内相对导入)
     __init__.py            ← 再导出 run_react_agent / ReactResult
     react_loop.py          ← L2 状态机(解析→分发→回喂→收尾;display 钩子)
     protocol.py            ← L3 纯函数协议解析(正则,零 IO)
     context.py             ← L3 四分区上下文 + 600k 阈值压缩
-    transcript.py          ← L3 Transcript(JSONL 事件流 + obs/ 全文落盘)
+    transcript.py          ← L3 Transcript(JSONL 事件流 + obs/ 全文落盘
+                             + reset_transcript 跑前清空统一入口)
     display.py             ← L3 终端监控显示(2026-08-19,用法见 step5_agent/DISPLAY.md)
   data/                    ← 数据契约(纯数据形态,零引擎依赖)
     __init__.py
-    artifacts.py           ← Finding schema + 工件存取/摘要
+    artifacts.py           ← Finding schema + 工件存取/摘要 + 宽容 JSON 提取
+                             (extract_json_object)/聚合落盘(save_aggregate)/
+                             溯源回写(stamp_provenance)/severity 排序表
+                             (SEVERITY_RANK)/工件回写(rewrite_artifact)
     prompts.py             ← 三 Agent 系统提示词 + 任务简报构建器
   providers/               ← 外部资源接入(引擎鸭子类型消费)
     __init__.py
@@ -224,9 +240,11 @@ step5_agent/
       binwalk_rescan.py    ← CLI 类(binwalk 签名复扫+专用镜像回退,2026-08-18)
       web_search.py        ← API 类(DDG 免 key,2026-08-18)
       rules/semgrep_security.yaml  ← semgrep 本地规则(离线)
+  demos/                   ← 演示脚本子包(ADR-0009 T6 自顶层迁入)
+    demo_display.py        ← 终端显示演示(python -m firmware_audit.step5_agent.demos.demo_display)
 ```
 
-依赖规则:runner/run\_step5 接线;engine、data、providers 三个包互不 import;tools 附属 providers(与 llm\_client 并列,同属"外部能力提供方")。
+依赖规则:run\_step5 → orchestration → runner/aggregator 接线;orchestration → engine/data/providers;engine、data、providers 三个包互不 import 也不向上(runner 永不 import orchestration);tools 附属 providers(与 llm\_client 并列,同属"外部能力提供方")。分层规则由 AST 守护测试机器强制(`test_step5_layer_guard.py`,ADR-0009)。
 
 ### 核心抽象:ToolResult + AgentTool
 

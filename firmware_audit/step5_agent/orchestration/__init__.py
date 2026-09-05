@@ -14,7 +14,10 @@ actions(三动作工具类+调度守卫纯函数)、handoff(交接块构建+快�
 已落地(T4;包内依赖单向 orchestrator → actions → handoff → state,
 环由 state 切断),verify_phase(每疑点一实例复核引擎:排序取 K/续跑
 身份校验/锚点回填/阶段终态,编排主体只剩调用点与结果登记)已落地(T5;
-单向 orchestrator → actions/verify_phase → …)。包内导入一律相对;
+单向 orchestrator → actions/verify_phase → …)。T6(2026-09-05)收尾:
+散落的同源知识收编 data/runner/engine 层单一出处(宽容 JSON 提取、聚合
+工件落盘、溯源回写、severity 排序表、执行后状态三岔判定、transcript
+跑前清空),demo 迁包内 demos/ 子包,七模块定稿。包内导入一律相对;
 依赖只准向下(orchestration → runner/aggregator/engine/data/providers,
 守护测试 test_step5_layer_guard.py 机器强制)。
 """

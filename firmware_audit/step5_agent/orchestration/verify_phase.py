@@ -26,20 +26,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .state import DispatchStatus, SubAgentResult
-from ..data.artifacts import load_artifact
+from ..data.artifacts import (CONFIDENCE_RANK, SEVERITY_RANK, load_artifact,
+                              save_aggregate, stamp_provenance)
 from ..data.prompts import build_verify_single_brief
 from ..engine.display import make_display
 from ..providers.llm_client import LLMError
 from ..providers.tools.base import ToolResult
-from ..runner import run_agent
+from ..runner import post_run_status, run_agent
 
-# ADR-0003:verification 每疑点一实例——K 上限(env STEP5_VERIFY_K,默认 10)
-# 与排序 rank(severity 主排序 + confidence 次排序,从高到低;rank 表原 T4
-# 暂驻 actions 供 SummarizeTool 双消费,T5 随复核引擎一并迁入)。
+# ADR-0003:verification 每疑点一实例——K 上限(env STEP5_VERIFY_K,默认 10)。
+# 排序 rank 表(severity 主排序 + confidence 次排序)自 T6 起以 data 层
+# SEVERITY_RANK/CONFIDENCE_RANK 为单一出处(原 T4 暂驻 actions、T5 随复核
+# 引擎迁入的本模块定义收编到 data 层派生表)。
 DEFAULT_VERIFY_K = 10
-
-VERIFY_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-VERIFY_CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
 def verify_k() -> int:
@@ -67,9 +66,9 @@ def rank_findings(findings: list) -> list[dict]:
     """
     return sorted(
         [f for f in findings if isinstance(f, dict)],
-        key=lambda f: (VERIFY_SEVERITY_RANK.get(
+        key=lambda f: (SEVERITY_RANK.get(
             str(f.get("severity", "info")).lower(), 9),
-            VERIFY_CONFIDENCE_RANK.get(
+            CONFIDENCE_RANK.get(
                 str(f.get("confidence", "")).lower(), 9)))
 
 
@@ -145,7 +144,7 @@ def _lift_verify_verdict(loaded: dict | None, vfs: list) -> None:
 
 
 def _run_verify_one(vseq: int, finding: dict, upstream: Path,
-                    task: str, request: dict, *, cfg, agent_dir: Path,
+                    request: dict, *, cfg, agent_dir: Path,
                     process_dir: Path, base_llm, agg, force: bool) -> SubAgentResult:
     """单条 finding 的独立 verification 实例(ADR-0003)。
 
@@ -179,20 +178,13 @@ def _run_verify_one(vseq: int, finding: dict, upstream: Path,
                          extra_brief=build_verify_single_brief(
                              process_dir, finding))
         elapsed = int((time.time() - t0) * 1000)
-        if ares.ok and ares.artifact_path:
-            status = DispatchStatus.SUCCESS
-        elif ares.artifact_path and ares.artifact_path.suffix == ".md":
-            status = DispatchStatus.DEGRADED
-        else:
-            status = DispatchStatus.FAILED
+        status = post_run_status(ares)   # DispatchStatus 值域字符串(值即落盘值)
         loaded_v = (load_artifact(ares.artifact_path)
                     if ares.artifact_path else None)
         vfs = [f for f in (loaded_v or {}).get("findings", []) or []
                if isinstance(f, dict)]
         _lift_verify_verdict(loaded_v, vfs)
-        for f in vfs:                 # 溯源:该条复核结论产自本实例
-            f["source_agent"] = "verification"
-            f["instance_seq"] = vseq
+        stamp_provenance(vfs, "verification", vseq)  # 溯源:结论产自本实例
         react = ares.react
         budget_exhausted = bool(
             react and (react.steps >= cfg.max_iters or not react.finished))
@@ -279,7 +271,7 @@ def run_verify_phase(cfg, *, agent_dir: Path, process_dir: Path, base_llm,
             if disp.enabled:
                 disp.instance_tag(i, len(top))
             instances.append(
-                _run_verify_one(next_seq(), f, upstream, task, request,
+                _run_verify_one(next_seq(), f, upstream, request,
                                 cfg=cfg, agent_dir=agent_dir,
                                 process_dir=process_dir, base_llm=base_llm,
                                 agg=agg, force=force))
@@ -290,12 +282,8 @@ def run_verify_phase(cfg, *, agent_dir: Path, process_dir: Path, base_llm,
         phase_summary = (f"已复核 {verified_n}/{len(ranked)} 条"
                          f"(未进入前 {len(top)} 的 {len(ranked) - len(top)}"
                          " 条未复核,verified=None,confidence 保留 analysis 初值)")
-        out_path = agent_dir / cfg.output_name
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps({
-            "schema": 2, "agent": "verification", "summary": phase_summary,
-            "findings": phase_findings,
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        out_path = save_aggregate(agent_dir / cfg.output_name, "verification",
+                                  phase_summary, phase_findings)
 
         # 阶段终态:全部实例 SUCCESS/SKIPPED → success;任一 FAILED/DEGRADED
         # (仅 .md 降级工件,该条结论不完整)→ 阶段降级/失败,如实上报不冒充
@@ -359,6 +347,6 @@ def run_verify_phase(cfg, *, agent_dir: Path, process_dir: Path, base_llm,
             f"verification 阶段失败(实例 {seq}): {type(e).__name__}: {e}")))
 
 
-__all__ = ["DEFAULT_VERIFY_K", "VERIFY_SEVERITY_RANK", "VERIFY_CONFIDENCE_RANK",
-           "verify_k", "rank_findings", "resume_identity_matches",
-           "merge_verdicts", "run_verify_phase", "VerifyPhaseOutcome"]
+__all__ = ["DEFAULT_VERIFY_K", "verify_k", "rank_findings",
+           "resume_identity_matches", "merge_verdicts", "run_verify_phase",
+           "VerifyPhaseOutcome"]

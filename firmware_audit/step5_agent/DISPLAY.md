@@ -11,11 +11,11 @@ Step5 Agent 审计执行过程的终端实时展示(Claude Code 风格,非流式
 python -m firmware_audit.main target/1
 
 # 效果演示(零 API 零 Docker,ScriptedLLM 回放三个典型场景)
-python -m firmware_audit.step5_agent.demo_display
+python -m firmware_audit.step5_agent.demos.demo_display
 
 # 彩色 / 完整模式 / 关闭
-STEP5_COLOR=1 python -m firmware_audit.step5_agent.demo_display
-STEP5_DISPLAY=full python -m firmware_audit.step5_agent.demo_display
+STEP5_COLOR=1 python -m firmware_audit.step5_agent.demos.demo_display
+STEP5_DISPLAY=full python -m firmware_audit.step5_agent.demos.demo_display
 STEP5_DISPLAY=0 python -m firmware_audit.main target/1
 ```
 

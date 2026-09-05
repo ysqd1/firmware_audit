@@ -30,7 +30,7 @@
 
 * [Step4 不透明分诊 triage](#step4-不透明分诊-triage)
 
-* [Step5 Agent 工具层](#step5-agent-工具层)（含 [list\_files](#list_files--目录文件枚举参考-deepaudit-listfilestool)、[search\_code](#search_code--按内容混合检索边车索引--extracted-文本-grep)、[编排层工具](#编排层工具orchestratorpy不在-providerstools-注册表)、[权限矩阵](#agent--工具权限矩阵v32026-08-29)）
+* [Step5 Agent 工具层](#step5-agent-工具层)（含 [list\_files](#list_files--目录文件枚举参考-deepaudit-listfilestool)、[search\_code](#search_code--按内容混合检索边车索引--extracted-文本-grep)、[编排层工具](#编排层工具orchestrationactionspy不在-providerstools-注册表)、[权限矩阵](#agent--工具权限矩阵v32026-08-29)）
 
 * [Step5 引擎与编排](#step5-引擎与编排)
 
@@ -50,7 +50,7 @@
 | Step4 | `step4/step4_decompile.py`                           | Ghidra 反编译 + 文本/密钥扫描                         | ghidra                        |
 | Step4 | `step4/triage.py`                                    | 不透明固件分诊                                      | 否                             |
 | Step5 | `step5_agent/providers/tools/`                       | 15 个 Agent 工具（含 `list_files`/`search_code`） | 部分走 sandbox/binwalk           |
-| Step5 | `step5_agent/orchestrator.py`                        | 编排层工具（`dispatch_agent`/`summarize`/`finish`） | —                             |
+| Step5 | `step5_agent/orchestration/actions.py`               | 编排层工具（`dispatch_agent`/`summarize`/`finish`） | —                             |
 | Step5 | `step5_agent/engine/` + `runner.py` + `run_step5.py` | ReAct 引擎与编排                                  | —                             |
 
 ***
@@ -1069,7 +1069,7 @@ docker run --rm --entrypoint cve-bin-tool `
 
 ***
 
-### 编排层工具（`orchestrator.py`，不在 providers/tools 注册表）
+### 编排层工具（`orchestration/actions.py`，不在 providers/tools 注册表）
 
 Orchestrator 自己的 ReAct 循环只暴露这 3 个动作，与子 Agent 的 15 个工具互不共享：
 
@@ -1139,7 +1139,7 @@ Orchestrator 自己的 ReAct 循环只暴露这 3 个动作，与子 Agent 的 1
 
 * 超阈值（默认 600k token，60% 窗口）自动压缩旧轮次。
 
-### 编排 `runner.py` + `orchestrator.py`
+### 编排 `orchestration/` 包 + `runner.py`
 
 * `AgentConfig{name, system_prompt, tool_names, output_name, max_iters, model, build_brief, label}`。
 

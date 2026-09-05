@@ -146,7 +146,7 @@ _Avoid_: 本地工具, 便宜工具
 _Avoid_: 工具返回, 结果(太泛)
 
 **上游工件 (upstream artifact)**:
-交接给某子 Agent 的前序阶段工件:analysis 的上游是 survey.json,verification 的上游是 findings.json。orchestrator 用 `_latest_upstream` 取最近一次已完成调度的工件。缺件时下游调度被拒。
+交接给某子 Agent 的前序阶段工件:analysis 的上游是 survey.json,verification 的上游是 findings.json。orchestrator 用 `latest_upstream`(orchestration/actions.py 守卫函数)取最近一次已完成调度的工件。缺件时下游调度被拒。
 
 **交接 (handoff)**:
 orchestrator 注入子 Agent 简报尾部的上下文块:前序任务状态、同类型前次结果、累计发现、任务上下文;补跑时追加已覆盖清单与差分提示。结构化快照落盘 `handoff_<seq>_<type>.json`。
@@ -188,7 +188,7 @@ FileInfo 上的审计结论字段,值域 `pending / passed / suspicious / failed
 _Avoid_: 状态, 审核状态
 
 **严重度 (severity)**:
-finding 的严重度等级,值域 `critical / high / medium / low / info`(`data/artifacts.py:SEVERITIES`),orchestrator 汇总时按此排序。
+finding 的严重度等级,值域 `critical / high / medium / low / info`(`data/artifacts.py:SEVERITIES`,排序权重表 `SEVERITY_RANK` 由它派生的单一出处),orchestrator 汇总与复核取前 K 时按此排序。
 _Avoid_: 等级, 风险等级(风险有可利用性含义)
 
 **置信度 (confidence)**:

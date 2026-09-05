@@ -16,6 +16,13 @@ from pathlib import Path
 FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*\}|\[.*\])\s*```", re.S)
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
+CONFIDENCES = ("high", "medium", "low")
+
+# 排序权重表(单一出处,T6 收编):列表序即从高到低,序号即排序键。
+# 消费方:复核引擎取前 K 排序(verify_phase.rank_findings)、summarize 清单
+# 呈现(actions.SummarizeTool)。表外键(空/未知枚举)由消费方给大数兜底。
+SEVERITY_RANK = {s: i for i, s in enumerate(SEVERITIES)}
+CONFIDENCE_RANK = {c: i for i, c in enumerate(CONFIDENCES)}
 
 
 @dataclass
@@ -124,6 +131,58 @@ def save_artifact(path: Path, agent: str, parsed: dict | None, raw: str) -> Path
     return md
 
 
+def save_aggregate(path: Path, agent: str, summary: str, findings: list) -> Path:
+    """聚合工件落盘(T6 收编):编排层聚合产物走 schema v2 容器,无 .md 降级。
+
+    与 save_artifact 的分工:后者承接 LLM Final Answer(解析失败降级 .md);
+    本函数承接编排侧已聚合好的 findings(verification 每疑点一实例的阶段
+    产物,merge_verdicts 输出),字段原样写入不解析不降级——溯源字段由
+    调用方经 stamp_provenance/merge_verdicts 补齐。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema": SCHEMA_VERSION, "agent": agent, "summary": summary,
+        "findings": findings,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def stamp_provenance(findings: list, agent: str, seq: int,
+                     only_missing: bool = False) -> None:
+    """schema v2 溯源字段回写(就地):每条 dict finding 标 source_agent/instance_seq。
+
+    runner 落盘时不知道 seq(save_artifact 只补 source_agent),seq 由编排层
+    调度返回后回填。两种策略(与收编前各消费点语义逐字一致):
+    - only_missing=False(verification 复核语义,默认):无条件覆盖——复核
+      结论产自哪个实例必须如实标注,实例返回工件自带值不保留;
+    - only_missing=True(编排调度回填语义,actions):instance_seq 仅缺省时补
+      (断点续跑工件保留原始实例号),source_agent 不动(落盘时已补)。
+    """
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        if only_missing:
+            if f.get("instance_seq") is None:
+                f["instance_seq"] = seq
+        else:
+            f["source_agent"] = agent
+            f["instance_seq"] = seq
+
+
+def rewrite_artifact(path: Path, obj: dict) -> bool:
+    """工件回写磁盘(T6 收编):溯源/归一化回填后整包重写。
+
+    OSError 吞掉返回 False——回填失败不阻塞调度(聚合层 ingest 仍会补),
+    与收编前 actions 的 try/except-pass 语义一致。
+    """
+    try:
+        path.write_text(json.dumps(obj, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
 def load_artifact(path: Path) -> dict | None:
     """读回工件(断点续跑喂下游)。宽容:失败返回 None。
     v1 工件(无 source_agent/instance_seq)读到时补默认值,消费方无感。"""
@@ -191,8 +250,12 @@ def _tostr(v) -> str:
         return str(v)
 
 
-def _extract_json_object(text: str) -> dict | None:
-    """从文本中宽容取出一个 dict JSON(首个 { 到最后一个 })。"""
+def extract_json_object(text: str) -> dict | None:
+    """从文本中宽容取出一个 dict JSON(首个 { 到最后一个 })。
+
+    宽容 JSON 提取的单一出处(T6 收编):survey 解析与编排层 report.json
+    副产品共用;调用方先剥围栏(strip_fence)。非 dict/解析失败返回 None。
+    """
     if not text:
         return None
     start, end = text.find("{"), text.rfind("}")
@@ -296,7 +359,7 @@ def parse_survey_artifact(final_answer: str) -> dict | None:
     rationale(任意层级)出现即拒绝并降级为 high_risk_areas 观察点 + summary 注明
     (v2 兼容层已移除,旧 attack_surface 结构不再宽容转换)。解析彻底失败返回 None(调用方降级存 .md)。
     """
-    obj = _extract_json_object(strip_fence(final_answer.strip()))
+    obj = extract_json_object(strip_fence(final_answer.strip()))
     if obj is None:
         return None
     return _normalize_survey(obj)
