@@ -9,7 +9,10 @@ T1(ADR-0009)整体迁入为单模块 orchestration/orchestrator.py;后续票
 按单一职责解体为 state/orchestrator/actions/handoff/dispatch_log/
 verify_phase/reconciliation——其中 reconciliation(报告对账纯函数群)
 已落地(T2),dispatch_log(调度留痕小类,start/finish/interrupted/attempt
-四动词)已落地(T3)。包内导入一律相对;依赖只准向下
+四动词)已落地(T3),state(共享词汇:状态枚举/标签/结果封装)、
+actions(三动作工具类+调度守卫纯函数)、handoff(交接块构建+快照落盘)
+已落地(T4;包内依赖单向 orchestrator → actions → handoff → state,
+环由 state 切断)。包内导入一律相对;依赖只准向下
 (orchestration → runner/aggregator/engine/data/providers,守护测试
 test_step5_layer_guard.py 机器强制)。
 """

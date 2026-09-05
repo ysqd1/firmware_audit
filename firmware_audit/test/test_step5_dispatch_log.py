@@ -154,22 +154,6 @@ def test_attempt_one_shot_record() -> list[str]:
     return fails
 
 
-def test_status_literals_match_dispatchstatus() -> list[str]:
-    """漂移守护:模块内字面量与编排主体 DispatchStatus 同值域(值即落盘契约;
-    state 模块 T4 落地后由此收编,收编前靠本测试防两处人肉对齐漂移)。"""
-    from firmware_audit.step5_agent.orchestration.orchestrator import DispatchStatus
-    from firmware_audit.step5_agent.orchestration import dispatch_log
-
-    fails: list[str] = []
-    if dispatch_log._RUNNING != DispatchStatus.RUNNING:
-        fails.append(f"_RUNNING 应与 DispatchStatus.RUNNING 同值: "
-                     f"{dispatch_log._RUNNING!r} != {DispatchStatus.RUNNING!r}")
-    if dispatch_log._INTERRUPTED != DispatchStatus.INTERRUPTED:
-        fails.append(f"_INTERRUPTED 应与 DispatchStatus.INTERRUPTED 同值: "
-                     f"{dispatch_log._INTERRUPTED!r} != {DispatchStatus.INTERRUPTED!r}")
-    return fails
-
-
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -177,7 +161,6 @@ def test_main() -> int:
         ("finish_backfills_terminal_state", test_finish_backfills_terminal_state),
         ("interrupted_backfills_running_only", test_interrupted_backfills_running_only),
         ("attempt_one_shot_record", test_attempt_one_shot_record),
-        ("status_literals_match_dispatchstatus", test_status_literals_match_dispatchstatus),
     ]:
         fl = fn()
         if fl:

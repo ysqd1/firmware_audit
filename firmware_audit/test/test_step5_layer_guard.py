@@ -155,11 +155,35 @@ def test_no_legacy_top_level_orchestrator() -> list[str]:
     return fails
 
 
+def test_orchestration_internal_edges() -> list[str]:
+    """编排包内边守护(T4):state/dispatch_log/handoff/actions 不得 import
+    编排主体 orchestrator——orchestrator 装配动作类、被动作回调,环由 state
+    切断,import 必须单向 orchestrator → actions → handoff → state(ADR-0009)。"""
+    fails: list[str] = []
+    for name in ("state", "dispatch_log", "handoff", "actions"):
+        py = PKG_ROOT / "orchestration" / f"{name}.py"
+        if not py.is_file():
+            continue  # 未到票的模块尚不存在,不空守护
+        tree = ast.parse(py.read_text(encoding="utf-8-sig"))
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                targets = [node.module]
+            elif isinstance(node, ast.Import):
+                targets = [a.name for a in node.names]
+            for t in targets:
+                if t.split(".")[-1] == "orchestrator":
+                    fails.append(f"orchestration/{name}.py 不得 import orchestrator"
+                                 "(包内依赖无环:环由 state 切断,反向边即环复活,ADR-0009 T4)")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in (
         ("dependency_layering", test_dependency_layering),
         ("no_legacy_top_level_orchestrator", test_no_legacy_top_level_orchestrator),
+        ("orchestration_internal_edges", test_orchestration_internal_edges),
     ):
         fl = fn()
         if fl:

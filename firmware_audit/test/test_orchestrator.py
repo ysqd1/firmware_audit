@@ -23,10 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from firmware_audit.step5_agent.orchestration.orchestrator import (
     Orchestrator,
-    SubAgentResult,
+    build_orchestrator_prompt,
+)
+from firmware_audit.step5_agent.orchestration.state import SubAgentResult
+from firmware_audit.step5_agent.orchestration.actions import (
     DispatchAgentTool,
     SummarizeTool,
-    build_orchestrator_prompt,
     MAX_DISPATCH_PER_AGENT,
 )
 from firmware_audit.step5_agent.data.artifacts import load_artifact
@@ -141,11 +143,11 @@ def test_max_iters_env_override() -> list[str]:
         if VERIFY_CFG.max_iters != 8:
             fails.append("模块常量 VERIFY_CFG 不应被 env 污染")
         orch = _orch(Path(tempfile.mkdtemp()), ScriptedLLM([]))
-        if orch._sub_cfgs["verification"].max_iters != 3:
+        if orch.sub_cfgs["verification"].max_iters != 3:
             fails.append("Orchestrator 应消费 env 覆盖后的 verification max_iters=3")
-        if orch._sub_cfgs["recon"].max_iters != RECON_CFG.max_iters:
+        if orch.sub_cfgs["recon"].max_iters != RECON_CFG.max_iters:
             fails.append("未覆盖的 agent 应保持默认")
-        if orch._sub_cfgs["analysis"].max_iters != ANALYSIS_CFG.max_iters:
+        if orch.sub_cfgs["analysis"].max_iters != ANALYSIS_CFG.max_iters:
             fails.append("未覆盖的 analysis 应保持默认")
     finally:
         del os.environ["STEP5_VERIFICATION_MAX_ITERS"]
@@ -1110,14 +1112,14 @@ def test_handoff_snapshot_file() -> list[str]:
 
 
 def test_status_enum_closed() -> list[str]:
-    """状态值域闭合:DispatchStatus.ALL 覆盖全部标签;_STATUS_LABEL 键一致。"""
+    """状态值域闭合:DispatchStatus.ALL 覆盖全部标签;state.STATUS_LABEL 键一致。"""
     fails: list[str] = []
-    from firmware_audit.step5_agent.orchestration.orchestrator import DispatchStatus, _STATUS_LABEL
+    from firmware_audit.step5_agent.orchestration.state import DispatchStatus, STATUS_LABEL
     if len(set(DispatchStatus.ALL)) != len(DispatchStatus.ALL):
         fails.append("DispatchStatus.ALL 不应有重复值")
-    if set(_STATUS_LABEL) != set(DispatchStatus.ALL):
-        fails.append(f"_STATUS_LABEL 键集应与 DispatchStatus.ALL 一致: "
-                     f"{set(_STATUS_LABEL) ^ set(DispatchStatus.ALL)}")
+    if set(STATUS_LABEL) != set(DispatchStatus.ALL):
+        fails.append(f"STATUS_LABEL 键集应与 DispatchStatus.ALL 一致: "
+                     f"{set(STATUS_LABEL) ^ set(DispatchStatus.ALL)}")
     # 常量即落盘字符串
     if DispatchStatus.DEGRADED != "degraded":
         fails.append("DEGRADED 值应为 'degraded'(落盘值)")
@@ -1138,10 +1140,10 @@ def test_ingest_merge_dedup() -> list[str]:
               "addr": "0x1000", "evidence": "system(cmd)", "severity": "high"}
         f2 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
               "addr": "0x1000", "confidence": "high", "verified": True}
-        from firmware_audit.step5_agent.orchestration.orchestrator import SubAgentResult
-        orch._register(SubAgentResult(seq=0, agent_name="analysis", status="success",
+        from firmware_audit.step5_agent.orchestration.state import SubAgentResult
+        orch.register(SubAgentResult(seq=0, agent_name="analysis", status="success",
                                       findings=[f1], request={}))
-        orch._register(SubAgentResult(seq=1, agent_name="analysis", status="success",
+        orch.register(SubAgentResult(seq=1, agent_name="analysis", status="success",
                                       findings=[f2], request={}))
         if len(orch.all_findings) != 1:
             fails.append(f"同键应合并为 1 条: {len(orch.all_findings)}")
@@ -1161,7 +1163,7 @@ def test_aggregator_module() -> list[str]:
     重合计分/recon 跳过,纯逻辑可直接单测。"""
     fails: list[str] = []
     from firmware_audit.step5_agent.aggregator import FindingAggregator
-    from firmware_audit.step5_agent.orchestration.orchestrator import SubAgentResult
+    from firmware_audit.step5_agent.orchestration.state import SubAgentResult
 
     # 1. 聚合 + 同键去重合并
     agg = FindingAggregator()
@@ -1315,10 +1317,10 @@ def test_ingest_verification_overrides() -> list[str]:
         f2 = {"title": "注入", "file": "unitree/bin/idlc", "func": "main",
               "addr": "0x1000", "severity": "low", "confidence": "low",
               "verified": False, "rationale": "证据与工件不符"}
-        from firmware_audit.step5_agent.orchestration.orchestrator import SubAgentResult
-        orch._register(SubAgentResult(seq=0, agent_name="analysis", status="success",
+        from firmware_audit.step5_agent.orchestration.state import SubAgentResult
+        orch.register(SubAgentResult(seq=0, agent_name="analysis", status="success",
                                       findings=[f1], request={}))
-        orch._register(SubAgentResult(seq=1, agent_name="verification", status="success",
+        orch.register(SubAgentResult(seq=1, agent_name="verification", status="success",
                                       findings=[f2], request={}))
         m = orch.all_findings[0]
         if m.get("verified") is not False or m.get("rationale") != "证据与工件不符":
@@ -1341,18 +1343,18 @@ def test_ingest_skips_recon_v3() -> list[str]:
         llm = ScriptedLLM([])
         orch = _orch(td, llm)
         # recon v3:哪怕带残留 findings 也不得进 _all_findings
-        orch._register(SubAgentResult(seq=0, agent_name="recon", status="success",
+        orch.register(SubAgentResult(seq=0, agent_name="recon", status="success",
                                       findings=[{"title": "残留", "severity": "high",
                                                  "file": "unitree/bin/idlc"}],
                                       request={}))
         if orch.all_findings:
             fails.append(f"recon v3 不应聚合任何 finding: {orch.all_findings}")
         # analysis/verification 正常聚合
-        orch._register(SubAgentResult(seq=1, agent_name="analysis", status="success",
+        orch.register(SubAgentResult(seq=1, agent_name="analysis", status="success",
                                       findings=[{"title": "真发现", "severity": "high",
                                                  "file": "unitree/bin/idlc"}],
                                       request={}))
-        orch._register(SubAgentResult(seq=2, agent_name="verification", status="success",
+        orch.register(SubAgentResult(seq=2, agent_name="verification", status="success",
                                       findings=[{"title": "真发现", "severity": "high",
                                                  "file": "unitree/bin/idlc",
                                                  "verified": True}],

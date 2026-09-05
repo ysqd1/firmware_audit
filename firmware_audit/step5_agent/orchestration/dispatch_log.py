@@ -14,11 +14,10 @@ started_at/finished_at/duration_ms/artifact_path/summary/error/
 status_history(+budget_state/duplicate_of 条件键)。每次记录变更即整表
 落盘(发起即留痕:编排进程异常退出也不丢已发生的调度史)。
 
-包内叶子:不 import 编排主体(spec 包内依赖方向:orchestrator → 各模块,
-禁止反向)。模块内使用的
-running/interrupted 落盘状态字面量即 dispatch_log.json 的契约值,与编排主体
-DispatchStatus 值域一致(state 模块(T4)落地后由共享词表收编);_now
-时间戳 helper 按 spec"小格式化 helper 留在各自消费者旁"在此原地保留一份。
+包内依赖:只 import state(共享词汇 DispatchStatus;T4 收编本模块原临时
+重复的 running/interrupted 落盘字面量,值不变)。不 import 编排主体(spec
+包内依赖方向:orchestrator → 各模块,禁止反向)。_now 时间戳 helper 按
+spec"小格式化 helper 留在各自消费者旁"在此原地保留一份。
 """
 from __future__ import annotations
 
@@ -27,10 +26,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# 本模块内部使用的落盘状态字面量(值即 dispatch_log.json 契约值,
-# 与编排主体 DispatchStatus.RUNNING/INTERRUPTED 一致)
-_RUNNING = "running"
-_INTERRUPTED = "interrupted"
+from .state import DispatchStatus
 
 
 def _now() -> str:
@@ -60,10 +56,10 @@ class DispatchLog:
 
     def start(self, seq: int, agent: str, task: str, request: dict) -> dict:
         """登记调度开始(running),返回记录引用供终态回填。"""
-        rec = {"seq": seq, "agent": agent, "task": task, "status": _RUNNING,
+        rec = {"seq": seq, "agent": agent, "task": task, "status": DispatchStatus.RUNNING,
                "request": request, "started_at": _now(), "finished_at": None,
                "duration_ms": None, "artifact_path": None, "summary": "",
-               "error": "", "status_history": [{"status": _RUNNING, "ts": _now()}]}
+               "error": "", "status_history": [{"status": DispatchStatus.RUNNING, "ts": _now()}]}
         self._records.append(rec)
         self._flush()
         return rec
@@ -89,12 +85,12 @@ class DispatchLog:
     def interrupted(self, rec: dict) -> None:
         """执行中断兜底:run_agent 抛异常向上传播时,running 记录回填为
         interrupted(LLMError 终止整个 Step5 的场景),不留悬挂的运行中状态。"""
-        if rec.get("status") == _RUNNING:
-            rec["status"] = _INTERRUPTED
+        if rec.get("status") == DispatchStatus.RUNNING:
+            rec["status"] = DispatchStatus.INTERRUPTED
             rec["finished_at"] = _now()
             rec["error"] = rec.get("error") or "子 Agent 执行中断(异常向上传播)"
             rec["status_history"].append(
-                {"status": _INTERRUPTED, "ts": _now()})
+                {"status": DispatchStatus.INTERRUPTED, "ts": _now()})
             self._flush()
 
     def attempt(self, agent: str, task: str, request: dict, status: str,
