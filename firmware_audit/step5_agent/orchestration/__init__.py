@@ -12,7 +12,9 @@ verify_phase/reconciliation——其中 reconciliation(报告对账纯函数群)
 四动词)已落地(T3),state(共享词汇:状态枚举/标签/结果封装)、
 actions(三动作工具类+调度守卫纯函数)、handoff(交接块构建+快照落盘)
 已落地(T4;包内依赖单向 orchestrator → actions → handoff → state,
-环由 state 切断)。包内导入一律相对;依赖只准向下
-(orchestration → runner/aggregator/engine/data/providers,守护测试
-test_step5_layer_guard.py 机器强制)。
+环由 state 切断),verify_phase(每疑点一实例复核引擎:排序取 K/续跑
+身份校验/锚点回填/阶段终态,编排主体只剩调用点与结果登记)已落地(T5;
+单向 orchestrator → actions/verify_phase → …)。包内导入一律相对;
+依赖只准向下(orchestration → runner/aggregator/engine/data/providers,
+守护测试 test_step5_layer_guard.py 机器强制)。
 """

@@ -19,10 +19,11 @@
   Observation 尾部呈现结构化 budget_state(exhausted/steps/pending_focuses/
   overlap_ratio);analysis 预算耗尽且仍有未覆盖疑点时附补跑建议;补跑
   dispatch 的简报追加已覆盖清单(前 30 条)与差分 task 提示
-- 模块分工(ADR-0009 T4): 调度守卫与三动作工具类在本包 actions 模块、交接
-  块构建/快照落盘在 handoff、共享词汇(状态枚举/标签/结果封装)在 state——
-  本模块只剩编排主体: 状态持有与登记、run() 主循环、verification 阶段引擎
-  (T5 迁 verify_phase)、budget 集群、报告/对账/终态落盘
+- 模块分工(ADR-0009 T4/T5): 调度守卫与三动作工具类在本包 actions 模块、
+  交接块构建/快照落盘在 handoff、共享词汇(状态枚举/标签/结果封装)在 state、
+  verification 每疑点一实例引擎在 verify_phase(T5 迁出)——本模块只剩
+  编排主体: 状态持有与登记、run() 主循环、verify_phase 调用点、budget 集群、
+  报告/对账/终态落盘
 
 目录落盘 (以 process/agent/ 为根):
 - orchestrator/  : transcript.jsonl(编排 LLM 输出)、dispatch_log.json(全量
@@ -39,28 +40,25 @@ API 失败(LLMError)不在工具层吞掉,向上传播立即终止(保持既有�
 from __future__ import annotations
 
 import json
-import os
 import sys
-import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from .actions import (MAX_DISPATCH_PER_AGENT, _VERIFY_CONFIDENCE_RANK,
-                      _VERIFY_SEVERITY_RANK, agent_call_count,
+from .actions import (MAX_DISPATCH_PER_AGENT, agent_call_count,
                       DispatchAgentTool, FinishTool, SummarizeTool)
 from .dispatch_log import DispatchLog
 from .reconciliation import reconcile_report
-from .state import DispatchStatus, SubAgentResult
+from .state import SubAgentResult
+from .verify_phase import run_verify_phase, verify_k
 from ..aggregator import FindingAggregator
 from ..data.artifacts import load_artifact, load_survey
-from ..data.prompts import build_system_prompt, build_verify_single_brief, save_system_prompt
+from ..data.prompts import build_system_prompt, save_system_prompt
 from ..engine.display import make_display
 from ..engine.react_loop import run_react_agent
-from ..providers.llm_client import LLMError
 from ..providers.tools import ToolContext
 from ..providers.tools.base import ToolResult
-from ..runner import ALL_CONFIGS, resolve_max_iters, run_agent
+from ..runner import ALL_CONFIGS, resolve_max_iters
 
 # 多次调用下编排轮数上限:默认 3 次调度+summarize+收尾,余量留给补充调用
 ORCH_MAX_ITERS = 12
@@ -69,29 +67,10 @@ ORCH_MAX_ITERS = 12
 # 日志;pending_count 始终是全量数)
 _BUDGET_FOCUS_LIMIT = 8
 
-# ADR-0003:verification 每疑点一实例——K 上限(env STEP5_VERIFY_K,默认 10)
-# 与排序 rank(severity 主排序 + confidence 次排序,从高到低;rank 表暂驻
-# actions,双消费见该模块 docstring)。
-DEFAULT_VERIFY_K = 10
-
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
-
-def _verify_k() -> int:
-    """verification 每疑点一实例的调度预算(analysis findings 取前 K 条复核)。
-
-    env STEP5_VERIFY_K 可配置(默认 10);非法值/缺失回落默认。K 即调度上限——
-    同类型 3 次上限(MAX_DISPATCH_PER_AGENT)不适用于 verification:调度语义
-    已改为按 finding 计数(K 上限),补跑逻辑整体取消(ADR-0003)。
-    """
-    raw = os.environ.get("STEP5_VERIFY_K", "").strip()
-    try:
-        k = int(raw) if raw else DEFAULT_VERIFY_K
-    except ValueError:
-        return DEFAULT_VERIFY_K
-    return max(1, k)
 
 # 提示词结构(2026-08-29 统一 8 节骨架,与三子 Agent 对齐):
 # 角色 → 可调度子Agent/工作区 → 输入输出 → 执行流程 → 判定规范 → 红线 → 输出协议 → 纪律
@@ -214,11 +193,11 @@ Action Input: <JSON 参数,一行写完;此行之后立即停止输出,禁止追
 def _orch_system() -> str:
     """编排器系统提示词模板格式化(调度上限 + K 值在调用时注入)。
 
-    K 取当前生效值 `_verify_k()`(env STEP5_VERIFY_K 可配置,默认 10),避免
-    提示词与运行时实际复核条数不一致误导编排 LLM。无模块级常量:env 可能在
-    import 之后才设置(测试/配置覆盖),延迟到构建时求值。
+    K 取当前生效值 `verify_k()`(env STEP5_VERIFY_K 可配置,默认 10,定义在
+    verify_phase),避免提示词与运行时实际复核条数不一致误导编排 LLM。无
+    模块级常量:env 可能在 import 之后才设置(测试/配置覆盖),延迟到构建时求值。
     """
-    return _ORCH_TMPL % (MAX_DISPATCH_PER_AGENT, _verify_k(), MAX_DISPATCH_PER_AGENT)
+    return _ORCH_TMPL % (MAX_DISPATCH_PER_AGENT, verify_k(), MAX_DISPATCH_PER_AGENT)
 
 
 def build_orchestrator_prompt(tools: dict, max_iters: int = ORCH_MAX_ITERS) -> str:
@@ -236,8 +215,8 @@ class Orchestrator:
     _agent_results 按类型保留最新实例(供 step5_run 阶段统计与 summarize 消费)。
     本类装配三动作工具类(DispatchAgentTool/SummarizeTool/FinishTool,守卫与
     调度前置校验见 actions 模块)并被其回调(host 回调面见 actions 模块
-    docstring)——编排主体只剩状态持有与登记 + verification 阶段引擎(T5 迁
-    verify_phase)+ budget 集群 + 报告/对账/终态落盘。
+    docstring)——编排主体只剩状态持有与登记 + verification 阶段调用点(引擎
+    在 verify_phase,T5 迁出)+ budget 集群 + 报告/对账/终态落盘。
     """
 
     def __init__(self, process_dir: Path, base_llm, force: bool = False):
@@ -284,258 +263,32 @@ class Orchestrator:
         self._agent_results[sub.agent_name] = sub
         self._agg.ingest(sub)
 
-    # ---- ADR-0003: verification 每疑点一实例 ----
+    # ---- ADR-0003: verification 每疑点一实例(引擎在 verify_phase,T5 迁出) ----
 
     def run_verification_phase(self, task: str, upstream: Path,
                                seq: int, request: dict, t0: float) -> ToolResult:
-        """verification 阶段(每疑点一实例):一次调度 → K 条独立实例 → 聚合工件。
+        """verification 阶段调用点:委托 verify_phase 引擎,登记其阶段结果。
 
-        流程:读 analysis findings → severity 主排序 + confidence 次排序取前 K 条
-        (STEP5_VERIFY_K,默认 10)→ 对每条派一个独立 verification 实例(max_iters=8,
-        输入=单条 finding + 工件指针)→ 逐条产单条 verified finding → 聚合回
-        verified_findings.json(全量 N 条:K 条带复核结论,N-K 条 verified=None,
-        confidence 保留 analysis 初值)。补跑逻辑整体取消(每条必被验证)。
+        引擎显式收依赖(子 Agent 配置/工作区/LLM/上游 findings/聚合器/force)
+        与留痕回调(dispatch_log 四动词/next_seq/budget_state),排序取 K、
+        单实例续跑身份校验、锚点回填聚合与阶段终态判定全在 verify_phase;
+        本方法只剩登记:调度史/同类型最新(register)、逐实例明细
+        (_verification_instances)、防重复标记(_verification_done)。
+        LLMError 由引擎回填 interrupted 后原样上抛(立即终止语义不变)。
         """
-        cfg = self.sub_cfgs["verification"]
-        rec = self.dispatch_log.start(seq, "verification", task, request)
-        try:
-            # 断点续跑(阶段级):聚合工件已存在且未 force → skipped
-            agg_path = self.agent_dir / cfg.output_name
-            if agg_path.is_file() and not self.force:
-                loaded = load_artifact(agg_path) or {}
-                sub = SubAgentResult(
-                    seq=seq, agent_name="verification", status=DispatchStatus.SKIPPED,
-                    artifact_path=agg_path,
-                    summary=(loaded or {}).get("summary", ""),
-                    findings=(loaded or {}).get("findings", []) or [],
-                    request=request,
-                    duration_ms=int((time.time() - t0) * 1000))
-                self.register(sub)
-                self._verification_done = True
-                self.dispatch_log.finish(rec, DispatchStatus.SKIPPED,
-                                         artifact=str(agg_path), summary=sub.summary,
-                                         budget_state=self.budget_state("verification"))
-                verified = sum(1 for f in sub.findings
-                               if f.get("verified") is not None)
-                return ToolResult(ok=True, text=(
-                    f"## verification Agent 结果(每疑点一实例,工件已存在,实例 {seq})\n"
-                    f"已复核 {verified}/{len(sub.findings)} 条(其余未复核,verified=None)。"
-                    f"工件: {agg_path.name}\n"
-                    f"(下一步: 调用 summarize 取报告素材)"))
-
-            # 源:analysis 已聚合 findings(跨多次调度去重合并后的全部候选 N 条)。
-            # 不用最新 analysis 工件——多次调度时最新实例只有本轮的 findings,
-            # 会丢前几轮已产出候选(ADR-0003 的 N 条候选 = 聚合全量)。
-            src = [f for f in self.all_findings if isinstance(f, dict)]
-            ranked = sorted(
-                src,
-                key=lambda f: (_VERIFY_SEVERITY_RANK.get(
-                    str(f.get("severity", "info")).lower(), 9),
-                    _VERIFY_CONFIDENCE_RANK.get(
-                        str(f.get("confidence", "")).lower(), 9)))
-            top = ranked[: _verify_k()]
-
-            # 逐条派独立实例(每条必跑;补跑逻辑整体取消);每实例启动前标
-            # "实例 i/N"(#6):单实例 done 行恒 1 findings,不标序号会误导为
-            # 全阶段只复核 1 条(阶段全貌由 phase_done 汇总行兜底)
-            disp = make_display()
-            instances = []
-            for i, f in enumerate(top, 1):
-                if disp.enabled:
-                    disp.instance_tag(i, len(top))
-                instances.append(
-                    self._run_verify_one(self.next_seq(), f, upstream,
-                                         task, request))
-            self._verification_instances = instances
-
-            # 聚合:全量 N 条(K 覆盖复核结论,N-K 原样 verified=None + confidence 初值)
-            # 锚点=各实例对应的原 analysis finding(按实例序与 top 对齐):复核结果
-            # 回填到原槽位——实例返回的 finding 常缺 addr/func,按 dedup_key 会错位
-            # 成新条目;以原 finding 的键锚定,verified/rationale/confidence/severity
-            # 覆盖,未进前 K 的条目原样保留(verified=None,confidence 保留 analysis
-            # 初值)。
-            # 复核结论回填:只覆盖复核权威字段(verified/rationale/confidence/severity),
-            # 不重排锚点——实例返回的 finding 可能缺 addr/func 或改 title,一律忽略
-            # 身份字段,防"换成别的 finding"混入(VERIFY_SYSTEM 单条必达红线 + 代码兜底)。
-            by_key = {self._agg.dedup_key(f): f for f in ranked}
-            verified_n = 0
-            for anchor, v in zip(top, instances):
-                if not v.findings:
-                    continue                    # 实例失败/无产出:该条保持未复核
-                vf = v.findings[0]
-                merged = dict(by_key[self._agg.dedup_key(anchor)])
-                merged["verified"] = vf.get("verified")      # True/False/None 照收
-                if vf.get("rationale"):
-                    merged["rationale"] = vf["rationale"]    # 存疑项可能留空
-                if vf.get("confidence"):
-                    merged["confidence"] = vf["confidence"]  # 存疑降级;无则留初值
-                if vf.get("severity"):
-                    merged["severity"] = vf["severity"]      # 判级降级(2026-09-03:
-                    # verification 是判级权威,实例 9 死代码降级 low 曾被丢弃,
-                    # 聚合产物 severity=high 与 rationale 自相矛盾;ADR-0003 精神延伸)
-                merged["source_agent"] = "verification"
-                merged["instance_seq"] = v.seq
-                by_key[self._agg.dedup_key(anchor)] = merged
-                if merged["verified"] is not None:
-                    verified_n += 1
-            phase_findings = list(by_key.values())
-
-            phase_summary = (f"已复核 {verified_n}/{len(ranked)} 条"
-                             f"(未进入前 {len(top)} 的 {len(ranked) - len(top)}"
-                             " 条未复核,verified=None,confidence 保留 analysis 初值)")
-            out_path = self.agent_dir / cfg.output_name
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps({
-                "schema": 2, "agent": "verification", "summary": phase_summary,
-                "findings": phase_findings,
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            # 阶段终态:全部实例 SUCCESS/SKIPPED → success;任一 FAILED/DEGRADED
-            # (仅 .md 降级工件,该条结论不完整)→ 阶段降级/失败,如实上报不冒充
-            bad = [v for v in instances
-                   if v.status in (DispatchStatus.FAILED, DispatchStatus.DEGRADED)]
-            if not bad:
-                status = DispatchStatus.SUCCESS
-            elif all(v.status == DispatchStatus.DEGRADED for v in bad):
-                status = DispatchStatus.DEGRADED
-            else:
-                status = DispatchStatus.FAILED
-            phase = SubAgentResult(
-                seq=seq, agent_name="verification", status=status,
-                artifact_path=out_path, summary=phase_summary,
-                findings=phase_findings,
-                error="; ".join(v.error for v in bad),
-                request=request,
-                duration_ms=int((time.time() - t0) * 1000),
-                steps=sum(v.steps for v in instances),
-                tool_calls=[c for v in instances for c in v.tool_calls],
-                budget_exhausted=any(v.budget_exhausted for v in instances))
-            self.register(phase)
-            self._verification_done = True
-            self.dispatch_log.finish(rec, status, duration_ms=phase.duration_ms,
-                                     artifact=str(out_path), summary=phase_summary,
-                                     error=phase.error,
-                                     budget_state=self.budget_state("verification"))
-            # 阶段级汇总行(#6,2026-09-03):每实例 done 行是单实例计数(恒
-            # 1 findings),阶段真实全貌(实例数/已复核 x/N/合计)在此汇总,
-            # 不再误导"只复核了 1 条"
-            if disp.enabled:
-                usage_sum = {}
-                for v in instances:
-                    for k, n in (v.usage or {}).items():
-                        usage_sum[k] = usage_sum.get(k, 0) + n
-                disp.phase_done("verification", out_path.name,
-                                len(instances), verified_n, len(ranked),
-                                phase.steps, usage_sum,
-                                elapsed_s=phase.duration_ms / 1000)
-            if status == DispatchStatus.SUCCESS:
-                return ToolResult(ok=True, text=(
-                    f"## verification Agent 结果(每疑点一实例,成功,实例 {seq})\n"
-                    f"已复核 {verified_n}/{len(ranked)} 条(共 {len(ranked)} 条;"
-                    f"未进入前 {len(top)} 的未复核,verified=None)\n"
-                    f"工件: {out_path.name}\n"
-                    f"(下一步: 调用 summarize 取报告素材)\n"
-                    + self.budget_state_text("verification")))
-            return ToolResult(ok=False, text="", error=(
-                f"verification 阶段失败(实例 {seq}): {phase.error}"))
-        except LLMError:
-            self.dispatch_log.interrupted(rec)
-            raise
-        except Exception as e:
-            self.dispatch_log.finish(rec, DispatchStatus.FAILED,
-                                     error=f"{type(e).__name__}: {e}",
-                                     budget_state=self.budget_state("verification"))
-            return ToolResult(ok=False, text="", error=(
-                f"verification 阶段失败(实例 {seq}): {type(e).__name__}: {e}"))
-
-    @staticmethod
-    def _lift_verify_verdict(loaded: dict | None, vfs: list) -> None:
-        """0/N bug(2026-09-03):模型把复核结论写在实例工件**顶层**
-        (verified/rationale),findings[] 只含 identity 字段(verified 空)。
-        归一进 findings[0],聚合层才读得到——否则已复核条目被丢进未复核区
-        (VERIFY_SYSTEM 虽要求写进 findings[],save_artifact 会保留未知顶层字段)。"""
-        if not vfs or not loaded:
-            return
-        head = vfs[0]
-        if head.get("verified") is None and "verified" in loaded:
-            head["verified"] = loaded["verified"]
-        if not head.get("rationale") and loaded.get("rationale"):
-            head["rationale"] = loaded["rationale"]
-
-    def _run_verify_one(self, vseq: int, finding: dict, upstream: Path,
-                        task: str, request: dict) -> SubAgentResult:
-        """单条 finding 的独立 verification 实例(ADR-0003)。
-
-        输入=单条 finding + 工件指针(build_verify_single_brief),输出=单条
-        verified finding;上下文隔离铁律不破(只从工件读,不传对话历史)。
-        """
-        cfg = self.sub_cfgs["verification"]
-        out_dir = self.agent_dir / f"{vseq}_verification"
-        out_path = out_dir / cfg.output_name
-        t0 = time.time()
-        # 单实例不进主 dispatch_log(ADR-0003:逐实例留痕在其自身 transcript/obs +
-        # result.json 的 verification_instances;主 dispatch_log 只记编排调度(阶段))
-        try:
-            # 断点续跑(单实例):该实例 .json 工件已存在且未 force → skipped。
-            # 身份校验(2026-09-03 错位 bug):目录名是全局 seq 位置而非 finding
-            # 身份,续跑时编排路径变化(如 analysis 补跑次数不同)会让 seq 前移,
-            # 本条 finding 可能命中**前一条** finding 的旧工件——只判文件存在
-            # 就加载会把别人的复核结论错配进来(target/1 实测 9/10 条整体错位,
-            # 新[N].rationale==旧[N-1],无任何告警)。故加载后比对工件 finding
-            # 与当前锚点身份:不一致或工件无 findings → 弃用工件真跑(如实上报
-            # 不冒充;真跑产物写回同一路径,错位旧工件随之被覆盖)。
-            # 匹配键=file+title 归一化(2026-09-03 review 修复):实例工件常缺
-            # func/addr(上方锚点回填注释自注),完整 dedup_key 四元组全等会把
-            # 合法工件误拒 → 每次续跑全部真跑、静默烧预算;file+title 是必填
-            # 身份字段,区分度足够(错位场景里 file/title 必然是别的 finding 的)。
-            if out_path.is_file() and not self.force:
-                loaded = load_artifact(out_path) or {}
-                vfs = [f for f in (loaded.get("findings") or [])
-                       if isinstance(f, dict)]
-                self._lift_verify_verdict(loaded, vfs)
-                if vfs and all(
-                        self._agg.norm_text(vfs[0].get(k, ""))
-                        == self._agg.norm_text(finding.get(k, ""))
-                        for k in ("file", "title")):
-                    return SubAgentResult(
-                        seq=vseq, agent_name="verification",
-                        status=DispatchStatus.SKIPPED,
-                        artifact_path=out_path, summary=loaded.get("summary", ""),
-                        findings=vfs, request=request,
-                        duration_ms=int((time.time() - t0) * 1000))
-            ares = run_agent(cfg, self.process_dir, self.base_llm, upstream,
-                             output_dir=out_dir,
-                             extra_brief=build_verify_single_brief(
-                                 self.process_dir, finding))
-            elapsed = int((time.time() - t0) * 1000)
-            if ares.ok and ares.artifact_path:
-                status = DispatchStatus.SUCCESS
-            elif ares.artifact_path and ares.artifact_path.suffix == ".md":
-                status = DispatchStatus.DEGRADED
-            else:
-                status = DispatchStatus.FAILED
-            loaded_v = (load_artifact(ares.artifact_path)
-                        if ares.artifact_path else None)
-            vfs = [f for f in (loaded_v or {}).get("findings", []) or []
-                   if isinstance(f, dict)]
-            self._lift_verify_verdict(loaded_v, vfs)
-            for f in vfs:                 # 溯源:该条复核结论产自本实例
-                f["source_agent"] = "verification"
-                f["instance_seq"] = vseq
-            react = ares.react
-            budget_exhausted = bool(
-                react and (react.steps >= cfg.max_iters or not react.finished))
-            return SubAgentResult(
-                seq=vseq, agent_name="verification", status=status,
-                artifact_path=ares.artifact_path,
-                summary=(loaded_v or {}).get("summary", ""),
-                findings=vfs, error=ares.error, request=request,
-                usage=dict(ares.usage), duration_ms=elapsed,
-                steps=react.steps if react else 0,
-                tool_calls=[c for c in (react.tool_calls if react else [])],
-                budget_exhausted=budget_exhausted)
-        except LLMError:
-            raise  # 阶段层捕获并回填 interrupted
+        out = run_verify_phase(
+            self.sub_cfgs["verification"], agent_dir=self.agent_dir,
+            process_dir=self.process_dir, base_llm=self.base_llm,
+            upstream=upstream, findings=self.all_findings, agg=self._agg,
+            force=self.force, dispatch_log=self.dispatch_log,
+            next_seq=self.next_seq, budget_state=self.budget_state,
+            task=task, request=request, seq=seq, t0=t0)
+        self._verification_done = out.done
+        if out.phase is not None:
+            self.register(out.phase)
+        if out.done:
+            self._verification_instances = out.instances
+        return out.result
 
     # ---- Task6: 动态分配与重合检测(budget_state / pending_focuses / overlap_ratio) ----
 
@@ -671,7 +424,7 @@ class Orchestrator:
             "默认各调度 1 次,结果明显不完整时用不同的任务描述补充调度"
             "(相同任务会返回历史结果)。\n"
             "verification 为**每疑点一实例**(ADR-0003):调度一次即对 analysis "
-            f"findings 按 severity+confidence 取前 {_verify_k()} 条(env "
+            f"findings 按 severity+confidence 取前 {verify_k()} 条(env "
             "STEP5_VERIFY_K 可调)逐条派独立复核实例;每条必被验证,补跑逻辑取消;"
             "复核完成后不得重复调度。\n"
             "每次调度自动交接前序任务状态与中间结果,无需手工搬运。\n"

@@ -156,11 +156,12 @@ def test_no_legacy_top_level_orchestrator() -> list[str]:
 
 
 def test_orchestration_internal_edges() -> list[str]:
-    """编排包内边守护(T4):state/dispatch_log/handoff/actions 不得 import
-    编排主体 orchestrator——orchestrator 装配动作类、被动作回调,环由 state
-    切断,import 必须单向 orchestrator → actions → handoff → state(ADR-0009)。"""
+    """编排包内边守护(T4/T5):state/dispatch_log/handoff/actions/verify_phase
+    不得 import 编排主体 orchestrator——orchestrator 装配动作类、被动作回调,
+    环由 state 切断,import 必须单向 orchestrator → actions/verify_phase →
+    handoff → state(ADR-0009)。"""
     fails: list[str] = []
-    for name in ("state", "dispatch_log", "handoff", "actions"):
+    for name in ("state", "dispatch_log", "handoff", "actions", "verify_phase"):
         py = PKG_ROOT / "orchestration" / f"{name}.py"
         if not py.is_file():
             continue  # 未到票的模块尚不存在,不空守护

@@ -978,7 +978,7 @@ def test_verification_phase_display_summary() -> list[str]:
         _make_process(td)
         os.environ["STEP5_VERIFY_K"] = "3"
         try:
-            with patch("firmware_audit.step5_agent.orchestration.orchestrator.make_display",
+            with patch("firmware_audit.step5_agent.orchestration.verify_phase.make_display",
                        return_value=cap_disp):
                 llm = ScriptedLLM([
                     D % "recon", TOOL, RECON_FINAL,        # 0/1/2

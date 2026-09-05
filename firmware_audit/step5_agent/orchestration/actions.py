@@ -20,9 +20,10 @@ import 层单向 orchestrator → actions → handoff → state,环由 state 切
 - 状态写: summarize_called(property setter)
 不上 typing.Protocol——单 adapter,第二个消费者出现再转正。
 
-_VERIFY_SEVERITY_RANK/_VERIFY_CONFIDENCE_RANK 暂驻本模块(排序表是复核
-引擎知识,不属共享词汇;SummarizeTool 与 orchestrator 的 verify 阶段双消费,
-T5 迁 verify_phase 时一并带走)。
+_VERIFY_SEVERITY_RANK/_VERIFY_CONFIDENCE_RANK 已随复核引擎迁 verify_phase
+(T5,转正为公开名 VERIFY_SEVERITY_RANK/VERIFY_CONFIDENCE_RANK):
+SummarizeTool 的 findings 排序呈现与复核引擎的取前 K 排序同源,从该模块
+导入,排序规则单一出处。
 """
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ from pathlib import Path
 
 from .handoff import build_handoff, build_rerun_brief, save_handoff_snapshot
 from .state import STATUS_LABEL, DispatchStatus, SubAgentResult
+from .verify_phase import VERIFY_SEVERITY_RANK
 from ..aggregator import normalize_file_paths
 from ..data.artifacts import load_artifact
 from ..providers.llm_client import LLMError
@@ -45,11 +47,6 @@ MAX_DISPATCH_PER_AGENT = 3
 
 # 阶段序(严格单向):recon → analysis → verification
 _PHASE = {"recon": 0, "analysis": 1, "verification": 2}
-
-# ADR-0003 排序 rank(severity 主排序 + confidence 次排序,从高到低)。
-# 暂驻(见模块 docstring):T5 迁 verify_phase 时一并带走。
-_VERIFY_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
-_VERIFY_CONFIDENCE_RANK = {"high": 0, "medium": 1, "low": 2}
 
 
 def _verified_mark(f: dict) -> str:
@@ -449,7 +446,7 @@ class SummarizeTool(AgentTool):
         parts.append(f"\n### 累计 findings({len(orch.all_findings)} 条,已去重合并)")
         if orch.all_findings:
             for f in sorted(orch.all_findings,
-                            key=lambda x: _VERIFY_SEVERITY_RANK.get(
+                            key=lambda x: VERIFY_SEVERITY_RANK.get(
                                 str(x.get("severity", "info")).lower(), 9)):
                 loc = f.get("file", "") + (f"::{f.get('func')}" if f.get("func") else "")
                 parts.append(f"- [{f.get('severity', 'info')}] {_verified_mark(f)} {f.get('title', '?')} @ {loc}")
