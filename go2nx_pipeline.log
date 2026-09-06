@@ -1,0 +1,408 @@
+[main] 工作区: E:\固件\create\important\target\3\process
+[main] 识别固件: go2_nx_Jetpack5.1.1_20250930.img
+  提取中: 0.00/0.06 GB (6.2%)  提取中: 0.01/0.06 GB (12.5%)  提取中: 0.01/0.06 GB (18.8%)  提取中: 0.02/0.06 GB (25.0%)  提取中: 0.02/0.06 GB (31.2%)  提取中: 0.02/0.06 GB (37.5%)  提取中: 0.03/0.06 GB (43.8%)  提取中: 0.03/0.06 GB (50.0%)  提取中: 0.04/0.06 GB (56.2%)  提取中: 0.04/0.06 GB (62.5%)  提取中: 0.04/0.06 GB (68.8%)  提取中: 0.05/0.06 GB (75.0%)  提取中: 0.05/0.06 GB (81.2%)  提取中: 0.05/0.06 GB (87.5%)  提取中: 0.06/0.06 GB (93.8%)  提取中: 0.06/0.06 GB (100.0%)
+  提取中: 0.00/0.06 GB (6.2%)  提取中: 0.01/0.06 GB (12.5%)  提取中: 0.01/0.06 GB (18.8%)  提取中: 0.02/0.06 GB (25.0%)  提取中: 0.02/0.06 GB (31.2%)  提取中: 0.02/0.06 GB (37.5%)  提取中: 0.03/0.06 GB (43.8%)  提取中: 0.03/0.06 GB (50.0%)  提取中: 0.04/0.06 GB (56.2%)  提取中: 0.04/0.06 GB (62.5%)  提取中: 0.04/0.06 GB (68.8%)  提取中: 0.05/0.06 GB (75.0%)  提取中: 0.05/0.06 GB (81.2%)  提取中: 0.05/0.06 GB (87.5%)  提取中: 0.06/0.06 GB (93.8%)  提取中: 0.06/0.06 GB (100.0%)
+  提取中: 0.00/0.08 GB (5.0%)  提取中: 0.01/0.08 GB (10.0%)  提取中: 0.01/0.08 GB (15.0%)  提取中: 0.02/0.08 GB (20.0%)  提取中: 0.02/0.08 GB (25.0%)  提取中: 0.02/0.08 GB (30.0%)  提取中: 0.03/0.08 GB (35.0%)  提取中: 0.03/0.08 GB (40.0%)  提取中: 0.04/0.08 GB (45.0%)  提取中: 0.04/0.08 GB (50.0%)  提取中: 0.04/0.08 GB (55.0%)  提取中: 0.05/0.08 GB (60.0%)  提取中: 0.05/0.08 GB (65.0%)  提取中: 0.05/0.08 GB (70.0%)  提取中: 0.06/0.08 GB (75.0%)  提取中: 0.06/0.08 GB (80.0%)  提取中: 0.07/0.08 GB (85.0%)  提取中: 0.07/0.08 GB (90.0%)  提取中: 0.07/0.08 GB (95.0%)  提取中: 0.08/0.08 GB (100.0%)
+[Step0] 警告: RECROOTFS 名字推断为 rootfs,但头部签名(unknown (raw binary))不匹配期望(ext4, squashfs, gzip, xz, lzma),身份存疑
+  提取中: 0.00/0.29 GB (1.3%)  提取中: 0.01/0.29 GB (2.7%)  提取中: 0.01/0.29 GB (4.0%)  提取中: 0.02/0.29 GB (5.3%)  提取中: 0.02/0.29 GB (6.7%)  提取中: 0.02/0.29 GB (8.0%)  提取中: 0.03/0.29 GB (9.3%)  提取中: 0.03/0.29 GB (10.7%)  提取中: 0.04/0.29 GB (12.0%)  提取中: 0.04/0.29 GB (13.3%)  提取中: 0.04/0.29 GB (14.7%)  提取中: 0.05/0.29 GB (16.0%)  提取中: 0.05/0.29 GB (17.3%)  提取中: 0.05/0.29 GB (18.7%)  提取中: 0.06/0.29 GB (20.0%)  提取中: 0.06/0.29 GB (21.3%)  提取中: 0.07/0.29 GB (22.7%)  提取中: 0.07/0.29 GB (24.0%)  提取中: 0.07/0.29 GB (25.3%)  提取中: 0.08/0.29 GB (26.7%)  提取中: 0.08/0.29 GB (28.0%)  提取中: 0.09/0.29 GB (29.3%)  提取中: 0.09/0.29 GB (30.7%)  提取中: 0.09/0.29 GB (32.0%)  提取中: 0.10/0.29 GB (33.3%)  提取中: 0.10/0.29 GB (34.7%)  提取中: 0.11/0.29 GB (36.0%)  提取中: 0.11/0.29 GB (37.3%)  提取中: 0.11/0.29 GB (38.7%)  提取中: 0.12/0.29 GB (40.0%)  提取中: 0.12/0.29 GB (41.3%)  提取中: 0.12/0.29 GB (42.7%)  提取中: 0.13/0.29 GB (44.0%)  提取中: 0.13/0.29 GB (45.3%)  提取中: 0.14/0.29 GB (46.7%)  提取中: 0.14/0.29 GB (48.0%)  提取中: 0.14/0.29 GB (49.3%)  提取中: 0.15/0.29 GB (50.7%)  提取中: 0.15/0.29 GB (52.0%)  提取中: 0.16/0.29 GB (53.3%)  提取中: 0.16/0.29 GB (54.7%)  提取中: 0.16/0.29 GB (56.0%)  提取中: 0.17/0.29 GB (57.3%)  提取中: 0.17/0.29 GB (58.7%)  提取中: 0.18/0.29 GB (60.0%)  提取中: 0.18/0.29 GB (61.3%)  提取中: 0.18/0.29 GB (62.7%)  提取中: 0.19/0.29 GB (64.0%)  提取中: 0.19/0.29 GB (65.3%)  提取中: 0.20/0.29 GB (66.7%)  提取中: 0.20/0.29 GB (68.0%)  提取中: 0.20/0.29 GB (69.3%)  提取中: 0.21/0.29 GB (70.7%)  提取中: 0.21/0.29 GB (72.0%)  提取中: 0.21/0.29 GB (73.3%)  提取中: 0.22/0.29 GB (74.7%)  提取中: 0.22/0.29 GB (76.0%)  提取中: 0.23/0.29 GB (77.3%)  提取中: 0.23/0.29 GB (78.7%)  提取中: 0.23/0.29 GB (80.0%)  提取中: 0.24/0.29 GB (81.3%)  提取中: 0.24/0.29 GB (82.7%)  提取中: 0.25/0.29 GB (84.0%)  提取中: 0.25/0.29 GB (85.3%)  提取中: 0.25/0.29 GB (86.7%)  提取中: 0.26/0.29 GB (88.0%)  提取中: 0.26/0.29 GB (89.3%)  提取中: 0.27/0.29 GB (90.7%)  提取中: 0.27/0.29 GB (92.0%)  提取中: 0.27/0.29 GB (93.3%)  提取中: 0.28/0.29 GB (94.7%)  提取中: 0.28/0.29 GB (96.0%)  提取中: 0.29/0.29 GB (97.3%)  提取中: 0.29/0.29 GB (98.7%)  提取中: 0.29/0.29 GB (100.0%)
+  提取中: 0.00/0.06 GB (6.2%)  提取中: 0.01/0.06 GB (12.5%)  提取中: 0.01/0.06 GB (18.8%)  提取中: 0.02/0.06 GB (25.0%)  提取中: 0.02/0.06 GB (31.2%)  提取中: 0.02/0.06 GB (37.5%)  提取中: 0.03/0.06 GB (43.8%)  提取中: 0.03/0.06 GB (50.0%)  提取中: 0.04/0.06 GB (56.2%)  提取中: 0.04/0.06 GB (62.5%)  提取中: 0.04/0.06 GB (68.8%)  提取中: 0.05/0.06 GB (75.0%)  提取中: 0.05/0.06 GB (81.2%)  提取中: 0.05/0.06 GB (87.5%)  提取中: 0.06/0.06 GB (93.8%)  提取中: 0.06/0.06 GB (100.0%)
+  提取中: 0.00/0.08 GB (5.0%)  提取中: 0.01/0.08 GB (10.0%)  提取中: 0.01/0.08 GB (15.0%)  提取中: 0.02/0.08 GB (20.0%)  提取中: 0.02/0.08 GB (25.0%)  提取中: 0.02/0.08 GB (30.0%)  提取中: 0.03/0.08 GB (35.0%)  提取中: 0.03/0.08 GB (40.0%)  提取中: 0.04/0.08 GB (45.0%)  提取中: 0.04/0.08 GB (50.0%)  提取中: 0.04/0.08 GB (55.0%)  提取中: 0.05/0.08 GB (60.0%)  提取中: 0.05/0.08 GB (65.0%)  提取中: 0.05/0.08 GB (70.0%)  提取中: 0.06/0.08 GB (75.0%)  提取中: 0.06/0.08 GB (80.0%)  提取中: 0.07/0.08 GB (85.0%)  提取中: 0.07/0.08 GB (90.0%)  提取中: 0.07/0.08 GB (95.0%)  提取中: 0.08/0.08 GB (100.0%)
+  提取中: 0.00/0.06 GB (6.2%)  提取中: 0.01/0.06 GB (12.5%)  提取中: 0.01/0.06 GB (18.8%)  提取中: 0.02/0.06 GB (25.0%)  提取中: 0.02/0.06 GB (31.2%)  提取中: 0.02/0.06 GB (37.5%)  提取中: 0.03/0.06 GB (43.8%)  提取中: 0.03/0.06 GB (50.0%)  提取中: 0.04/0.06 GB (56.2%)  提取中: 0.04/0.06 GB (62.5%)  提取中: 0.04/0.06 GB (68.8%)  提取中: 0.05/0.06 GB (75.0%)  提取中: 0.05/0.06 GB (81.2%)  提取中: 0.05/0.06 GB (87.5%)  提取中: 0.06/0.06 GB (93.8%)  提取中: 0.06/0.06 GB (100.0%)
+[Step0] 磁盘镜像 go2_nx_Jetpack5.1.1_20250930.img 已提取 7 个分区到 E:\固件\create\important\target\3\process:
+  - part02_kernel.img (64.0 MB)
+  - part05_kernel_b.img (64.0 MB)
+  - part08_recovery.img (80.0 MB)
+  - part10_RECROOTFS.img (300.0 MB)
+  - part11_esp.img (64.0 MB)
+  - part12_recovery_alt.img (80.0 MB)
+  - part14_esp_alt.img (64.0 MB)
+[main] 磁盘镜像识别出 7 个分区,逐个审计:
+[main] === 分区工作区: E:\固件\create\important\target\3\process\part02_kernel ===
+[main] 工作区: E:\固件\create\important\target\3\process\part02_kernel
+[main] 识别固件: part02_kernel.img
+[Step0] part02_kernel.img 非磁盘镜像,直接交 binwalk
+[Step1] 引导解包 层0: 1 个候选
+[Step1] 引导解包 层1: 3 个候选
+[Step1] 引导解包 层2: 95 个候选
+[Step1] 引导解包完成 -> E:\固件\create\important\target\3\process\part02_kernel\extracted
+[Step2] 提示: 白名单目录 home/unitree, usr/lib/modules 0 命中。若该分区是 kernel/dtb/recovery(非完整系统),此为预期;若应含 rootfs,请检查 binwalk 输出结构
+[Step2] 提示: 白名单敏感配置 etc/passwd, etc/shadow, etc/sudoers, etc/group, etc/gshadow, etc/systemd, etc/init.d, etc/init, etc/ssh, etc/bluetooth, etc/docker, etc/NetworkManager, etc/default, etc/network, etc/netplan, etc/hostapd, etc/dropbear, etc/uhttpd, etc/nginx, etc/apache2, etc/crontab, etc/cron.d, etc/cron.daily, etc/cron.hourly, etc/adb, etc/adbkey 0 命中。若该分区是 kernel/dtb/recovery(非完整系统),此为预期;若应含 rootfs,请检查 binwalk 输出结构
+[Step2] 过滤完成(profile=nano-ubuntu): 171 -> 57 文件
+[Step3] 分类完成: 57 文件 (config=1, elf_exec=45, script=4, text=6, unknown=1)
+[Step4] 清理孤儿产物: 删除 0 个(反编译 0, ELF 产物 0, 文本 0, 证书 0)
+[Step4] Ghidra 并行: 待处理 45 ELF, workers=4
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/bash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/busybox
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cat
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/chmod
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cat
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cp
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/chmod
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dash
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/date
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cp
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/date
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/df
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dmesg
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dmesg
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/echo
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/df
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/expr
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/busybox
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/grep
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/echo
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/gzip
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/expr
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ip
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/gzip
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/kmod
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/grep
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ln
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/bash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ls
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ln
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mawk
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/kmod
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/md5sum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ls
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mkdir
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/md5sum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mount
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ip
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mountpoint
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mawk
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/partx
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mountpoint
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/rm
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mount
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/run-parts
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mkdir
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sed
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/partx
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sha256sum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/run-parts
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sleep
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/rm
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tail
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sleep
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tar
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sha256sum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tee
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sed
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/test
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tail
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/timeout
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tee
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/umount
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/test
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/xxd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/timeout
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/[
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/umount
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/blkid
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/xxd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/chroot
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/[
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/dhclient
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/chroot
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/fdisk
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/blkid
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/getty
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tar
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/ifconfig
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/fdiskE:\固件\create\important\firmware_audit\step4\step4_decompile.py:807: CryptographyDeprecationWarning: SSH DSA keys are deprecated and will be removed in a future release.
+  key = load_ssh_private_key(data, password=None)
+E:\固件\create\important\firmware_audit\step4\step4_decompile.py:813: CryptographyDeprecationWarning: SSH DSA keys are deprecated and will be removed in a future release.
+  key = load_ssh_public_key(data)
+
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/mkfs.ext4
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/getty
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/mount.nfs
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/ifconfig
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/mount.nfs
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/dhclient
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/mkfs.ext4
+[Step4] 处理完成: ELF=45(ok=45, failed=0, 跳过=0, 续传复用=0, cap跳过=0), crypto=0(), 文本扫描=11(有发现=4), ELF字符串扫描=45(有发现=31), 不透明分诊=1(hex/srec从text捞=0, 已分诊=0)
+[main] FileInfo 已保存: E:\固件\create\important\target\3\process\part02_kernel\fileinfo.json
+[main] 跳过 Step5(--no-step5);可随时用 python -m firmware_audit.step5_agent.run_step5 <target> 补跑
+[main] === 分区工作区: E:\固件\create\important\target\3\process\part05_kernel_b ===
+[main] 工作区: E:\固件\create\important\target\3\process\part05_kernel_b
+[main] 识别固件: part05_kernel_b.img
+[Step0] part05_kernel_b.img 非磁盘镜像,直接交 binwalk
+[Step1] 引导解包 层0: 1 个候选
+[Step1] 引导解包 层1: 4 个候选
+[Step1] 引导解包 层2: 95 个候选
+[Step1] 引导解包完成 -> E:\固件\create\important\target\3\process\part05_kernel_b\extracted
+[Step2] 提示: 白名单目录 home/unitree, usr/lib/modules 0 命中。若该分区是 kernel/dtb/recovery(非完整系统),此为预期;若应含 rootfs,请检查 binwalk 输出结构
+[Step2] 提示: 白名单敏感配置 etc/passwd, etc/shadow, etc/sudoers, etc/group, etc/gshadow, etc/systemd, etc/init.d, etc/init, etc/ssh, etc/bluetooth, etc/docker, etc/NetworkManager, etc/default, etc/network, etc/netplan, etc/hostapd, etc/dropbear, etc/uhttpd, etc/nginx, etc/apache2, etc/crontab, etc/cron.d, etc/cron.daily, etc/cron.hourly, etc/adb, etc/adbkey 0 命中。若该分区是 kernel/dtb/recovery(非完整系统),此为预期;若应含 rootfs,请检查 binwalk 输出结构
+[Step2] 过滤完成(profile=nano-ubuntu): 173 -> 58 文件
+[Step3] 分类完成: 58 文件 (config=1, elf_exec=45, script=4, text=7, unknown=1)
+[Step4] 清理孤儿产物: 删除 0 个(反编译 0, ELF 产物 0, 文本 0, 证书 0)
+[Step4] Ghidra 并行: 待处理 45 ELF, workers=4
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/bash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/busybox
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cat
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/chmod
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cat
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cp
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/chmod
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dash
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/date
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cp
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/date
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/df
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dmesg
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dmesg
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/echo
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/df
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/expr
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/busybox
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/grep
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/echo
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/gzip
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/expr
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ip
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/gzip
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/kmod
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/grep
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ln
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/bash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ls
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ln
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mawk
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/kmod
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/md5sum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/md5sum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mkdir
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ls
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mount
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mawk
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mountpoint
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mount
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/partx
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mountpoint
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/rm
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mkdir
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/run-parts
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/run-parts
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sed
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/rm
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sha256sum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/partx
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sleep
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sha256sum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tail
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sleep
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tar
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sed
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tee
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tee
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/test
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tail
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/timeout
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/timeout
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/umount
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/test
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/xxd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/umount
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/[
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/xxd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/blkid
+[Step4] 反编译无有效产出(全部函数失败或空壳): 000001_decompressed.bin.extracted/0/usr/bin/ip
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/chroot
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tar
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/dhclient
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/[
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/fdisk
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/chroot
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/getty
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/blkid
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/ifconfig
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/getty
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/mkfs.ext4
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/ifconfig
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/mount.nfs
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/fdisk
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/mount.nfs
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/dhclient
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/mkfs.ext4
+[Step4] 处理完成: ELF=45(ok=44, failed=1, 跳过=0, 续传复用=0, cap跳过=0), crypto=0(), 文本扫描=12(有发现=4), ELF字符串扫描=44(有发现=31), 不透明分诊=1(hex/srec从text捞=0, 已分诊=0)
+[main] FileInfo 已保存: E:\固件\create\important\target\3\process\part05_kernel_b\fileinfo.json
+[main] 跳过 Step5(--no-step5);可随时用 python -m firmware_audit.step5_agent.run_step5 <target> 补跑
+[main] === 分区工作区: E:\固件\create\important\target\3\process\part08_recovery ===
+[main] 工作区: E:\固件\create\important\target\3\process\part08_recovery
+[main] 识别固件: part08_recovery.img
+[Step0] part08_recovery.img 非磁盘镜像,直接交 binwalk
+[Step1] 引导解包 层0: 1 个候选
+[Step1] 引导解包 层1: 3 个候选
+[Step1] 引导解包 层2: 170 个候选
+[Step1] 引导解包完成 -> E:\固件\create\important\target\3\process\part08_recovery\extracted
+[Step2] 过滤完成(profile=nano-ubuntu): 254 -> 104 文件
+[Step3] 分类完成: 104 文件 (config=1, crypto_ssh=8, elf_exec=68, elf_lib=5, script=10, text=11, unknown=1)
+[Step4] 清理孤儿产物: 删除 0 个(反编译 0, ELF 产物 0, 文本 0, 证书 0)
+[Step4] Ghidra 并行: 待处理 73 ELF, workers=4
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/bash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/blockdev
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/busybox
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cat
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cat
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/chattr
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/blockdev
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/chmod
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/chattr
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cksum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/chmod
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cp
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cksum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/cut
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cut
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dash
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/cp
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/date
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/date
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/df
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/busybox
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/diff
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dirname
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/df
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/dmesg
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dirname
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/du
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/dmesg
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/echo
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/bash
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/expr
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/echo
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/find
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/du
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/grep
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/expr
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/gzip
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/gzip
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/head
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/grep
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ip
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/find
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/kmod
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/head
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ln
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/kmod
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ls
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ln
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mawk
+[Step4] 反编译无有效产出(全部函数失败或空壳): 000001_decompressed.bin.extracted/0/usr/bin/diff
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/md5sum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/md5sum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mkdir
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ls
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mount
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mawk
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mountpoint
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ip
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mtd_debug
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mkdir
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/mv
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mountpoint
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/partx
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mount
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/passwd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mtd_debug
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ping
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/passwd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/ps
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/partx
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/rm
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/mv
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/run-parts
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ping
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/scp
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/run-parts
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sed
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/ps
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/seq
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/rm
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sha1sum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/seq
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sha256sum
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sha1sum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sleep
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sed
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sshd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sha256sum
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/su
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sleep
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/sync
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sync
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tail
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/su
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tar
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tail
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tee
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tee
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/test
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/test
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/timeout
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tar
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/tr
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/timeout
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/umount
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/sshd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/w
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/tr
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/whoami
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/w
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/xxd
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/umount
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/bin/[
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/whoami
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/blkid
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/xxd
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/chroot
+[Step4] 反编译无有效产出(全部函数失败或空壳): 000001_decompressed.bin.extracted/0/usr/bin/scp
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/dhclient
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/bin/[
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/fdisk
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/chroot
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/getty
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/blkid
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/ifconfig
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/fdisk
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/mkfs.ext4
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/getty
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/sbin/mount.nfs
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/ifconfig
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/mtd.ko
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/mtd.ko
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/mtdblock.ko
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/mount.nfs
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/mtd_blkdevs.ko
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/mtdblock.ko
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/spi/spi-tegra210-qspi.ko
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/sbin/dhclient
+[Step4] Ghidra 反编译: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/devices/qspi_mtd.ko
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/mtd_blkdevs.ko
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/mtd/devices/qspi_mtd.ko
+[Step4] 反编译成功: 000001_decompressed.bin.extracted/0/usr/lib/modules/5.10.104-tegra/kernel/drivers/spi/spi-tegra210-qspi.ko
+[Step4] 反编译无有效产出(全部函数失败或空壳): 000001_decompressed.bin.extracted/0/usr/sbin/mkfs.ext4
+[Step4] 处理完成: ELF=73(ok=70, failed=3, 跳过=0, 续传复用=0, cap跳过=0), crypto=8(crypto_ssh=8), 文本扫描=22(有发现=6), ELF字符串扫描=70(有发现=46), 不透明分诊=1(hex/srec从text捞=0, 已分诊=0)
+[main] FileInfo 已保存: E:\固件\create\important\target\3\process\part08_recovery\fileinfo.json
+[main] 跳过 Step5(--no-step5);可随时用 python -m firmware_audit.step5_agent.run_step5 <target> 补跑
+[main] === 分区工作区: E:\固件\create\important\target\3\process\part10_RECROOTFS ===
+[main] 工作区: E:\固件\create\important\target\3\process\part10_RECROOTFS
+[main] 识别固件: part10_RECROOTFS.img
+[Step0] part10_RECROOTFS.img 非磁盘镜像,直接交 binwalk
+[Step1] 引导解包 层0: 1 个候选
+[Step1] 引导解包完成 -> E:\固件\create\important\target\3\process\part10_RECROOTFS\extracted
+[Step2] 提示: 白名单目录 home/unitree, usr/lib/modules 0 命中。若该分区是 kernel/dtb/recovery(非完整系统),此为预期;若应含 rootfs,请检查 binwalk 输出结构
+[Step2] 提示: 白名单敏感配置 etc/passwd, etc/shadow, etc/sudoers, etc/group, etc/gshadow, etc/systemd, etc/init.d, etc/init, etc/ssh, etc/bluetooth, etc/docker, etc/NetworkManager, etc/default, etc/network, etc/netplan, etc/hostapd, etc/dropbear, etc/uhttpd, etc/nginx, etc/apache2, etc/crontab, etc/cron.d, etc/cron.daily, etc/cron.hourly, etc/adb, etc/adbkey 0 命中。若该分区是 kernel/dtb/recovery(非完整系统),此为预期;若应含 rootfs,请检查 binwalk 输出结构
+[Step2] 过滤完成(profile=nano-ubuntu): 2 -> 0 文件
+[main] Step2 过滤后无文件,终止
