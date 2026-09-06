@@ -37,7 +37,7 @@ from ..data.artifacts import (SEVERITY_RANK, load_artifact, rewrite_artifact,
                               stamp_provenance)
 from ..providers.llm_client import LLMError
 from ..providers.tools import ToolContext
-from ..providers.tools.base import AgentTool, ToolResult, truncate_text
+from ..providers.tools.base import AgentTool, ToolResult
 from ..runner import post_run_status, run_agent
 
 # 同一类型子 Agent 的调度次数上限(1 次默认 + 至多 2 次补跑;超出即拒绝)
@@ -168,10 +168,7 @@ class DispatchAgentTool(AgentTool):
             raise
         except Exception as e:
             result = ToolResult(ok=False, text="", error=f"{type(e).__name__}: {e}")
-        result.elapsed = round(time.time() - start, 3)
-        result.raw = result.text
-        result.text = truncate_text(result.text)
-        return result
+        return self._finalize(result, start)
 
     def _run(self, agent: str = "", task: str = "", context: str = "", **kw) -> ToolResult:
         orch = self.orch
@@ -397,6 +394,10 @@ class SummarizeTool(AgentTool):
     """
 
     name = "summarize"
+    # 素材护栏 64k(票01):素材随 findings 数线性增长(每条全字段 ~1.5k 字符),
+    # 64k ≈ 40+ 条全字段素材,为 target/1 实测规模(9 条 1.4 万字符)的 4 倍+
+    # ——素材是唯一必须完整的 Observation,护栏只防 findings 规模失控
+    max_text_chars = 64000
     description = ("查看当前审计汇总(只读,不消耗子 Agent):累计 findings 清单、"
                    "各阶段统计与已复核明细。verification 完成后必须调用一次,"
                    "其返回值是最终总结报告的写作素材。")
@@ -453,7 +454,7 @@ class SummarizeTool(AgentTool):
             parts.append(f"\n### 报告写作素材(verification 工件 {vres.artifact_path.name},"
                          f"已复核 {verified_n}/{len(vfindings)} 条;"
                          "已复核/未复核拆独立区段,全量字段如下)")
-            parts.append(f"工件路径(read_file 可查): {vres.artifact_path}")
+            parts.append(f"工件路径(素材已在本 Observation,无需回读): {vres.artifact_path}")
             parts.append(f"verification summary: {loaded.get('summary', '')}")
 
             # 已复核区:verified 非 None(true/false),完整 confidence + rationale

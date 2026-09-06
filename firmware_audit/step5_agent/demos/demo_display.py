@@ -63,14 +63,14 @@ class BoomTool(AgentTool):
 
 
 class BigTool(AgentTool):
-    """返回 >8KB 文本,演示截断 + obs/ 全文指针。"""
+    """返回 >16KB 文本,演示截断 + obs/ 全文指针。"""
 
     name, description, params_doc = "big", "demo", "{}"
 
     def _run(self, **kw) -> ToolResult:
         return ToolResult(
             ok=True,
-            text="HEAD" + "A" * 6000 + "MIDDLE_LOST" + "B" * 2000 + "TAIL",
+            text="HEAD" + "A" * 12000 + "MIDDLE_LOST" + "B" * 5000 + "TAIL",
         )
 
 

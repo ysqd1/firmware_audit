@@ -211,19 +211,19 @@ def test_truncate_text() -> list[str]:
     fails: list[str] = []
     short = "x" * 100
     if truncate_text(short) != short:
-        fails.append("≤8KB 不应截断")
-    exact = "y" * 8000
+        fails.append("≤16k 不应截断")
+    exact = "y" * 16000
     if truncate_text(exact) != exact:
-        fails.append("恰好 8000 字符不应截断")
-    long = "A" * 6000 + "M" * 3000 + "Z" * 2000  # 共 11000
+        fails.append("恰好 16000 字符不应截断")
+    long = "A" * 12000 + "M" * 3000 + "Z" * 4000  # 共 19000
     out = truncate_text(long)
-    if len(out) > 8000 + 200:
+    if len(out) > 16000 + 200:
         fails.append(f"截断后长度异常: {len(out)}")
-    if "已截断" not in out or "11000" not in out:
+    if "已截断" not in out or "19000" not in out:
         fails.append("截断提示缺总量说明")
-    if not out.startswith("A" * 6000):
+    if not out.startswith("A" * 12000):
         fails.append("头部 75% 保留失败")
-    if not out.endswith("Z" * 1600):
+    if not out.endswith("Z" * 3200):
         fails.append("尾部 20% 保留失败")
     return fails
 

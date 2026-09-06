@@ -40,16 +40,40 @@ class FailTool(AgentTool):
 
 
 class BigTool(AgentTool):
-    """返回 >8KB 文本,验证截断策略与全文落盘。"""
+    """返回 >16KB 文本,验证截断策略与全文落盘。"""
 
     name = "big"
     description = "test"
     params_doc = ""
 
     def _run(self, **kw) -> ToolResult:
-        # 全长 8019 > 8000;MIDDLE_LOST 位于 ~6000(head 6000 与 tail 1600 之间的省略区)
-        body = "HEAD" + "A" * 6000 + "MIDDLE_LOST" + "B" * 2000 + "TAIL"
+        # 全长 17019 > 16000;MIDDLE_LOST 位于 ~12000(head 12000 与 tail 3200 之间的省略区)
+        body = "HEAD" + "A" * 12000 + "MIDDLE_LOST" + "B" * 5000 + "TAIL"
         return ToolResult(ok=True, text=body)
+
+
+class WideCapTool(AgentTool):
+    """声明 64k 覆盖(summarize 同值):20000 字符应全量通过。"""
+
+    name = "cap64k"
+    description = "test"
+    params_doc = ""
+    max_text_chars = 64000
+
+    def _run(self, **kw) -> ToolResult:
+        return ToolResult(ok=True, text="B" * 20000)
+
+
+class NarrowCapTool(AgentTool):
+    """声明小覆盖:按声明值截断。"""
+
+    name = "captiny"
+    description = "test"
+    params_doc = ""
+    max_text_chars = 100
+
+    def _run(self, **kw) -> ToolResult:
+        return ToolResult(ok=True, text="C" * 500)
 
 
 class FakeFS(AgentTool):
@@ -461,9 +485,9 @@ def test_truncate_headtail_and_obs_fulltext() -> list[str]:
     if "MIDDLE_LOST" in r.text:
         fails.append("截断后中间段应被省略")
     # 总量提示:LLM 需知道全文总长与省略量,才会改分页重读
-    if "共 8019 字符" not in r.text or "省略中间" not in r.text:
+    if "共 17019 字符" not in r.text or "省略中间" not in r.text:
         fails.append(f"截断提示应含总字符数与省略量: {r.text[:120]}")
-    if r.raw != "HEAD" + "A" * 6000 + "MIDDLE_LOST" + "B" * 2000 + "TAIL":
+    if r.raw != "HEAD" + "A" * 12000 + "MIDDLE_LOST" + "B" * 5000 + "TAIL":
         fails.append("raw 应保留截断前全文")
     # 短文本不动
     if truncate_text("short") != "short":
@@ -483,7 +507,7 @@ def test_truncate_headtail_and_obs_fulltext() -> list[str]:
             fails.append(f"obs 全文文件缺失: {obs_file}")
         else:
             content = obs_file.read_text(encoding="utf-8")
-            if "MIDDLE_LOST" not in content or len(content) < 8000:
+            if "MIDDLE_LOST" not in content or len(content) < 16000:
                 fails.append("obs 文件应含未截断全文(含中间段)")
         entries = [_json.loads(l) for l in tr.read_text(encoding="utf-8").splitlines()]
         obs_entries = [e for e in entries if e.get("phase") == "observation"]
@@ -491,6 +515,29 @@ def test_truncate_headtail_and_obs_fulltext() -> list[str]:
             fails.append("transcript 应含 observation 条目")
         elif not obs_entries[0].get("obs_file"):
             fails.append(f"observation 条目应带 obs_file 指针: {obs_entries[0]}")
+    return fails
+
+
+def test_per_tool_truncation_override() -> list[str]:
+    """票01 per-tool 覆盖属性:未声明用全局默认 16000;声明 64000 的工具
+    20000 字符全量通过(summarize 素材护栏语义);声明小值按声明截断,
+    截断行为模型不变(头 75% 保留 + 省略提示)。"""
+    fails: list[str] = []
+    ctx = ToolContext(process_dir=Path("."))
+    # 未声明覆盖 → 全局默认 16000:BigTool 17019 字符被截断
+    r_big = BigTool(ctx).execute()
+    if len(r_big.text) > 16000 + 200 or "已截断" not in r_big.text:
+        fails.append(f"未声明覆盖应按全局默认 16000 截断: len={len(r_big.text)}")
+    # 声明 64000(summarize 同值)→ 20000 字符全量通过
+    r_wide = WideCapTool(ctx).execute()
+    if r_wide.text != "B" * 20000:
+        fails.append(f"声明 64000 时 20000 字符应全量通过: len={len(r_wide.text)}")
+    # 声明小值 100 → 按声明截断,头 75% 保留
+    r_narrow = NarrowCapTool(ctx).execute()
+    if len(r_narrow.text) > 300 or "已截断" not in r_narrow.text:
+        fails.append(f"声明 100 应按 100 截断: len={len(r_narrow.text)}")
+    if not r_narrow.text.startswith("C" * 75):
+        fails.append("覆盖截断仍应头 75% 保留")
     return fails
 
 
@@ -516,17 +563,18 @@ def test_obs_readback_via_read_file() -> list[str]:
         if "全文已存 agent/t/obs/step001_big.txt" not in step1_obs:
             fails.append(f"截断提示应带具体 obs 路径: {step1_obs[-160:]}")
 
-        # 模拟 LLM 按提示发 read_file(白名单内相对路径,分页读中段)
-        rr = tools["read_file"].execute(path="agent/t/obs/step001_big.txt", offset=1, limit=1)
+        # 模拟 LLM 按提示发 read_file(白名单内相对路径,分页读中段;
+        # MIDDLE_LOST 在 ~12000 字符处 → 4000 软折行的第 4 行)
+        rr = tools["read_file"].execute(path="agent/t/obs/step001_big.txt", offset=3, limit=1)
         if not rr.ok:
             fails.append(f"read_file 读 obs 失败: {rr.error}")
         elif "MIDDLE_LOST" not in rr.text:
             fails.append(f"分页应能取回中间段 MIDDLE_LOST: {rr.text[:150]}")
-        # 折行生效:8019+12 字符单行 → 3 行左右,行式分页可定位
+        # 折行生效:17019+13 字符单行 → 5 行左右,行式分页可定位
         obs_lines = (Path(td) / "agent" / "t" / "obs" / "step001_big.txt").read_text(
             encoding="utf-8").splitlines()
-        if not (2 <= len(obs_lines) <= 4):
-            fails.append(f"折行后行数应 2-4, got {len(obs_lines)}")
+        if not (4 <= len(obs_lines) <= 6):
+            fails.append(f"折行后行数应 4-6, got {len(obs_lines)}")
     return fails
 
 
@@ -660,6 +708,7 @@ def test_main() -> int:
         ("final_without_tools_rejected", test_final_without_tools_rejected),
         ("repeat_call_intervention", test_repeat_call_intervention),
         ("truncate_headtail_and_obs_fulltext", test_truncate_headtail_and_obs_fulltext),
+        ("per_tool_truncation_override", test_per_tool_truncation_override),
         ("obs_readback_via_read_file", test_obs_readback_via_read_file),
         ("last_round_notice_and_summary_force", test_last_round_notice_and_summary_force),
         ("force_final_30_rounds", test_force_final_30_rounds),

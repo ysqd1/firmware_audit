@@ -11,8 +11,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 
-# Observation 入上下文预算(agents.md 约定 ≤8KB,全文另落盘 transcript)
-MAX_TEXT_CHARS = 8000
+# Observation 入上下文预算:全局默认 16000 字符(2026-09-06 票01,由 8KB
+# 小窗口时代的保守值上调——target/1 实测 141 个 Observation 仅 12 个超 8k,
+# 16k 覆盖除 summarize 外全部超限样本);单工具可用类属性 max_text_chars 覆盖
+MAX_TEXT_CHARS = 16000
 
 
 @dataclass
@@ -159,9 +161,24 @@ class AgentTool(ABC):
     name: str = ""
     description: str = ""  # 写进系统提示词,LLM 据此选工具
     params: dict[str, dict] = {}  # 结构化参数声明(单一来源:params_doc 渲染 + execute 校验共用)
+    # Observation 入上下文字符上限覆盖(票01):None=用全局默认 MAX_TEXT_CHARS;
+    # 素材类工具声明更大值(取值依据见 SummarizeTool 声明点)
+    max_text_chars: int | None = None
 
     def __init__(self, ctx: ToolContext):
         self.ctx = ctx
+
+    @property
+    def text_limit(self) -> int:
+        """本工具 Observation 入上下文的字符上限(per-tool 覆盖优先于全局默认)。"""
+        return MAX_TEXT_CHARS if self.max_text_chars is None else self.max_text_chars
+
+    def _finalize(self, result: ToolResult, start: float) -> ToolResult:
+        """统一收尾:计时/原文保留/截断(单一出处——数值与规则变更只动这里)。"""
+        result.elapsed = round(time.time() - start, 3)
+        result.raw = result.text
+        result.text = truncate_text(result.text, self.text_limit)
+        return result
 
     @property
     def params_doc(self) -> str:
@@ -190,10 +207,7 @@ class AgentTool(ABC):
                 result = self._run(**kw)
         except Exception as e:
             result = ToolResult(ok=False, text="", error=f"{type(e).__name__}: {e}")
-        result.elapsed = round(time.time() - start, 3)
-        result.raw = result.text
-        result.text = truncate_text(result.text)
-        return result
+        return self._finalize(result, start)
 
     @abstractmethod
     def _run(self, **kw) -> ToolResult: ...

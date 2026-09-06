@@ -25,7 +25,10 @@ from firmware_audit.step5_agent.orchestration.orchestrator import (
     Orchestrator,
     build_orchestrator_prompt,
 )
-from firmware_audit.step5_agent.orchestration.state import SubAgentResult
+from firmware_audit.step5_agent.orchestration.state import (
+    DispatchStatus,
+    SubAgentResult,
+)
 from firmware_audit.step5_agent.orchestration.actions import (
     DispatchAgentTool,
     SummarizeTool,
@@ -608,6 +611,94 @@ def test_summarize_tool_and_report() -> list[str]:
         material_msg = llm.calls[10][-1]["content"]
         if "报告写作素材" not in material_msg:
             fails.append(f"summarize 后应注入报告素材: {material_msg[:120]}")
+        if "read_file 可查" in material_msg:
+            fails.append("素材文案不应再向 orchestrator 承诺 read_file 回读"
+                         "(编排者没有该动作,target/1 实测白烧一轮)")
+    return fails
+
+
+def _summarize_observation(td: Path, findings: list[dict]):
+    """直构 verification 工件 + 编排层状态,返回 summarize 的 Observation。
+
+    票01 素材规模测法:全链路 dispatch 由其余用例覆盖,规模断言只需工件在盘 +
+    agent_results 登记——SummarizeTool.execute 的 text 即编排层实际进
+    Observation 的内容(截断在工具 execute 统一入口发生)。
+    """
+    art = td / "process" / "agent" / "9_verification" / "verified_findings.json"
+    art.parent.mkdir(parents=True, exist_ok=True)
+    art.write_text(json.dumps({"summary": "复核完成", "findings": findings},
+                              ensure_ascii=False), encoding="utf-8")
+    orch = _orch(td, ScriptedLLM([]))
+    orch.register(SubAgentResult(seq=9, agent_name="verification",
+                                 status=DispatchStatus.SUCCESS,
+                                 artifact_path=art, summary="复核完成"))
+    tool = SummarizeTool(ToolContext(process_dir=orch.process_dir), orch)
+    return tool.execute()
+
+
+def test_summarize_material_under_64k_full() -> list[str]:
+    """票01:素材在 64k 护栏内全量进 Observation(target/1 事故翻转:9 条
+    全字段素材约 2.7 万字符,超过全局默认 16000 仍不截断,首尾 rationale
+    完整在场——不再出现第 2-7 条明细落在被丢弃中间段的事故)。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        findings = [
+            {"title": f"finding-{i}", "severity": "high",
+             "file": "extracted/unitree/bin/idlc", "confidence": "high",
+             "verified": True,
+             "rationale": f"PROOF-{i} " + "R" * 2000 + f" TAIL-{i}",
+             "evidence": "E" * 600}
+            for i in range(1, 10)  # 事故同款 9 条
+        ]
+        r = _summarize_observation(td, findings)
+        if not r.ok:
+            fails.append(f"summarize 应成功: {r.error}")
+        if len(r.text) <= 16000:
+            fails.append(f"用例素材应超过全局默认 16000: {len(r.text)}")
+        if "已截断" in r.text:
+            fails.append("≤64k 素材不应出现截断提示")
+        for needle in ("PROOF-1", "TAIL-1", "PROOF-9", "TAIL-9"):
+            if needle not in r.text:
+                fails.append(f"素材应全量注入(首尾 rationale 明细在场): 缺 {needle}")
+        if r.raw != r.text:
+            fails.append("未截断时 raw 应与 text 一致")
+        if "read_file 可查" in r.text:
+            fails.append("素材文案不应再含 'read_file 可查' 空头承诺")
+    return fails
+
+
+def test_summarize_material_over_64k_guardrail() -> list[str]:
+    """票01:素材超 64k 护栏触发截断兜底(finding 规模失控不无界注入),
+    头尾保留行为模型不变;raw 保留截断前全文供 obs/ 落盘。"""
+    fails: list[str] = []
+    # 生产声明点:summarize 报告素材护栏 64000(spec 定值,编排层工具)
+    if SummarizeTool.max_text_chars != 64000:
+        fails.append(f"SummarizeTool 护栏应声明 64000, got {SummarizeTool.max_text_chars}")
+    with tempfile.TemporaryDirectory() as _td:
+        td = Path(_td)
+        findings = [
+            {"title": f"finding-{i}", "severity": "high",
+             "file": "extracted/unitree/bin/idlc", "confidence": "high",
+             "verified": True,
+             "rationale": f"PROOF-{i} " + "R" * 7000
+                          + (f" TAIL-{i}" if i >= 11 else ""),
+             "evidence": "E" * 600}
+            for i in range(1, 13)  # 12 条 × ~7.9k ≈ 9.6 万字符 > 64k
+        ]
+        r = _summarize_observation(td, findings)
+        if "已截断" not in r.text:
+            fails.append(">64k 素材应触发护栏截断提示")
+        if "PROOF-1" not in r.text or "TAIL-12" not in r.text:
+            fails.append("护栏截断应保留头尾(PROOF-1 / TAIL-12 在场)")
+        if "PROOF-8" in r.text or "TAIL-8" in r.text:
+            fails.append("护栏截断应省略中间段(finding-8 落在被丢弃区)")
+        # 长度上界钳住护栏取值:64k 截断后 ≈ 头75%+尾20%+提示 ≈ 6.1 万;
+        # 若护栏被误改小(如 32k/8k),长度会显著低于 6 万
+        if not (60000 <= len(r.text) <= 64000 + 200):
+            fails.append(f"护栏截断后长度应在 [60000, 64200](64k 口径): {len(r.text)}")
+        if len(r.raw) <= 64000:
+            fails.append("raw 应保留截断前全文")
     return fails
 
 
@@ -2210,6 +2301,8 @@ def test_main() -> int:
         ("orchestrator_integration_dirs", test_orchestrator_integration_dirs),
         ("orchestrator_multi_dispatch_integration", test_orchestrator_multi_dispatch_integration),
         ("summarize_tool_and_report", test_summarize_tool_and_report),
+        ("summarize_material_under_64k_full", test_summarize_material_under_64k_full),
+        ("summarize_material_over_64k_guardrail", test_summarize_material_over_64k_guardrail),
         ("report_unreviewed_section", test_report_unreviewed_section),
         ("verify_toplevel_verdict_merged", test_verify_toplevel_verdict_merged),
         ("report_absent_without_summarize", test_report_absent_without_summarize),
