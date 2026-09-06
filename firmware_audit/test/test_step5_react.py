@@ -493,9 +493,13 @@ def test_truncate_headtail_and_obs_fulltext() -> list[str]:
     if truncate_text("short") != "short":
         fails.append("短文本不应被截断")
 
-    # 循环层:obs/ 全文落盘 + transcript observation 条目带 obs_file
+    # 循环层:obs/ 全文落盘 + transcript observation 条目带 obs_file。
+    # 票02 忠实化:Action Input 放大到 >4000 字符,assistant/tool_call/tool
+    # 事件随之超长——记录层不得再裁剪;observation 记录与进上下文文本逐字一致,
+    # 截断提示(位于上下文文本 ~15000 字符处,旧 4000 记录线恰好裁掉)完整在场。
+    long_q = "X" * 5000
     llm = ScriptedLLM([
-        "Action: big\nAction Input: {}",
+        f'Action: big\nAction Input: {{"q": "{long_q}"}}',
         "Final Answer: done",
     ])
     tools = {"big": BigTool(ToolContext(process_dir=Path(".")))}
@@ -513,8 +517,24 @@ def test_truncate_headtail_and_obs_fulltext() -> list[str]:
         obs_entries = [e for e in entries if e.get("phase") == "observation"]
         if not obs_entries:
             fails.append("transcript 应含 observation 条目")
-        elif not obs_entries[0].get("obs_file"):
-            fails.append(f"observation 条目应带 obs_file 指针: {obs_entries[0]}")
+        else:
+            if not obs_entries[0].get("obs_file"):
+                fails.append(f"observation 条目应带 obs_file 指针: {obs_entries[0]}")
+            recorded = obs_entries[0]["content"]
+            ctx_obs = llm.calls[1][-1]["content"]  # 第 2 次调用回喂的 user 消息
+            if recorded != ctx_obs:
+                fails.append(f"observation 记录应与进上下文文本逐字一致: "
+                             f"recorded={len(recorded)} ctx={len(ctx_obs)}")
+            if "分页读取被省略的中间部分" not in recorded:
+                fails.append("截断提示应完整出现在 observation 记录中(旧 4000 记录线裁掉)")
+        # assistant/tool_call/tool 事件长内容(>4000 字符)不再被记录层裁剪
+        a1 = next((e for e in entries if e.get("phase") == "assistant"), None)
+        if a1 is None or a1["content"] != llm.replies[0]:
+            fails.append("assistant 事件应记全文(>4000 字符不裁剪)")
+        for ph in ("tool_call", "tool"):
+            e = next((x for x in entries if x.get("phase") == ph), None)
+            if e is None or long_q not in e["content"]:
+                fails.append(f"{ph} 事件应记完整调用输入(不再截 200/4000)")
     return fails
 
 

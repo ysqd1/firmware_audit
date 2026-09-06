@@ -47,13 +47,20 @@ class Transcript:
         self.path = path
 
     def log(self, step: int, phase: str, content: str, **extra) -> None:
-        """追加一条 JSONL 事件(带 ts 时间戳;content 截 4000 字符防单条爆文件)。"""
+        """追加一条 JSONL 事件(带 ts 时间戳)。
+
+        忠实记录(票02,2026-09-06):content 一律全文落盘,不设记录层截断——
+        transcript 是"LLM 实际看到了什么"的存证,截断提示等中间内容被记录层
+        裁掉会二次误导排查(2026-09-05 target/1 实测)。尺寸天然有界:
+        observation 受入上下文上限约束(全局 16k / per-tool 覆盖),
+        assistant/tool 事件源自 LLM 回复,受 max_tokens 约束。
+        """
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)  # 独立调用无 runner 预建
         entry = {"step": step, "phase": phase,
                  "ts": datetime.now().isoformat(timespec="seconds"),
-                 "content": content[:4000], **extra}
+                 "content": content, **extra}
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

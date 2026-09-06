@@ -172,8 +172,10 @@ def run_react_agent(
         kwargs = parse_action_input(raw_input)
 
         # 立即留痕:调用发起即记(长耗时工具如 dispatch_agent 执行期间,
-        # transcript 就能看到"已发起什么调用";结果由下方 tool/observation 补记)
-        tr.log(step, "tool_call", f"{name}({raw_input[:200]})")
+        # transcript 就能看到"已发起什么调用",含完整 Action Input;
+        # 结果由下方 tool 事件补记,回显同串复用)
+        call_echo = f"{name}({raw_input})"
+        tr.log(step, "tool_call", call_echo)
 
         # 同参循环守卫:同一工具+相同参数超过 3 次 → 拦截不执行,注入干预提示
         key = name.strip() + "|" + _json.dumps(
@@ -197,10 +199,14 @@ def run_react_agent(
                          log_extra.get("elapsed"), truncated, obs_file)
         if truncated and obs_file:
             obs += "\n" + OBS_TRUNCATE_HINT.format(path=obs_file)
+        # 同一字符串既进上下文也进记录(票02 忠实化):observation 记录与
+        # 进上下文文本逐字一致,排查者从 transcript 直接看到"LLM 实际看到了什么"
+        # (含截断提示;截断前原文仍只在 obs/,分工不变)
+        user_obs = f"Observation: {obs}"
         cm.append("assistant", reply)
-        cm.append("user", f"Observation: {obs}")
-        tr.log(step, "tool", f"{name}({raw_input[:200]})", **log_extra)
-        tr.log(step, "observation", obs, obs_file=obs_file)
+        cm.append("user", user_obs)
+        tr.log(step, "tool", call_echo, **log_extra)
+        tr.log(step, "observation", user_obs, obs_file=obs_file)
 
     return _force_final_round(llm, cm, tr, result, display=disp)
 
