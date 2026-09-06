@@ -18,9 +18,9 @@ from pathlib import Path
 
 
 def wrap_long_lines(text: str, width: int = 4000) -> str:
-    """超长行软折行:obs 文件要供 read_file 按行分页回读,单行 >8KB 会让
-    分页失效(整行读出又触发截断,中间段永远取不回)。JSON/代码按 width
-    折行后仍肉眼可读;不影响入上下文的 text(折行只发生在落盘副本)。"""
+    """超长行软折行:obs 文件要供 read_file 按行分页回读,单行超过 Observation
+    入上下文预算会让分页失效(整行读出又触发截断,中间段永远取不回)。JSON/代码
+    按 width 折行后仍肉眼可读;不影响入上下文的 text(折行只发生在落盘副本)。"""
     out: list[str] = []
     for line in text.splitlines():
         while len(line) > width:

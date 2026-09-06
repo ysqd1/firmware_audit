@@ -15,7 +15,7 @@
 
 ## Agent 层约定(2026-08-16 新增,08-17 随工具层定稿更新)
 
-- **工具统一 ToolResult 接口**(2026-08-17 定稿)— 三类实现:CLI 类 subprocess 调容器内 CLI(checksec/cve-bin-tool/radare2 等)、读盘类直读 Step4 工件(find_decompiled_function/strings/imports/read_file)、API 类 urllib(cve_lookup);返回 `{ok, text, data, error, elapsed}`,text ≤8KB 截断
+- **工具统一 ToolResult 接口**(2026-08-17 定稿)— 三类实现:CLI 类 subprocess 调容器内 CLI(checksec/cve-bin-tool/radare2 等)、读盘类直读 Step4 工件(find_decompiled_function/strings/imports/read_file)、API 类 urllib(cve_lookup);返回 `{ok, text, data, error, elapsed, raw}`,text ≤16000 字符截断(2026-09-06 票01 由 8KB 上调;基类 `max_text_chars` 可按工具覆盖,summarize 素材护栏 64000)
 - **幂等与超时** — 同参同果(cve_lookup 以缓存快照为准);每工具可配超时
 - **分析一次、多次查询** — 复用 Step4 工件(functions/imports/strings),不重复反编译
 - **漏斗式调用** — 廉价工具批量跑(读盘类毫秒级),昂贵操作(Ghidra 重分析/仿真)按触发条件深挖;单函数反编译是读盘切片,不再昂贵

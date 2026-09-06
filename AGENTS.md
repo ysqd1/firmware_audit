@@ -150,7 +150,7 @@ def step5_run(ctx):
 
 * **迭代上限按 Agent 固化**:recon 20 / analysis 30(2026-08-29 由 24 上调,防疑点取证中途截断)/ **verification 每实例 8**(2026-09-01 ADR-0003:每疑点一实例后,单条复核轮次需求 ≤8;原 24 是"单实例复核全部疑点"的多疑点摊薄值,已不适用),防死循环烧预算。**轮次可 env 覆盖(2026-09-02)**:`STEP5_RECON_MAX_ITERS` / `STEP5_ANALYSIS_MAX_ITERS` / `STEP5_VERIFICATION_MAX_ITERS` / `STEP5_ORCHESTRATOR_MAX_ITERS`(默认 20/30/8/12),缺失/非法值回落默认、下限钳 1;`runner.resolve_max_iters` 消费点解析,模块常量不污染;均可写入 `firmware_audit/.env`(`load_env_file` 启动注入,OS 环境变量优先)
 
-* **Observation 截断**:单条工具结果 ≤ 8KB 入上下文,全文落盘供后续查询
+* **Observation 截断(2026-09-06 票01 定稿)**:单条工具结果 ≤ **16000 字符**入上下文(由 8KB 上调,头 75%+尾 20% 头尾保留),全文落盘供后续查询;工具基类可选类属性 `max_text_chars` 按工具覆盖(None=全局默认),**summarize 声明 64000 护栏**——报告素材是唯一必须完整进 Observation 的内容,orchestrator 无 read_file 回读动作,素材被截即闭环断裂(target/1 实测事故)
 
 * 工具失败不终止:Observation 返回错误信息,Agent 自行换路(继承铁律"失败不崩")
 
@@ -254,7 +254,7 @@ step5_agent/
 @dataclass
 class ToolResult:
     ok: bool                 # 退出码/文件存在/API 200
-    text: str                # 给 LLM 看的文本,≤8KB,超长截断(头75%+尾20%+提示)
+    text: str                # 给 LLM 看的文本,≤16000(基类 max_text_chars 可覆盖,见下),超长截断(头75%+尾20%+提示)
     data: dict | list | None # 结构化结果(有 JSON 就解析,没有就 None)
     error: str | None
     elapsed: float
@@ -341,7 +341,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 | `find_decompiled_function` | 读盘  | 读 `analysis/*.c`,切函数片段                                                    | 单个函数 C 代码                  | analysis, verification |
 | `xref_query`               | CLI | radare2 `axtj`(JSON 输出)                                                   | 交叉引用链                      | analysis, verification |
 | `cve_lookup`               | API | NVD REST API 2.0                                                          | CVSS/POC 可用性               | analysis, verification |
-| `read_file`                | 读盘  | pathlib 读 `process/` 下文件(路径白名单)                                           | 工件细节片段 ≤8KB                | 全部(跨 Agent 回查机制)       |
+| `read_file`                | 读盘  | pathlib 读 `process/` 下文件(路径白名单)                                           | 工件细节片段 ≤16000 字符           | 全部(跨 Agent 回查机制)       |
 | `semgrep_scan`             | CLI | semgrep 1.100.0 + 本地规则 `tools/rules/semgrep_security.yaml`(离线,不用 p/ 网络规则) | 脚本语义漏洞(命令注入/SQLi/反序列化);'.' 双扫 analysis 反编译 C 危险调用(strcpy/sprintf/gets/system 等,仅 \*.c) | recon, analysis        |
 | `gitleaks_scan`            | CLI | gitleaks 8.18.2 `detect --no-git`(单容器 detect+cat 报告)                      | 硬编码密钥/凭据                   | recon, analysis        |
 | `sandbox_verify`           | CLI | 沙箱跑复核脚本(仅 python3/node/php 白名单解释器,网络隔离,extracted 只读)                      | Fuzzing Harness/PoC 动态验证输出 | verification           |
@@ -424,7 +424,7 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 
 * 压缩函数:复用默认模型 deepseek-v4-flash(AgentConfig.model 可覆盖为更便宜型号),概括保留区最老若干轮,摘要写回概括区、原文删除;概括 prompt 保留四类信息:已确认事实/已排除项/未决问题/证据指针(工件路径)
 
-* 不丢证据(2026-08-18 补齐):Observation 入上下文 ≤8KB **头尾保留截断**(头 75%+尾 20%,学 DeepAudit:提示注明省略字符数与全文总长);**原文全文落盘** `process/agent/<name>/obs/step<N>_<tool>.txt`(`ToolResult.raw` 保留截断前原文;>4k 字符单行软折行保 read\_file 行分页可用);**截断时 Observation 末尾自动附具体回读路径**(相对 process/,与 read\_file 白名单同根),LLM 可自主 `read_file` 分页取回省略的中间段——闭环有端到端测试(`obs_readback_via_read_file`)
+* 不丢证据(2026-08-18 补齐;预算 2026-09-06 票01 由 8KB 上调):Observation 入上下文 ≤16000 字符(工具基类 `max_text_chars` 可覆盖,summarize 素材 64k)**头尾保留截断**(头 75%+尾 20%,学 DeepAudit:提示注明省略字符数与全文总长);**原文全文落盘** `process/agent/<name>/obs/step<N>_<tool>.txt`(`ToolResult.raw` 保留截断前原文;>4k 字符单行软折行保 read\_file 行分页可用);**截断时 Observation 末尾自动附具体回读路径**(相对 process/,与 read\_file 白名单同根),LLM 可自主 `read_file` 分页取回省略的中间段——闭环有端到端测试(`obs_readback_via_read_file`)
 
 * 兜底:压缩调用失败不重试,直接丢弃最老轮次(失败不崩)
 
@@ -433,6 +433,8 @@ sandbox 镜像现状(2026-08-18 更新):`firm_audit/sandbox:latest` 已是压扁
 ### 已定:transcript 落盘与测试(2026-08-17)
 
 * `process/agent/<agent名>/transcript.jsonl`,每行记 role/content/工具名/耗时/原始结果路径
+
+* **记录忠实化(2026-09-06 票02)**:transcript=实际所见——记录层零截断,observation 事件 content 含 `Observation: ` 前缀、与进上下文的 user 消息逐字一致,assistant 事件含 reasoning+reply;`obs/`=截断前工具原文。二者互补:排查截断类事故两份都要看
 
 * `ScriptedLLM`(按脚本回放假回复)让 run\_react\_agent 全链路单测零 API 消耗
 

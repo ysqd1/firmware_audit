@@ -146,7 +146,7 @@ class TerminalDisplay:
                              f"OK {elapsed:.2f}s" if elapsed is not None else "OK")
         else:
             status = self._c(_RED, "Error")
-        # 紧凑取首行;完整模式取前 12 行(仍远小于入上下文的 8KB)
+        # 紧凑取首行;完整模式取前 12 行(仍远小于入上下文的 16k 预算)
         lines = [l for l in text.splitlines() if l.strip()]
         if self.mode == "full" and len(lines) > 1:
             body = " | ".join(self._clip(l, self._content_width())

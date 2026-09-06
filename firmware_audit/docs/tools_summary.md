@@ -563,7 +563,7 @@ python -m firmware_audit.step0.step0_split_img <img文件> [--out-dir 目录] [-
 @dataclass
 class ToolResult:
     ok: bool                 # 成功/失败
-    text: str                # 入上下文的文本（已截断 ≤8KB，头75%+尾20%）
+    text: str                # 入上下文的文本（已截断 ≤16000 字符，头75%+尾20%；基类 max_text_chars 可按工具覆盖，summarize 素材护栏 64000）
     data: dict|list|None     # 结构化数据
     error: str|None          # 错误信息
     elapsed: float           # 耗时秒
@@ -1131,7 +1131,7 @@ Orchestrator 自己的 ReAct 循环只暴露这 3 个动作，与子 Agent 的 1
 
 * 最后一轮 `LAST_ROUND_NOTICE` + 强制收尾 `_force_final_round`
 
-**Observation**：截断 ≤8KB + 全文落盘 `process/agent/<name>/obs/step<N>_<tool>.txt`，截断时附回读路径提示。
+**Observation**：截断 ≤16000 字符（2026-09-06 票01 由 8KB 上调；全局默认，`AgentTool.max_text_chars` 可按工具覆盖，summarize 素材护栏 64000）+ 全文落盘 `process/agent/<name>/obs/step<N>_<tool>.txt`，截断时附回读路径提示。
 
 ### ContextManager（四分区上下文）`engine/context.py`
 

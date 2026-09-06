@@ -63,7 +63,7 @@ class BoomTool(AgentTool):
 
 
 class BigTool(AgentTool):
-    """返回 >16KB 文本,演示截断 + obs/ 全文指针。"""
+    """返回 >16k 字符文本,演示截断 + obs/ 全文指针。"""
 
     name, description, params_doc = "big", "demo", "{}"
 

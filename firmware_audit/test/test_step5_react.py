@@ -40,7 +40,7 @@ class FailTool(AgentTool):
 
 
 class BigTool(AgentTool):
-    """返回 >16KB 文本,验证截断策略与全文落盘。"""
+    """返回 >16k 字符文本,验证截断策略与全文落盘。"""
 
     name = "big"
     description = "test"
