@@ -12,6 +12,9 @@ target/
 **/process/.cve_cache/
 **/process/fileinfo.json
 
+# ---- CVE 共享缓存(firmware_audit/.cve_cache,各 target junction 指向) ----
+firmware_audit/.cve_cache/
+
 # ---- Python 缓存 ----
 __pycache__/
 *.py[cod]
