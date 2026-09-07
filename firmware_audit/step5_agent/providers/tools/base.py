@@ -6,6 +6,7 @@ ToolResult 是数据口袋:ReAct 循环只消费它,不感知工具的数据来�
 from __future__ import annotations
 
 import json
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -34,6 +35,11 @@ class ToolContext:
     process_dir: Path  # target/<N>/process(工件根,也是 read_file 白名单根)
 
 
+# 盘符前缀(C:/ 或 C:形态,反斜杠换算后)按绝对引用拒绝——Windows 上 Path
+# 语义本就如此,POSIX 上需显式判定(CONTEXT.md 路径白名单"绝对盘符 → ok=False")
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+
+
 def resolve_within(root: Path, ref: str | None) -> Path | None:
     """把 ref(相对路径,可能带 \\ 分隔)解析为 root 下的绝对路径;越界返回 None。
 
@@ -41,13 +47,15 @@ def resolve_within(root: Path, ref: str | None) -> Path | None:
       if p != root and root not in p.parents
     复制在 base.resolve_analysis_file / cli_base.container_path / read_file /
     list_files / search_code._resolve_scope / binwalk_rescan 六处,规则已分叉。
-    统一收口到此;空串/None/越界(.. / 绝对路径)一律返回 None,由调用方决定
-    是报错还是静默跳过(失败不崩,见 rules.md)。根目录自身(如 ".")按 containment
-    语义视为合法,返回 root(调用方若要"根即越界"需自行特判)。
+    统一收口到此;空串/None/越界(.. / 绝对路径/盘符前缀)一律返回 None,由
+    调用方决定是报错还是静默跳过(失败不崩,见 rules.md)。根目录自身(如 ".")
+    按 containment 语义视为合法,返回 root(调用方若要"根即越界"需自行特判)。
     """
     base = Path(root).resolve()
     r = str(ref or "").strip().replace("\\", "/")
     if not r:
+        return None
+    if _DRIVE_PREFIX_RE.match(r):
         return None
     cand = (base / r).resolve()
     if cand != base and base not in cand.parents:

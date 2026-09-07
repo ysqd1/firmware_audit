@@ -107,6 +107,9 @@ def test_resolve_within() -> list[str]:
         for bad in ("", "/", "..", "../x", "sub/../../x", "C:\\evil"):
             if resolve_within(root, bad) is not None:
                 fails.append(f"越界/空引用应按 None 拒绝: {bad!r}")
+        # 盘符前缀(含正斜杠形态)按绝对引用拒绝——跨平台同一契约
+        if resolve_within(root, "C:/evil") is not None:
+            fails.append("盘符前缀应按绝对引用拒绝: 'C:/evil'")
         if resolve_within(root, None) is not None:
             fails.append("None 引用应按 None 拒绝")
     return fails
