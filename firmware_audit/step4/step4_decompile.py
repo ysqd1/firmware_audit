@@ -6,6 +6,7 @@ ELF → Ghidra Headless 提取程序信息(Docker 镜像)
 """
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -22,6 +23,13 @@ GHIDRA_IMAGE = "ghidra"
 _CONT_INPUT = "/work/input"
 _CONT_OUTPUT = "/work/output"
 _CONT_PROJECT = "/work/project"
+
+# 宿主 uid:gid:Ghidra 容器以此身份跑,挂载写出的产物归宿主用户。WSL/
+# Docker Desktop 下容器默认 root,写出的文件 root:root 0640,宿主读回
+# Permission denied(Windows 文件层无此语义,迁移后 target/1 实测
+# 522/522 全挂)。非 POSIX(Windows 宿主)无 getuid → None,调用点
+# 的 user 与 HOME 均不注入,维持原行为。
+_HOST_UID_GID = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else None
 
 
 def _decompile_success_count(decompiled_c: Path) -> int:
@@ -580,8 +588,13 @@ def _run_ghidra(fi: FileInfo, analysis_dir: Path) -> bool:
         # Docker timeout 900: 分析 300s 截断后 + postScript 反编译仍需时间,
         # 600s 总限太紧(实测 60s 分析 + 反编译 = 248s;300s 分析 + 反编译
         # 大库可能 >600s,故提到 900 给足余量)。
+        # HOME=/tmp:非 root 身份写不了镜像默认 /root,Ghidra 首跑要建
+        # ~/.ghidra 用户设置目录,指到容器内可写的 /tmp(随容器即抛,无状态)。
+        # 仅随 _HOST_UID_GID 一起注入,非 POSIX 平台两参皆不传,行为不变。
         rc, stdout, stderr = run_docker(
-            GHIDRA_IMAGE, args, mounts=mounts, timeout=900
+            GHIDRA_IMAGE, args, mounts=mounts, timeout=900,
+            user=_HOST_UID_GID,
+            env={"HOME": "/tmp"} if _HOST_UID_GID else None,
         )
 
         if rc != 0:

@@ -105,6 +105,38 @@ def test_docker_available_utf8_decode() -> list[str]:
     return fails
 
 
+def test_run_docker_user_flag() -> list[str]:
+    """run_docker 的 user 参数必须透传 --user;缺省不注入(容器默认身份)。
+
+    WSL 下容器默认 root 身份,写挂载产物 root:root 0640,宿主非 root 读回
+    Permission denied(Step4 Ghidra 实测 522/522 全挂)——调用方需显式传
+    宿主 uid:gid,本测试钉住透传契约。
+    """
+    fails: list[str] = []
+    captured: dict = {}
+    real_run = _subprocess.run
+
+    def fake_run(cmd, **kw):
+        captured["cmd"] = list(cmd)
+        return real_run([sys.executable, "-c", "pass"], **kw)
+
+    orig = docker_utils.subprocess.run
+    docker_utils.subprocess.run = fake_run
+    try:
+        docker_utils.run_docker("img", ["arg"], user="1000:1000")
+        with_user = captured["cmd"]
+        docker_utils.run_docker("img", ["arg"])
+        without_user = captured["cmd"]
+    finally:
+        docker_utils.subprocess.run = orig
+
+    if "--user" not in with_user or "1000:1000" not in with_user:
+        fails.append(f"user='1000:1000' 应透传为 --user,实际 {with_user}")
+    if "--user" in without_user:
+        fails.append(f"缺省 user 不应注入 --user,实际 {without_user}")
+    return fails
+
+
 def main() -> int:
     groups = [
         ("无tag补latest", test_ensure_tag_untagged()),
@@ -112,6 +144,7 @@ def main() -> int:
         ("registry补latest", test_ensure_tag_registry()),
         ("run_docker utf-8解码", test_run_docker_utf8_decode()),
         ("docker_available utf-8解码", test_docker_available_utf8_decode()),
+        ("run_docker --user透传", test_run_docker_user_flag()),
     ]
     failures = 0
     for name, fl in groups:

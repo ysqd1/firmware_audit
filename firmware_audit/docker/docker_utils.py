@@ -24,6 +24,7 @@ def run_docker(
     timeout: int = 3600,
     env: dict[str, str] | None = None,
     network: str | None = None,
+    user: str | None = None,
 ) -> tuple[int, str, str]:
     """运行 Docker 容器,返回 (returncode, stdout, stderr)。
 
@@ -39,6 +40,9 @@ def run_docker(
         network: Docker 网络模式(如 "none" 断网);None 用默认 bridge。
                 Step5 Agent 工具一律 none(签名扫描/本地规则/沙箱复核均不需外网,
                 cve_bin_tool_scan 的 CVE 库由 .cve_cache 卷预热 + --offline 维护)。
+        user: --user 透传(如宿主 "1000:1000")。容器写挂载的产物随之归宿主
+              用户——WSL 下容器默认 root,写出的文件 root:root 0640,宿主
+              读回 Permission denied(Windows 文件层无此语义,Step4 实测)。
 
     失败不抛异常,返回非零退出码 + stderr,由调用方决定降级。
     """
@@ -50,6 +54,8 @@ def run_docker(
         cmd += ["-w", workdir]
     if network:
         cmd += ["--network", network]
+    if user:
+        cmd += ["--user", user]
     for k, v in (env or {}).items():
         cmd += ["-e", f"{k}={v}"]
 
