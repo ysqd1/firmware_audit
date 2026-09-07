@@ -11,6 +11,10 @@
   - 磁盘镜像(含 GPT/MBR 分区表,如 .img)→ 分区提取,每个分区独立
     交 Step1 引导解包器。为什么必须分区: 几百 GB 的整盘镜像直接进 binwalk
     会爆炸(扫描整盘 + 递归解包 OOM/超时),先按分区表切成小文件。
+    例外: 命中 ext4 超级块魔数(0xEF53)的分区走直读(step0_ext4_read,
+    debugfs/mount 双后端),不经 dd+binwalk 直接产出文件树 + Step1 完成标记
+    ——不看大小(超大 rootfs 靠它救活);返回条目里这类分区是子工作区
+    目录(非 .img 文件),main.py 按目录识别直接递归。
   - 其他(.bin 等)→ 原样返回,skip_binwalk=False
 """
 from __future__ import annotations
@@ -30,8 +34,10 @@ from .step0_split_img import (
     should_extract,
     extract_partition,
     _verify_extracted,
+    _find_existing_part,
     SKIP_AUDIT_KINDS,
 )
+from .step0_ext4_read import STEP1_DONE_MARKER, direct_read_ext4, is_ext4_partition
 import contextlib
 
 # 归档类:解出文件系统,跳过 binwalk
@@ -130,18 +136,6 @@ def _decompress_single(src: Path, dest_dir: Path) -> Path:
     return out
 
 
-def _find_existing_part(out_dir: Path, name: str, size: int) -> Path | None:
-    """在 process/ 根及分区子工作区 process/<stem>/ 中找已提取的同名同大小分区。"""
-    stem = Path(name).stem
-    for cand in (out_dir / stem / name, out_dir / name):
-        try:
-            if cand.is_file() and cand.stat().st_size == size:
-                return cand
-        except OSError:
-            continue
-    return None
-
-
 def _cleanup_skipped_part(out_dir: Path, index: int, name: str) -> None:
     """删除被筛类型分区(dtb/reserved)的旧产物,保持目录与筛选规则一致。
 
@@ -166,15 +160,26 @@ def _cleanup_skipped_part(out_dir: Path, index: int, name: str) -> None:
             print(f"[Step0] 清理失败({cand.name}): {e}")
 
 
-def _extract_partitions(img: Path, target_dir: Path) -> list[Path]:
-    """磁盘镜像分区提取,返回提取出的分区文件列表(可能为空)。
+def _extract_partitions(img: Path, target_dir: Path) -> list[Path] | None:
+    """磁盘镜像分区提取,返回分区条目列表(可能为空或 None)。
 
     target_dir 是 process/(extracted_dir.parent);分区文件直接落 process/ 根,
     main.py 随即把每个分区 move 进 process/<分区名>/ 子工作区。
 
+    返回值三态:
+      - 非空 list:.img 文件(非 ext4 分区,交 Step1 引导解包器)与/或子工作区
+        目录(ext4 直读产物,extracted/ + .step1_done 已就位);main.py 按
+        目录/文件分流递归。
+      - []:无分区表(或表不可信),调用方回退直接交 binwalk(旧行为)。
+      - None:有分区表但所有分区均未产出且含 ext4 直读失败——调用方必须
+        终止而非回退:把几百 GB 整盘镜像交 binwalk 正是分区提取要防的爆炸。
+
     准确性命门: 每个分区提取后做回读校验(源头 4KB vs 提取文件头),不一致
     的分区宁可不产出(删除)也不输出坏数据——分区错,下游全废。
     复用同样过回读校验:大小一致但内容损坏的旧文件会被重提。
+
+    ext4 直读失败(缺 debugfs/mount 无免密 sudo/文件系统损坏)不崩:响亮
+    告警后跳过该分区,批次里其余分区照常处理(逐分区 try 隔离异常)。
     """
     out_dir = target_dir
     try:
@@ -186,14 +191,20 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path]:
         return []
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    files: list[Path] = []
+    entries: list[Path] = []
+    direct_read_failed = False
     try:
         with open(img, "rb") as f:
             for p in partitions:
-                if not should_extract(p["kind"], p["size"], _PARTITION_MAX_SIZE_GB):
+                # 类型筛选(dtb/reserved 纯噪声)对 ext4 直读同样生效
+                if p["kind"] in SKIP_AUDIT_KINDS:
                     # 类型被筛(dtb/reserved):顺带清理旧产物,避免残留误导
-                    if p["kind"] in SKIP_AUDIT_KINDS:
-                        _cleanup_skipped_part(out_dir, p["index"], p["name"])
+                    _cleanup_skipped_part(out_dir, p["index"], p["name"])
+                    continue
+                # ext4 魔数命中 → 直读,不看大小(spec 决策:大小闸门只管非 ext4
+                # 的 dd 老路径;超大 rootfs 正是直读要救的对象)
+                ext4 = is_ext4_partition(f, p)
+                if not ext4 and not should_extract(p["kind"], p["size"], _PARTITION_MAX_SIZE_GB):
                     continue
                 # 告警:身份冲突 / 截断(有问题也要让用户看到,但不中断流程)
                 if p.get("kind_conflict"):
@@ -201,7 +212,31 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path]:
                 if p.get("truncated"):
                     print(f"[Step0] 警告: {p['name']} {p['issues'][0]}")
                 safe_name = p["name"].replace("/", "_").replace("\\", "_")
-                part_file = out_dir / f"part{p['index']:02d}_{safe_name}.img"
+                stem = f"part{p['index']:02d}_{safe_name}"
+
+                if ext4:
+                    ws = out_dir / stem
+                    marker = ws / "extracted" / STEP1_DONE_MARKER
+                    if marker.is_file():
+                        print(f"[Step0] ext4 分区 {p['name']} 直读产物已存在,断点复用: {ws.name}")
+                        entries.append(ws)
+                        continue
+                    print(f"[Step0] ext4 分区 {p['name']}({p['size'] / 1024 ** 3:.1f} GB)"
+                          "命中 0xEF53 魔数,直读文件树(不经 dd+binwalk)")
+                    # 逐分区 try:直读内部非 OSError 异常也不许炸掉整批分区
+                    try:
+                        ok, reason = direct_read_ext4(img, p, ws, f)
+                    except Exception as e:
+                        ok, reason = False, f"直读异常:{e}"
+                    if ok:
+                        entries.append(ws)
+                    else:
+                        direct_read_failed = True
+                        print(f"[Step0] 告警: 分区 {p['name']} 直读失败:{reason};"
+                              "跳过该分区,批次继续(其余分区不受影响)")
+                    continue
+
+                part_file = out_dir / f"{stem}.img"
                 # 复用:main.py 会把分区 move 进子工作区 process/<stem>/,
                 # 两处都查,避免已处理的分区被重复提取(几百 GB 镜像重复 IO 很痛)。
                 # 复用得过回读校验:大小一致但内容损坏的旧文件必须重新提取。
@@ -209,7 +244,7 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path]:
                 if existing is not None:
                     if _verify_extracted(img, p["offset"], p["size"], existing):
                         print(f"[Step0] 复用已提取分区: {existing.name}")
-                        files.append(existing)
+                        entries.append(existing)
                         continue
                     print(f"[Step0] 已存在分区 {existing.name} 回读校验失败,重新提取")
                     with contextlib.suppress(OSError):
@@ -221,19 +256,26 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path]:
                     with contextlib.suppress(OSError):
                         part_file.unlink()
                     continue
-                files.append(part_file)
+                entries.append(part_file)
     except Exception as e:
         print(f"[Step0] 分区提取失败({img.name}): {e},回退直接交 binwalk")
         return []
 
-    if not files:
+    if not entries:
+        if direct_read_failed:
+            print(f"[Step0] 错误: {img.name} 所有分区均未产出(含 ext4 直读失败),"
+                  "不回退整盘 binwalk(会爆炸),交由调用方终止")
+            return None
         print(f"[Step0] {img.name} 有分区表但无分区被提取(均为超大分区/空表),"
               "回退直接交 binwalk")
         return []
-    print(f"[Step0] 磁盘镜像 {img.name} 已提取 {len(files)} 个分区到 {out_dir}:")
-    for fp in files:
-        print(f"  - {fp.name} ({fp.stat().st_size / 1024 / 1024:.1f} MB)")
-    return files
+    print(f"[Step0] 磁盘镜像 {img.name} 已处理 {len(entries)} 个分区到 {out_dir}:")
+    for fp in entries:
+        if fp.is_dir():
+            print(f"  - {fp.name}/ (ext4 直读树,含 .step1_done)")
+        else:
+            print(f"  - {fp.name} ({fp.stat().st_size / 1024 / 1024:.1f} MB)")
+    return entries
 
 
 def preprocess(firmware_path: Path, extracted_dir: Path) -> tuple[list[Path], bool]:
@@ -272,6 +314,8 @@ def preprocess(firmware_path: Path, extracted_dir: Path) -> tuple[list[Path], bo
                 parts = _extract_partitions(out, extracted_dir.parent)
                 if parts:
                     return parts, False
+                if parts is None:
+                    return [], False
             return [out], False
     except Exception as e:
         print(f"[Step0] 解压失败({firmware_path.name}): {e},回退交 binwalk")
@@ -283,5 +327,9 @@ def preprocess(firmware_path: Path, extracted_dir: Path) -> tuple[list[Path], bo
         parts = _extract_partitions(firmware_path, extracted_dir.parent)
         if parts:
             return parts, False
+        if parts is None:
+            # 有分区表但所有分区均未产出(含 ext4 直读失败):整盘交 binwalk
+            # 会爆炸,返回空输入交调用方响亮终止
+            return [], False
     print(f"[Step0] {firmware_path.name} 非磁盘镜像,直接交 binwalk")
     return [firmware_path], False

@@ -344,6 +344,18 @@ def extract_partition(f, partition, out_path):
     return copied
 
 
+def _find_existing_part(out_dir: Path, name: str, size: int) -> Path | None:
+    """在 process/ 根及分区子工作区 process/<stem>/ 中找已提取的同名同大小分区。"""
+    stem = Path(name).stem
+    for cand in (out_dir / stem / name, out_dir / name):
+        try:
+            if cand.is_file() and cand.stat().st_size == size:
+                return cand
+        except OSError:
+            continue
+    return None
+
+
 def _verify_extracted(src_path, offset, size, out_path, chunk=_VERIFY_CHUNK):
     """提取后回读校验:比较源分区头与提取文件头。
 

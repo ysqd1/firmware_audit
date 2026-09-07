@@ -237,23 +237,37 @@ def run_pipeline(
                 else:
                     step1_marker.write_text("ok", encoding="utf-8")
                     print(f"[main] Step0 预解压完成 + 引导解包树扫描,使用: {extracted_root}")
-            elif len(pre_inputs) > 1:
+            elif not pre_inputs:
+                # 磁盘镜像有分区表但所有分区均未产出(如 ext4 直读失败且无其他
+                # 分区):Step0 特意不回退整盘 binwalk(几百 GB 会爆炸),响亮终止
+                print("[main] Step0 有分区表但所有分区均未产出(直读失败/被筛),终止")
+                print("[main] 提示: 安装 debugfs(e2fsprogs)或配置免密 sudo 用 "
+                      "STEP0_EXT4_BACKEND=mount 后重跑")
+                sys.exit(1)
+            elif len(pre_inputs) > 1 or any(p.is_dir() for p in pre_inputs):
                 # 磁盘镜像:每个分区独立工作区(process/<分区名>/,自包含),
                 # 递归跑完整流水线。为什么独立: 多个分区的解包产物(如 etc/passwd)
                 # 若合并进同一 extracted/ 会 rel_path 冲突、去重互相误删;
                 # 分区各自 fileinfo.json/analysis/ 也便于审计报告分块。
+                # 条件含 is_dir: Step0 ext4 直读产物是子工作区目录(extracted/ +
+                # .step1_done 已就位),单目录(单 ext4 分区镜像)也必须走递归。
                 print(f"[main] 磁盘镜像识别出 {len(pre_inputs)} 个分区,逐个审计:")
                 all_infos: list[FileInfo] = []
                 for pf in pre_inputs:
                     stem = Path(pf).stem
                     sub_target = workspace / stem
                     sub_target.mkdir(parents=True, exist_ok=True)
-                    dst = sub_target / pf.name
-                    if not dst.exists():
-                        # 同盘 rename 零拷贝;已存在说明上次跑过,直接复用续传
-                        import shutil as _shutil
-                        _shutil.move(str(pf), str(dst))
-                    print(f"[main] === 分区工作区: {sub_target} ===")
+                    if pf.is_dir():
+                        # ext4 直读子工作区:Step1 已由直读完成(树+标记),
+                        # 无分区文件可 move,直接复用该工作区跑 Step2-5
+                        print(f"[main] === 分区工作区(ext4 直读): {sub_target} ===")
+                    else:
+                        dst = sub_target / pf.name
+                        if not dst.exists():
+                            # 同盘 rename 零拷贝;已存在说明上次跑过,直接复用续传
+                            import shutil as _shutil
+                            _shutil.move(str(pf), str(dst))
+                        print(f"[main] === 分区工作区: {sub_target} ===")
                     infos = run_pipeline(
                         sub_target,
                         max_elf=max_elf,

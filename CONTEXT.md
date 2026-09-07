@@ -275,7 +275,7 @@ _Avoid_: 沙箱(那是 sandbox_verify), 权限
 CLI 类工具一律 `--network none` 跑容器;唯一例外是 API 类(cve_lookup/web_search)需要出网。binwalk_rescan 也走 none。
 
 **Docker 容器 (container)**:
-Step0-4 的 binwalk/file/ghidra 与 Step5 的 CLI 类工具在容器内执行,宿主机只跑 Python。统一经 `docker_utils.run_docker` 调用(returncode/stdout/stderr,不抛异常,超时返回 124)。
+Step0-4 的 binwalk/file/ghidra 与 Step5 的 CLI 类工具在容器内执行,宿主机只跑 Python。统一经 `docker_utils.run_docker` 调用(returncode/stdout/stderr,不抛异常,超时返回 124)。唯一例外:Step0 ext4 直读的 debugfs/mount 后端在宿主原生执行(debugfs 用户态读镜像,不进内核;见 ext4 直读)。
 _Avoid_: 沙箱(指具体镜像 firm_audit/sandbox), Docker 命令
 
 **沙箱 (sandbox)**:
@@ -288,6 +288,10 @@ _Avoid_: 解包(特指 binwalk -Me), 魔数解包
 **预解压 (preprocess)**:
 Step0 在 binwalk 之前用宿主标准库解外层压缩/归档/磁盘镜像,避开 binwalk 解压偶发 bug,提升确定性。产物按分流规则决定是否仍需 binwalk。
 _Avoid_: 预处理(太泛), 解压
+
+**ext4 直读 (ext4 direct-read)**:
+Step0 对磁盘镜像中 ext4 分区(超级块魔数命中)的原生文件树读取——不经 dd+binwalk,直接产出该分区的解包树与 Step1 完成标记,下游零改动。双后端:debugfs(默认,用户态零特权)/ mount(快路,需 root)。取代 2026-09-06 的手工旁路。
+_Avoid_: 旁路(指当年手工方案), 挂载(特指 mount 后端)
 
 **不透明固件分诊 (opaque triage)**:
 Step4 对 unknown/可疑 text 的纯规则分诊(`triage.py`),按头特征/熵分类为 firmware_hex / firmware_srec / voice_resource / allwinner_boot0 / opaque_privformat / opaque_firmware / opaque_unknown,绝不静默消失。
