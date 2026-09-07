@@ -19,6 +19,7 @@ import bz2
 import gzip
 import lzma
 import shutil
+import stat
 import tarfile
 import zipfile
 from pathlib import Path
@@ -58,7 +59,9 @@ def _safe_extract_zip(src: Path, dest: Path) -> None:
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
-            if info.create_system == 3:  # Unix symlink
+            # external_attr 高 16 位存 Unix mode;create_system==3 只说明
+            # "zip 由 Unix 系统创建",不等于符号链接(误判会拒掉整个 zip)
+            if stat.S_ISLNK(info.external_attr >> 16):
                 print(f"[Step0] 安全拦截: 跳过 zip 符号链接 {name!r}")
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
