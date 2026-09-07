@@ -4,3 +4,4 @@
 # cryptography: Step4 解析证书/私钥/公钥等密码学材料
 pyyaml
 cryptography
+# 测试另需 pytest(pip install pytest 或系统包 python3-pytest)
