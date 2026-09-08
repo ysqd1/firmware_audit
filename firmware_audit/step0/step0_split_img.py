@@ -68,6 +68,13 @@ _KIND_ALLOWS_UNKNOWN = {"kernel", "bootloader", "recovery"}
 # 要强制提取/审计时用 --extract-all 或显式传 extract_all=True。
 SKIP_AUDIT_KINDS = {"dtb", "reserved"}
 
+# 大小闸门管辖的分区类型(rootfs/recovery 价值高但体积大,不超上限才提取;
+# 其余类型要么恒提取(bootloader/kernel/esp/small/medium),要么按策略跳过
+# (userdata/large))。should_extract 的闸门判定与 step0_preprocess.
+# partition_skip_message 的告警口径(受闸门管辖才称"超过上限")共用本常量,
+# 单一出处防两处漂移
+GATED_KINDS = ("rootfs", "recovery")
+
 
 def is_disk_image(path) -> bool:
     """判断文件是否磁盘镜像(含 GPT 或 MBR 分区表)。
@@ -310,7 +317,7 @@ def should_extract(kind, size, max_size_gb):
         return True
 
     # rootfs/recovery 价值高但体积大,不超过限制才提取
-    if kind in ("rootfs", "recovery") and size <= max_size_bytes:  # noqa: SIM103 —— 多守卫提前 return 结构,直返会丢可读性
+    if kind in GATED_KINDS and size <= max_size_bytes:  # noqa: SIM103 —— 多守卫提前 return 结构,直返会丢可读性
         return True
 
     # userdata 和超大分区跳过

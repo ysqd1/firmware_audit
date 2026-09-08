@@ -117,6 +117,23 @@ def _find_firmware(target_dir: Path) -> Path | None:
     return None
 
 
+def empty_filter_action(is_partition: bool) -> tuple[str, str]:
+    """空分区跳过判定(小决策点,票 02):Step2 过滤后为空时如何处置。
+
+    - 分区批次内(is_partition=True):跳过该分区、继续其余分区——单分区
+      空树(如 target/3 的 RECROOTFS)曾以 sys.exit(1) 杀死整批,其余分区
+      全部不再处理;空分区本身无审计价值,记录(分区名+原因)后放行。
+    - 顶层单固件(is_partition=False):过滤为空即终止——顶层固件过滤为空
+      意味着解包/过滤环节有问题,静默产出空报告比响亮终止更危险(语义不变)。
+
+    Returns:
+        (action, reason):action ∈ {"skip", "terminate"},reason 供日志记录。
+    """
+    if is_partition:
+        return "skip", "Step2 过滤后为 0 文件(空分区或纯被滤系统文件)"
+    return "terminate", "Step2 过滤后无文件"
+
+
 def run_pipeline(
     target_dir: Path,
     max_elf: int | None = None,
@@ -124,6 +141,7 @@ def run_pipeline(
     profile: str = "nano-ubuntu",
     workspace: Path | None = None,
     run_step5: bool = True,
+    is_partition: bool = False,
 ) -> list[FileInfo]:
     """运行 Step1-4 流水线。
 
@@ -137,6 +155,9 @@ def run_pipeline(
                     磁盘镜像分区分发时传分区子文件夹本身,
                     使分区子文件夹即工作区(不自带嵌套 process/)
         run_step5: Step1-4 完成后是否跑 Step5 Agent 审计(默认跑)
+        is_partition: 本次运行是多分区批次的分区子工作区(分区递归内部传 True)。
+                    Step2 过滤为空时跳过该分区返回 [](不 sys.exit 杀整批),
+                    顶层固件仍终止——见 empty_filter_action
 
     Returns:
         填充完整的 FileInfo 列表
@@ -253,6 +274,7 @@ def run_pipeline(
                 # .step1_done 已就位),单目录(单 ext4 分区镜像)也必须走递归。
                 print(f"[main] 磁盘镜像识别出 {len(pre_inputs)} 个分区,逐个审计:")
                 all_infos: list[FileInfo] = []
+                skipped_parts: list[str] = []
                 for pf in pre_inputs:
                     stem = Path(pf).stem
                     sub_target = workspace / stem
@@ -275,8 +297,19 @@ def run_pipeline(
                         profile=profile,
                         workspace=sub_target,  # 分区子文件夹即工作区,不自带嵌套 process/
                         run_step5=run_step5,
+                        is_partition=True,
                     )
+                    if not infos:
+                        # 票 02:空分区返回 [](Step2 过滤为 0,成因已当场记录),
+                        # 名单批次末汇总
+                        skipped_parts.append(stem)
                     all_infos.extend(infos)
+                if skipped_parts:
+                    # 汇总口径取"未产出可审计文件"而非具体成因:递归返回 [] 的
+                    # 路径今后可能不止 Step2 过滤为空(如嵌套磁盘镜像整批跳过),
+                    # 各分区自己的成因在跳过当场已按分区名记录
+                    print(f"[main] 批次汇总: 跳过 {len(skipped_parts)}/{len(pre_inputs)} "
+                          f"个分区(未产出可审计文件): {', '.join(skipped_parts)}")
                 print(f"[main] 所有分区审计完成,共 {len(all_infos)} 个文件")
                 return all_infos
             else:
@@ -298,7 +331,12 @@ def run_pipeline(
     # Step2 过滤(profile 指定名单,默认 nano-ubuntu)
     files = step2_filter.filter_files(extracted_root, profile=profile)
     if not files:
-        print("[main] Step2 过滤后无文件,终止")
+        # 票 02:分区批次内空分区跳过续批(记录分区名+原因),顶层固件仍终止
+        action, reason = empty_filter_action(is_partition)
+        if action == "skip":
+            print(f"[main] 分区 {target_dir.name}: {reason},记录跳过,其余分区继续")
+            return []
+        print(f"[main] {reason},终止")
         sys.exit(1)
 
     # 认证无标记解包树:兼容路径(无 .step1_done 但结构完整)已通过 Step2,

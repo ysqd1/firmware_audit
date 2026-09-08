@@ -29,12 +29,14 @@ import zipfile
 from pathlib import Path
 
 from .step0_split_img import (
+    format_size,
     is_disk_image,
     parse_partitions,
     should_extract,
     extract_partition,
     _verify_extracted,
     _find_existing_part,
+    GATED_KINDS,
     SKIP_AUDIT_KINDS,
 )
 from .step0_ext4_read import STEP1_DONE_MARKER, direct_read_ext4, is_ext4_partition
@@ -157,6 +159,26 @@ def _cleanup_skipped_part(out_dir: Path, index: int, name: str) -> None:
             print(f"[Step0] 清理失败({cand.name}): {e}")
 
 
+def partition_skip_message(p: dict, max_size_gb: float) -> str:
+    """非 ext4 分区被闸门/策略跳过时的日志行(票 02:主 rootfs 曾无声消失)。
+
+    大小闸门只管辖 GATED_KINDS(rootfs/recovery;bootloader/kernel/esp/
+    small/medium 恒提取,userdata/无特征大分区按策略跳过)——受闸门管辖而
+    超限的分区打醒目告警并附 env 指引;其余策略性跳过打普通提示行。凡是
+    走到闸门判定的分区,跳过必留日志。dtb/reserved 类型筛在调用方更早分支
+    (带旧产物清理打印),不经本消息。ext4 分区在调用方先于闸门判魔数直读,
+    天然不触发本消息。
+    """
+    if p["kind"] in GATED_KINDS:
+        return (f"[Step0] 告警: 分区 {p['name']}({format_size(p['size'])},"
+                f"{p['kind']})超过提取上限 {max_size_gb:g} GB,跳过——"
+                "该分区内容将不进流水线;如需调整: env STEP0_PARTITION_MAX_SIZE_GB"
+                "(ext4 分区不受此限,魔数命中即自动直读)")
+    return (f"[Step0] 跳过分区 {p['name']}({format_size(p['size'])},{p['kind']}):"
+            "按类型策略不提取(如需审计可用 python -m firmware_audit.step0."
+            "step0_split_img --extract-all 单独提取)")
+
+
 def _extract_partitions(img: Path, target_dir: Path) -> list[Path] | None:
     """磁盘镜像分区提取,返回分区条目列表(可能为空或 None)。
 
@@ -205,6 +227,9 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path] | None:
                 # 的 dd 老路径;超大 rootfs 正是直读要救的对象)
                 ext4 = is_ext4_partition(f, p)
                 if not ext4 and not should_extract(p["kind"], p["size"], max_size_gb):
+                    # 票 02:被跳过的分区必须留下含名/大小/上限的告警,不允许
+                    # 主 rootfs 无声消失(target/3 事故)
+                    print(partition_skip_message(p, max_size_gb))
                     continue
                 # 告警:身份冲突 / 截断(有问题也要让用户看到,但不中断流程)
                 if p.get("kind_conflict"):
