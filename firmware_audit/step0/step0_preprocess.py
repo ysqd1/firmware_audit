@@ -38,16 +38,13 @@ from .step0_split_img import (
     SKIP_AUDIT_KINDS,
 )
 from .step0_ext4_read import STEP1_DONE_MARKER, direct_read_ext4, is_ext4_partition
+from ..gates import resolve_partition_max_size_gb
 import contextlib
 
 # 归档类:解出文件系统,跳过 binwalk
 _ARCHIVE_EXTS = (".zip", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")
 # 单文件压缩:解出单文件,仍交引导解包器
 _SINGLE_COMPRESS_EXTS = (".gz", ".bz2", ".xz")
-
-# rootfs/recovery 分区提取上限:超过视为"超大分区"跳过(几百 GB 的 APP
-# rootfs 提取会耗尽磁盘且 binwalk 仍会爆炸)。需要时可调大或单独处理。
-_PARTITION_MAX_SIZE_GB = 50.0
 
 
 def _safe_extract_zip(src: Path, dest: Path) -> None:
@@ -191,6 +188,9 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path] | None:
         return []
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    # 每镜像解析一次闸门(env STEP0_PARTITION_MAX_SIZE_GB,默认 50;只管辖
+    # 非 ext4 的 dd 老路径——ext4 直读不看大小)
+    max_size_gb = resolve_partition_max_size_gb()
     entries: list[Path] = []
     direct_read_failed = False
     try:
@@ -204,7 +204,7 @@ def _extract_partitions(img: Path, target_dir: Path) -> list[Path] | None:
                 # ext4 魔数命中 → 直读,不看大小(spec 决策:大小闸门只管非 ext4
                 # 的 dd 老路径;超大 rootfs 正是直读要救的对象)
                 ext4 = is_ext4_partition(f, p)
-                if not ext4 and not should_extract(p["kind"], p["size"], _PARTITION_MAX_SIZE_GB):
+                if not ext4 and not should_extract(p["kind"], p["size"], max_size_gb):
                     continue
                 # 告警:身份冲突 / 截断(有问题也要让用户看到,但不中断流程)
                 if p.get("kind_conflict"):

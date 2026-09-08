@@ -32,6 +32,8 @@ import zlib
 from pathlib import Path
 import contextlib
 
+from ..gates import PARTITION_MAX_SIZE_GB, resolve_partition_max_size_gb
+
 # 分区签名扫描上限:ext4 superblock(0x438)、squashfs/FAT/ELF 头都在分区前 64KB,
 # 不必读 64MB(老实现 15 分区 × 64MB = ~1GB IO,对几百 GB 镜像浪费在无意义读盘)。
 _MAX_SIGNATURE_SCAN = 64 * 1024
@@ -601,7 +603,7 @@ def parse_partitions(img_path) -> list[dict]:
 def extract_partitions_from_image(
     img_path,
     out_dir,
-    max_size_gb: float = 50.0,
+    max_size_gb: float | None = None,
     extract_all: bool = False,
 ) -> list[dict]:
     """解析分区表并提取应提取的分区,返回 [{file, partition, extracted_size, verified}]。
@@ -609,15 +611,18 @@ def extract_partitions_from_image(
     Args:
         img_path: 磁盘镜像文件
         out_dir: 提取输出目录(自动创建)
-        max_size_gb: rootfs/recovery 分区最大提取大小(默认 50GB,
-                    超过视为"大分区"跳过——几百 GB 的 APP rootfs 直接提取
-                    会耗尽磁盘且 binwalk 仍会爆炸,留给用户单独处理)
+        max_size_gb: rootfs/recovery 分区最大提取大小(None=用闸门解析结果,
+                    env STEP0_PARTITION_MAX_SIZE_GB 覆盖、默认 50GB;超过视为
+                    "大分区"跳过——几百 GB 的 APP rootfs 直接提取会耗尽磁盘
+                    且 binwalk 仍会爆炸,留给用户单独处理)
         extract_all: 提取所有分区(包括 userdata/超大)
 
     Returns:
         已提取分区列表;空列表表示无分区表或全部跳过。
         每个分区提取后做回读校验,失败的分区删除且不加入结果(宁缺毋滥)。
     """
+    if max_size_gb is None:
+        max_size_gb = resolve_partition_max_size_gb()
     img_path = Path(img_path)
     out_dir = Path(out_dir)
     partitions = parse_partitions(img_path)
@@ -687,8 +692,10 @@ def main():
     parser.add_argument("img_path", help="镜像文件路径")
     parser.add_argument("--out-dir", default=".",
                         help="输出目录 (默认: 当前目录)")
-    parser.add_argument("--max-size", type=float, default=50.0,
-                        help="单个分区最大提取大小 GB (默认: 50)")
+    parser.add_argument("--max-size", type=float, default=None,
+                        help=f"单个分区最大提取大小 GB "
+                             f"(默认: {PARTITION_MAX_SIZE_GB:g},"
+                             f"env STEP0_PARTITION_MAX_SIZE_GB 可覆盖)")
     parser.add_argument("--list-only", action="store_true",
                         help="只列出分区信息，不提取")
     parser.add_argument("--extract-all", action="store_true",
@@ -711,6 +718,10 @@ def main():
         print("[Step0] 建议直接使用 binwalk 分析")
         sys.exit(0)
 
+    # --max-size 未显式给 → 用闸门解析结果(env STEP0_PARTITION_MAX_SIZE_GB,
+    # 默认 50);列表/manifest/提取三处共用同一值
+    max_size = args.max_size if args.max_size is not None else resolve_partition_max_size_gb()
+
     # 2. 打印每个分区
     print(f"\n[Step0] 共发现 {len(partitions)} 个分区:")
     print(f'{"":>4} {"名称":<25} {"偏移":>14} {"大小":>12} {"类型":<12} {"校验":<8} {"签名":<30} {"操作"}')
@@ -718,7 +729,7 @@ def main():
 
     for p in partitions:
         size_str = format_size(p["size"])
-        do_extract = args.extract_all or should_extract(p["kind"], p["size"], args.max_size)
+        do_extract = args.extract_all or should_extract(p["kind"], p["size"], max_size)
         action = "提取" if do_extract else "跳过"
 
         print(f'  {p["index"]:<3} {p["name"]:<25} {p["offset"]:>14} {size_str:>12} '
@@ -734,13 +745,13 @@ def main():
     print("\n[Step0] === 开始提取 ===")
 
     extracted = extract_partitions_from_image(
-        img_path, args.out_dir, max_size_gb=args.max_size, extract_all=args.extract_all
+        img_path, args.out_dir, max_size_gb=max_size, extract_all=args.extract_all
     )
 
     # 4. 输出总结
     total_extracted = sum(e["extracted_size"] for e in extracted)
     skipped = [p for p in partitions if not (
-        args.extract_all or should_extract(p["kind"], p["size"], args.max_size))]
+        args.extract_all or should_extract(p["kind"], p["size"], max_size))]
     total_skipped = sum(p["size"] for p in skipped)
 
     print("\n[Step0] === 提取完成 ===")
@@ -781,7 +792,7 @@ def main():
         mf.write(f'{"":>4} {"名称":<25} {"偏移":>14} {"大小":>14} {"类型":<12} '
                  f'{"校验":<8} {"签名":<30} {"操作"}\n')
         for p in partitions:
-            do_extract = args.extract_all or should_extract(p["kind"], p["size"], args.max_size)
+            do_extract = args.extract_all or should_extract(p["kind"], p["size"], max_size)
             action = "extracted" if do_extract else "skipped"
             mf.write(f'  {p["index"]:<3} {p["name"]:<25} {p["offset"]:>14} {p["size"]:>14} '
                      f'{p["kind"]:<12} {_partition_status(p):<8} '

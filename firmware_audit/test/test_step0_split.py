@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import bz2
+import os
 import struct
 import zlib
 from pathlib import Path
@@ -512,6 +513,59 @@ def test_sfdisk_json_none(tmp_path) -> list[str]:
     return fails
 
 
+def test_extract_gate_env_consumed(tmp_path) -> list[str]:
+    """STEP0_PARTITION_MAX_SIZE_GB 消费接线(工单 03):未显式传
+    max_size_gb 时按 env 判限——闸门收紧 rootfs 跳过、放宽则提取。"""
+    fails: list[str] = []
+    env_name = "STEP0_PARTITION_MAX_SIZE_GB"
+    img = tmp_path / "gate.img"
+    # APP → kind rootfs;30 扇区 = 15360B
+    make_gpt_image(img, [("APP", b"A" * (SECTOR * 30))])
+    old = os.environ.get(env_name)
+    try:
+        os.environ[env_name] = "0.00001"   # ≈10.7KB < 15KB → 超限跳过
+        got = extract_partitions_from_image(img, tmp_path / "out_tight")
+        if got:
+            fails.append(f"闸门收紧后 15KB rootfs 应跳过,got {[e['file'] for e in got]}")
+        os.environ[env_name] = "1"         # 1GB → 放行
+        got = extract_partitions_from_image(img, tmp_path / "out_loose")
+        if len(got) != 1:
+            fails.append(f"闸门放宽后应提取 1 个分区,got {len(got)}")
+    finally:
+        if old is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old
+    return fails
+
+
+def test_preprocess_partition_gate_env(tmp_path) -> list[str]:
+    """同闸门在 preprocess 主路径生效:收紧 → 无分区产出、整盘回退 binwalk;
+    放宽 → 返回分区文件条目。"""
+    fails: list[str] = []
+    env_name = "STEP0_PARTITION_MAX_SIZE_GB"
+    img = tmp_path / "gate2.img"
+    make_gpt_image(img, [("APP", b"A" * (SECTOR * 30))])
+    old = os.environ.get(env_name)
+    try:
+        os.environ[env_name] = "0.00001"
+        proc = tmp_path / "proc_tight"
+        inputs, skip = step0_preprocess.preprocess(img, proc / "extracted")
+        if inputs != [img] or skip:
+            fails.append(f"闸门收紧应无分区产出、回退整盘,got ({inputs}, {skip})")
+        os.environ[env_name] = "1"
+        proc2 = tmp_path / "proc_loose"
+        inputs2, skip2 = step0_preprocess.preprocess(img, proc2 / "extracted")
+        if len(inputs2) != 1 or "APP" not in inputs2[0].name or skip2:
+            fails.append(f"闸门放宽应返回 APP 分区条目,got ({inputs2}, {skip2})")
+    finally:
+        if old is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old
+    return fails
+
+
 def test_sfdisk_json_truncated(tmp_path) -> list[str]:
     """分区超出文件末尾 → truncated=True(截断标记)。"""
     fails: list[str] = []
@@ -560,6 +614,8 @@ def test_main() -> int:
             ("sfdisk JSON MBR解析", test_sfdisk_json_mbr(tmp)),
             ("sfdisk JSON 无表/失败", test_sfdisk_json_none(tmp)),
             ("sfdisk JSON 截断标记", test_sfdisk_json_truncated(tmp)),
+            ("分区闸门env接线·提取", test_extract_gate_env_consumed(tmp)),
+            ("分区闸门env接线·preprocess", test_preprocess_partition_gate_env(tmp)),
         ]
         for name, fl in groups:
             if fl:

@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ..docker.docker_utils import run_docker, docker_available
+from ..gates import resolve_max_files_per_extraction, resolve_max_total_files
 from .file_magic import sniff_magic, preclassify, rule_decision
 import contextlib
 
@@ -30,10 +31,9 @@ CONTAINER_WS = "/work/ws"
 # manifest 记录每容器 depth 供事后审计;第 6 层仍有 continue → warning 而非
 # 静默强制 finalize(深度上限只是保险,不该吞掉"真的还有料"的信号)。
 MAX_DEPTH = 6
-# 单次解包产出上限:超过即删除该次产物并记录(防 fdt 类爆炸,最坏=空目录)
-MAX_FILES_PER_EXTRACTION = 50000
-# 全树文件数上限:超过停止新增解包(防总规模失控)
-MAX_TOTAL_FILES = 200000
+# 单次产出/全树文件数两道闸门的默认值与 env 覆盖(STEP1_MAX_FILES_PER_
+# EXTRACTION / STEP1_MAX_TOTAL_FILES)见 gates.py——消费点调 resolve_*,
+# 默认值不在本模块重复定义
 _MANIFEST_NAME = "guided_extract.json"
 
 
@@ -57,7 +57,7 @@ def _save_manifest(output_dir: Path, manifest: dict) -> None:
 
 
 def _binwalk_extract_one(path: Path, seq: int, parent: Path) -> tuple[list[Path], str]:
-    """真实解包: binwalk -e 单层 + 7z 兜底 + 50k 守卫。
+    """真实解包: binwalk -e 单层 + 7z 兜底 + 单次产出上限守卫。
 
     流程:
       1. 硬改名 <parent>/<seq>_<原名>(防 binwalk 同名输出覆盖;首段
@@ -66,7 +66,8 @@ def _binwalk_extract_one(path: Path, seq: int, parent: Path) -> tuple[list[Path]
          (-x dtb: 恒排除设备树签名,源头拦截 fdt 分解)
       3. 空产出 → 7z 兜底(binwalk 镜像内置 7z;cpio/tar/7z/zip/squashfs
          等 binwalk 有签名但无 extractor 的场景)
-      4. 产出 > MAX_FILES_PER_EXTRACTION → 删除该次产物,记 over_guard
+      4. 产出 > 单次上限(env STEP1_MAX_FILES_PER_EXTRACTION,默认 5 万)
+         → 删除该次产物,记 over_guard
 
     Returns:
         (产出文件列表, 状态): "ok" / "empty" / "over_guard" / "failed"
@@ -105,7 +106,7 @@ def _binwalk_extract_one(path: Path, seq: int, parent: Path) -> tuple[list[Path]
     if not files:
         return [], "empty"
 
-    if len(files) > MAX_FILES_PER_EXTRACTION:
+    if len(files) > resolve_max_files_per_extraction():
         shutil.rmtree(extracted_dir, ignore_errors=True)
         return [], "over_guard"
 
@@ -350,7 +351,7 @@ def extract_guided(
                         "done": True,
                     }
                     total_files += len(files)
-                    if total_files > MAX_TOTAL_FILES:
+                    if total_files > resolve_max_total_files():
                         over_total = True
                         print(f"[Step1] 全树文件数守卫: 已 {total_files} 文件,停止新增解包")
                     for f in files:
@@ -363,7 +364,7 @@ def extract_guided(
                     over_guard_count += 1
                     manifest[rel] = {"seq": seqs[id(path)], "depth": depth,
                                      "action": "finalize",
-                                     "reason": f"单次产出>{MAX_FILES_PER_EXTRACTION} 删除",
+                                     "reason": f"单次产出>{resolve_max_files_per_extraction()} 删除",
                                      "done": True}
                     print(f"[Step1] over_guard: {rel} 产出超限,已删除")
                 elif status == "empty":

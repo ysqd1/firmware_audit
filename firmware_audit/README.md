@@ -85,6 +85,18 @@ python -m firmware_audit.main target/1
 
 可选参数:见 `firmware_audit/main.py` 的 argparse(如 `--max-elf` 限制反编译数、`--no-step5` 跳过 Agent 审计)。
 
+### 规模闸门(shell 环境变量)
+
+三道防爆炸闸门默认值不变,换大固件时按次覆盖即可;缺失/非法值回落默认并告警。注意这些闸门由 Step0/Step1 消费,`main.py` 不读 `.env`,须在 shell 里 `export`:
+
+| 环境变量 | 管辖 | 默认 |
+| --- | --- | --- |
+| `STEP0_PARTITION_MAX_SIZE_GB` | 非 ext4 分区(rootfs/recovery)dd 提取上限,超过跳过 | 50 |
+| `STEP1_MAX_FILES_PER_EXTRACTION` | 单次 binwalk/7z 解包产出上限,超过删该次产物 | 50000 |
+| `STEP1_MAX_TOTAL_FILES` | 全树文件数上限,超过停止新增解包 | 200000 |
+
+> ext4 分区直读(魔数触发)不受分区大小闸门约束——超大 rootfs 正是直读要救的对象。默认值唯一出处见 `firmware_audit/gates.py`。
+
 **单独补跑 Step5**(已有 Step1-4 产物时,可独立跑三 Agent 审计,无需重跑前四步):
 
 ```bash

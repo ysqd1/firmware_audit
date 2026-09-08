@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -13,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from firmware_audit.step5_agent.providers.tools import make_tools
 from firmware_audit.step5_agent.providers.tools.base import ToolContext
+from firmware_audit.step5_agent.providers.tools import cve_bin_tool_scan as cbt
 from firmware_audit.step5_agent.providers.tools.find_decompiled_function import extract_function
 from firmware_audit.step5_agent.providers.tools.imports_query import format_hits
 
@@ -478,11 +480,86 @@ def test_resolve_analysis_file_tolerant() -> list[str]:
     return fails
 
 
+def test_cve_cache_dir_env(tmp_path: Path) -> list[str]:
+    """CVE 缓存挂载目录(工单 03):缺省 = process/.cve_cache(与现状逐字节
+    一致,容器侧仍挂 /home/sandbox/.cache);FIRMWARE_AUDIT_CVE_CACHE_DIR
+    覆盖挂载源(共享库预热一次跨 target 复用)。纯单测,不依赖 Docker/工件。"""
+    fails: list[str] = []
+    ctx = ToolContext(process_dir=tmp_path)
+    (tmp_path / "extracted").mkdir()
+    (tmp_path / "extracted" / "app").write_bytes(b"\x7fELF")
+
+    captured: dict = {}
+
+    def fake_run_in_sandbox(args, entrypoint, ctx, timeout=0,
+                            extra_mounts=None, **kw):
+        captured["mounts"] = extra_mounts
+        return 0, "[]", ""
+
+    env_name = cbt.CVE_CACHE_ENV
+    old = os.environ.get(env_name)
+    old_fn = cbt.run_in_sandbox
+    cbt.run_in_sandbox = fake_run_in_sandbox
+    try:
+        # 缺省:挂载源 = process/.cve_cache(自动创建),容器目标不变
+        os.environ.pop(env_name, None)
+        r = cbt.CveBinToolScanTool(ctx).execute(file_ref="app")
+        if not r.ok:
+            fails.append(f"假沙箱下扫描应 ok: {r.error}")
+        mounts = captured.get("mounts") or []
+        if len(mounts) != 1 or mounts[0] != (tmp_path / ".cve_cache",
+                                              cbt.CVE_CACHE_MOUNT):
+            fails.append(f"缺省挂载源应为 process/.cve_cache,got {mounts}")
+        if not (tmp_path / ".cve_cache").is_dir():
+            fails.append("缺省缓存目录应自动创建")
+
+        # env 覆盖:挂载源 = 指定目录(共享库),per-target 目录不再创建
+        proc2 = tmp_path / "p2"
+        proc2.mkdir()
+        ctx2 = ToolContext(process_dir=proc2)
+        shared = tmp_path / "shared_cve_cache"
+        os.environ[env_name] = str(shared)
+        cbt.CveBinToolScanTool(ctx2).execute(file_ref="app")
+        mounts = captured.get("mounts") or []
+        if len(mounts) != 1 or mounts[0] != (shared, cbt.CVE_CACHE_MOUNT):
+            fails.append(f"env 覆盖后挂载源应为 {shared},got {mounts}")
+        if not shared.is_dir():
+            fails.append("env 指定目录应自动创建")
+        if (proc2 / ".cve_cache").exists():
+            fails.append("env 覆盖时不应再创建 per-target 缓存目录")
+
+        # 解析函数直测:空白 env 视同缺省
+        os.environ[env_name] = "   "
+        if cbt.resolve_cve_cache_dir(proc2) != proc2 / ".cve_cache":
+            fails.append("空白 env 应回落 per-target 缺省")
+    finally:
+        cbt.run_in_sandbox = old_fn
+        if old is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old
+    return fails
+
+
 def test_main() -> int:
+    # 纯单测组:不依赖 target/1 工件,SKIP 门槛之外先跑
+    standalone_failures = 0
+    for name, fn in [
+        ("cve_cache_dir_env", lambda: test_cve_cache_dir_env(
+            Path(tempfile.mkdtemp(prefix="test_cve_cache_")))),
+    ]:
+        fl = fn()
+        if fl:
+            standalone_failures += len(fl)
+            for msg in fl:
+                print(f"[FAIL] {name}: {msg}")
+        else:
+            print(f"[PASS] {name}")
+
     process_dir = _find_process_dir()
     if process_dir is None:
         print("[SKIP] target/1 工件不存在,读盘工具测试跳过")
-        return 0
+        return 1 if standalone_failures else 0
 
     ctx = ToolContext(process_dir=process_dir)
     tools = make_tools(ctx)
@@ -508,8 +585,8 @@ def test_main() -> int:
         else:
             print(f"[PASS] {name}")
 
-    print(f"\n结果: {'全部通过' if failures == 0 else f'{failures} 个断言失败'}")
-    return 1 if failures else 0
+    print(f"\n结果: {'全部通过' if failures + standalone_failures == 0 else f'{failures + standalone_failures} 个断言失败'}")
+    return 1 if failures + standalone_failures else 0
 
 
 if __name__ == "__main__":

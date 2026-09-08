@@ -7,9 +7,11 @@
 """
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
+from ..step1 import step1_guided_extract
 from ..step1.file_magic import (
     sniff_magic,
     shannon_entropy,
@@ -18,6 +20,7 @@ from ..step1.file_magic import (
 )
 from ..step1.step1_guided_extract import (
     extract_guided,
+    _binwalk_extract_one,
     _load_manifest,
     _save_manifest,
     _MANIFEST_NAME,
@@ -244,6 +247,112 @@ def test_extract_guided_over_guard(tmp_path: Path) -> list[str]:
     return fails
 
 
+def test_binwalk_guard_env_consumed(tmp_path: Path) -> list[str]:
+    """STEP1_MAX_FILES_PER_EXTRACTION 消费接线(工单 03):_binwalk_extract_one
+    的单次产出守卫按 env 判限——收紧 → over_guard 删产物;缺省 → 默认放行。"""
+    fails: list[str] = []
+    env_name = "STEP1_MAX_FILES_PER_EXTRACTION"
+
+    def fake_run_docker(image, args, mounts=None, env=None, timeout=0, **kw):
+        # 模拟 binwalk 解出 3 个文件:产物目录 <parent>/<文件名>.extracted
+        parent = mounts[0][0]
+        name = args[args.index("-e") + 1].rsplit("/", 1)[-1]
+        d = parent / f"{name}.extracted"
+        d.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            (d / f"f{i}").write_bytes(b"x")
+        return 0, "", ""
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    old_env = os.environ.get(env_name)
+    old_fn = step1_guided_extract.run_docker
+    step1_guided_extract.run_docker = fake_run_docker
+    try:
+        fw = ws / "blob.bin"
+        fw.write_bytes(b"\x1f\x8b" + b"\x00" * 60)
+        os.environ[env_name] = "2"
+        files, status = _binwalk_extract_one(fw, 0, ws)
+        if status != "over_guard" or files:
+            fails.append(f"上限 2 时 3 文件应 over_guard,got ({len(files)}, {status})")
+        if (ws / "000000_blob.bin.extracted").exists():
+            fails.append("over_guard 应删除该次产物")
+
+        fw2 = ws / "blob2.bin"
+        fw2.write_bytes(b"\x1f\x8b" + b"\x00" * 60)
+        os.environ.pop(env_name, None)
+        files, status = _binwalk_extract_one(fw2, 1, ws)
+        if status != "ok" or len(files) != 3:
+            fails.append(f"缺省(默认 5 万)3 文件应放行,got ({len(files)}, {status})")
+    finally:
+        step1_guided_extract.run_docker = old_fn
+        if old_env is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old_env
+    return fails
+
+
+def test_total_guard_env_consumed(tmp_path: Path) -> list[str]:
+    """STEP1_MAX_TOTAL_FILES 消费接线(工单 03):收紧 → 全树守卫触发,后续
+    候选 finalize 不再解包;缺省 → 同场景不触发。"""
+    fails: list[str] = []
+
+    class ManyExtractor:
+        """一次产出 3 个 gzip 文件(gzip 链下一层仍会 continue)。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, path: Path, seq: int, parent: Path):
+            self.calls += 1
+            d = parent / f"{seq:06d}_{path.name}.extracted"
+            d.mkdir(parents=True, exist_ok=True)
+            files = []
+            for i in range(3):
+                f = d / f"f{i}.gz"
+                f.write_bytes(b"\x1f\x8b" + b"\x00" * 60)
+                files.append(f)
+            return files, "ok"
+
+    env_name = "STEP1_MAX_TOTAL_FILES"
+    old = os.environ.get(env_name)
+    try:
+        root = tmp_path / "tight"
+        root.mkdir()
+        fw = _mk_firmware(root)
+        fake = ManyExtractor()
+        os.environ[env_name] = "2"
+        extract_guided(fw, root / "out", max_depth=3, extractor=fake,
+                       check_docker=False)
+        man = _load_manifest(root / "out")
+        guarded = [r for r in man.values()
+                   if r.get("reason") == "全树文件数守卫"]
+        if not guarded:
+            fails.append(f"上限 2 时首批 3 文件应触发全树守卫: {man}")
+        if fake.calls != 1:
+            fails.append(f"触发守卫后不应继续解包,extractor 调用 {fake.calls} 次,期望 1")
+
+        root2 = tmp_path / "loose"
+        root2.mkdir()
+        fw2 = _mk_firmware(root2)
+        fake2 = ManyExtractor()
+        os.environ.pop(env_name, None)
+        extract_guided(fw2, root2 / "out", max_depth=3, extractor=fake2,
+                       check_docker=False)
+        man2 = _load_manifest(root2 / "out")
+        if any(r.get("reason") == "全树文件数守卫" for r in man2.values()):
+            fails.append("缺省(默认 20 万)同场景不应触发全树守卫")
+        if fake2.calls < 2:
+            fails.append(f"缺省下应继续解包嵌套容器,extractor 调用 {fake2.calls} 次,期望 >=2")
+    finally:
+        if old is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = old
+    return fails
+
+
 def test_manifest_roundtrip_and_corrupt(tmp_path: Path) -> list[str]:
     """manifest 往返一致;损坏 JSON → 空 dict 不崩。"""
     fails: list[str] = []
@@ -408,6 +517,8 @@ def test_main() -> int:
             ("主循环 gzip 链终止", test_extract_guided_loop_terminates(tmp_path)),
             ("fdt 永不进 extractor", test_extract_guided_fdt_never_extracted(tmp_path)),
             ("over_guard 守卫", test_extract_guided_over_guard(tmp_path)),
+            ("单次上限env接线", test_binwalk_guard_env_consumed(tmp_path)),
+            ("全树上限env接线", test_total_guard_env_consumed(tmp_path)),
             ("manifest 往返与损坏", test_manifest_roundtrip_and_corrupt(tmp_path)),
             ("断点续传 resume", test_extract_guided_resume(tmp_path)),
             ("scan_tree 解嵌套容器", test_scan_tree_extracts_nested_container(tmp_path)),

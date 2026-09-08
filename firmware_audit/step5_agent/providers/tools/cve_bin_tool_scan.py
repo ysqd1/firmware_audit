@@ -1,22 +1,43 @@
 """cve_bin_tool_scan:沙箱容器内 cve-bin-tool,按产品版本特征匹配已知 CVE。
 
-CVE 数据库不烘镜像:宿主 process/.cve_cache volume 挂载进容器复用,
+CVE 数据库不烘镜像:宿主缓存目录 volume 挂载进容器复用,
 首跑下载 NVD 数据(无 key 限速,可能数分钟),超时降级报错不崩。
 退出码约定(cve-bin-tool v3):0=无发现, 1=有 CVE 命中, ≥2=错误。
 
+缓存目录(2026-09-08 工单 03):默认 target 各自的 process/.cve_cache(与
+历史行为逐字节一致);env FIRMWARE_AUDIT_CVE_CACHE_DIR 指到共享目录
+(如 firmware_audit/.cve_cache)即可预热一次跨 target 复用——替代
+Windows junction 方案(WSL 迁移后 junction 已不可用),预热命令见 README。
+
 挂载路径修正(2026-08-22 实测):cve-bin-tool 3.4 的缓存根是 $HOME/.cache/cve-bin-tool/
 (CVEDB.CACHEDIR = ~/.cache/cve-bin-tool),不是老约定的 ~/.cache/cvedb。
--> 挂整块宿主的 .cve_cache 到容器 $HOME/.cache(即 /home/sandbox/.cache),
+-> 挂整块宿主缓存目录到容器 $HOME/.cache(即 /home/sandbox/.cache),
 让工具自己管理子目录;若仍挂到 ~/.cache/cvedb,后者不存在导致库永远找不到(码 40)。
 """
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 from .base import AgentTool, ToolResult
 from .cli_base import container_path, run_in_sandbox
 
 CVE_CACHE_MOUNT = "/home/sandbox/.cache"
+
+CVE_CACHE_ENV = "FIRMWARE_AUDIT_CVE_CACHE_DIR"
+
+
+def resolve_cve_cache_dir(process_dir: Path) -> Path:
+    """CVE 缓存宿主目录:env FIRMWARE_AUDIT_CVE_CACHE_DIR 覆盖,缺省 per-target。
+
+    缺省/空白 = process_dir/.cve_cache(与既有行为逐字节一致);env 非空时
+    用指定目录(~ 展开),预热一次跨 target 复用。
+    """
+    raw = os.environ.get(CVE_CACHE_ENV, "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return process_dir / ".cve_cache"
 
 
 class CveBinToolScanTool(AgentTool):
@@ -31,7 +52,7 @@ class CveBinToolScanTool(AgentTool):
         cpath = container_path(self.ctx, file_ref)
         if cpath is None:
             return ToolResult(ok=False, text="", error=f"非法路径: {file_ref}")
-        cache = self.ctx.process_dir / ".cve_cache"
+        cache = resolve_cve_cache_dir(self.ctx.process_dir)
         cache.mkdir(parents=True, exist_ok=True)
         # 参数依据(cve-bin-tool 3.4 实测):
         #   --disable-data-source PURL2CPE  首跑必崩(no such table: purl2cpe)
