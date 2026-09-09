@@ -118,11 +118,39 @@ def _find_firmware(target_dir: Path) -> Path | None:
     return None
 
 
+# 解包簿记文件名(不算解包内容)
+_BOOKKEEPING = {".step1_done", "guided_extract.json"}
+
+
+def content_file_count(extracted_dir: Path) -> int:
+    """解包树内容文件数(排除解包簿记)。零内容 = 解包未产出任何可审计文件
+    (典型成因:厂商加密头固件,如 D-Link SHRS,标准解包器不识别)。"""
+    if not extracted_dir.is_dir():
+        return 0
+    return sum(1 for p in extracted_dir.rglob("*")
+               if p.is_file() and p.name not in _BOOKKEEPING)
+
+
+def empty_content_action(is_partition: bool) -> tuple[str, str]:
+    """零内容解包树处置(小决策点):分区批次内跳过续批,顶层响亮终止。
+
+    原 Step2"过滤后无文件"的兜底语义在 Step2 退役后上移到本守卫
+    (target/4 e2e 实测:D-Link 加密固件解出零内容树,静默进 Step5 是空转)。
+
+    Returns:
+        (action, reason):action ∈ {"skip", "terminate"},reason 供日志记录。
+    """
+    if is_partition:
+        return "skip", "解包零内容(无任何内容文件,如加密/无签名固件段)"
+    return "terminate", "解包零内容(无任何内容文件)"
+
+
 def run_pipeline(
     target_dir: Path,
     profile: str = "nano-ubuntu",
     workspace: Path | None = None,
     run_step5: bool = True,
+    is_partition: bool = False,
 ) -> None:
     """运行 Step0→1→5 流水线(ADR-0011:Step2-4 已退役)。
 
@@ -136,6 +164,9 @@ def run_pipeline(
                     磁盘镜像分区分发时传分区子文件夹本身,
                     使分区子文件夹即工作区(不自带嵌套 process/)
         run_step5: Step1 完成后是否跑 Step5 Agent 审计(默认跑)
+        is_partition: 本次运行是多分区批次的分区子工作区(分区递归内部传 True)。
+                    解包零内容时跳过该分区返回(不 sys.exit 杀整批),
+                    顶层固件仍响亮终止——见 empty_content_action
     """
     target_dir = Path(target_dir).resolve()
     if not target_dir.is_dir():
@@ -269,6 +300,7 @@ def run_pipeline(
                         profile=profile,
                         workspace=sub_target,  # 分区子文件夹即工作区,不自带嵌套 process/
                         run_step5=run_step5,
+                        is_partition=True,
                     )
                 print(f"[main] 所有分区审计完成({len(pre_inputs)} 个分区)")
                 return
@@ -294,6 +326,18 @@ def run_pipeline(
     if not step1_marker.exists():
         step1_marker.write_text("ok", encoding="utf-8")
         print(f"[main] 认证解包树(无标记但结构完整),补写 {step1_marker.name}")
+
+    # 零内容守卫:Step2 退役后由本守卫兜底——解包零内容(如厂商加密头固件)
+    # 时,顶层响亮终止、分区内跳过续批,不再静默放行进 Step5 空转
+    if content_file_count(extracted_dir) == 0:
+        action, reason = empty_content_action(is_partition)
+        if action == "skip":
+            print(f"[main] 分区 {target_dir.name}: {reason},记录跳过,其余分区继续")
+            return
+        print(f"[main] {reason},终止")
+        print("[main] 提示: 固件可能带厂商加密/私有头(如 D-Link SHRS),标准解包器不识别;"
+              "可先用厂商解密工具处理,或人工确认格式后再放入 target 目录重跑")
+        sys.exit(1)
 
     # Step5 Agent 审计(recon→analysis→verification 串行;无 API key 或
     # API 调用失败立即终止不降级;工件齐备时断点跳过)。workspace 即 process 等价目录,

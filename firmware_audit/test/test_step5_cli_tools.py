@@ -88,8 +88,8 @@ def test_r2_list_functions(tools) -> list[str]:
         fails.append("idlc 应有函数条目")
     elif not any(isinstance(d, dict) and d.get("name") for d in r.data):
         fails.append(f"函数条目应含 name 字段: {r.data[:2]}")
-    # 非 ELF → 引导性拒绝(不付容器;extracted 下必有非 ELF 文本)
-    r2 = tools["r2_list_functions"].execute(file_ref="unitree/module/bashrunner/README.md")
+    # 非 ELF → 引导性拒绝(不付容器;真实存在的脚本文件)
+    r2 = tools["r2_list_functions"].execute(file_ref="unitree/module/bashrunner/run_test.sh")
     if r2.ok:
         fails.append("非 ELF 应被引导性拒绝")
     elif "不是 ELF" not in (r2.error or ""):
@@ -338,10 +338,11 @@ def test_ghidra_decompile_smoke(tools, process_dir) -> list[str]:
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         (root / "extracted").mkdir(parents=True)
-        shutil.copy2(src, root / "extracted" / "sample.so")
+        # 拷贝名不带扩展名(边车名 = <rel>.c,避免 ".so.c" 这类后缀误判)
+        shutil.copy2(src, root / "extracted" / "sample")
         ctx = ToolContext(process_dir=root)
         fresh = make_tools(ctx)["ghidra_decompile"]
-        r = fresh.execute(file_ref="sample.so")
+        r = fresh.execute(file_ref="sample")
         if not r.ok:
             fails.append(f"真 Ghidra 反编译失败: {r.error}")
             return fails
@@ -352,7 +353,7 @@ def test_ghidra_decompile_smoke(tools, process_dir) -> list[str]:
         if "个函数" not in r.text:
             fails.append(f"Observation 应含函数数: {r.text[:160]}")
         # 二次调用:缓存命中,零容器语义(Observation 文案判别)
-        r2 = fresh.execute(file_ref="sample.so")
+        r2 = fresh.execute(file_ref="sample")
         if not r2.ok or "缓存命中" not in r2.text:
             fails.append(f"二次调用应缓存命中: {r2.error or r2.text[:160]}")
     return fails

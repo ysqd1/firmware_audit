@@ -197,6 +197,90 @@ def test_partition_subworkspace_pipeline(tmp_path) -> list[str]:
     return fails
 
 
+# --- 零内容解包树守卫(target/4 e2e 实测暴露:Step2 退役后由本守卫兜底) ---
+
+def test_empty_content_action() -> list[str]:
+    """小决策点:分区内跳过续批,顶层终止(沿用原 Step2 空过滤语义)。"""
+    from ..main import empty_content_action
+
+    fails: list[str] = []
+    action, reason = empty_content_action(True)
+    if action != "skip" or not reason:
+        fails.append(f"分区模式应 skip 且带原因,实际 {(action, reason)!r}")
+    action_top, _ = empty_content_action(False)
+    if action_top != "terminate":
+        fails.append(f"顶层模式应 terminate,实际 {action_top!r}")
+    return fails
+
+
+def test_content_file_count_excludes_bookkeeping() -> list[str]:
+    """内容计数排除解包簿记(.step1_done/guided_extract.json)。"""
+    from ..main import content_file_count
+
+    fails: list[str] = []
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        ext = Path(td) / "extracted"
+        ext.mkdir()
+        if content_file_count(ext) != 0:
+            fails.append("空树应为 0")
+        (ext / ".step1_done").write_text("ok", encoding="utf-8")
+        (ext / "guided_extract.json").write_text("{}", encoding="utf-8")
+        if content_file_count(ext) != 0:
+            fails.append("仅簿记文件应仍为 0")
+        (ext / "etc").mkdir()
+        (ext / "etc" / "passwd").write_text("root:x:0:0\n", encoding="utf-8")
+        if content_file_count(ext) != 1:
+            fails.append("内容文件应计数")
+    return fails
+
+
+def test_zero_content_tree_guard(tmp_path) -> list[str]:
+    """run_pipeline 级:顶层零内容树响亮终止(exit 1 + 加密头提示);
+    分区零内容树跳过返回(不杀整批)。"""
+    from ..main import run_pipeline
+
+    fails: list[str] = []
+    tmp_path = tmp_path / "guard"
+    tmp_path.mkdir(exist_ok=True)
+
+    # 顶层:仅簿记文件的解包树(跳过 Step1 路径也会过守卫)
+    top = tmp_path / "tgt"
+    top.mkdir()
+    (top / "extracted").mkdir()
+    (top / "extracted" / ".step1_done").write_text("ok", encoding="utf-8")
+    buf = io.StringIO()
+    exited = False
+    try:
+        with contextlib.redirect_stdout(buf):
+            run_pipeline(top, workspace=top, run_step5=False)
+    except SystemExit as e:
+        exited = True
+        if e.code != 1:
+            fails.append(f"顶层零内容应 sys.exit(1),实际 {e.code!r}")
+    if not exited:
+        fails.append("顶层零内容树应响亮终止")
+    log = buf.getvalue()
+    for token in ("解包零内容", "终止", "SHRS"):
+        if token not in log:
+            fails.append(f"终止输出应含 {token!r}(加密头指引),日志: {log[-300:]!r}")
+
+    # 分区:同样零内容,但跳过返回不终止
+    part = tmp_path / "part"
+    part.mkdir()
+    (part / "extracted").mkdir()
+    (part / "extracted" / ".step1_done").write_text("ok", encoding="utf-8")
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        run_pipeline(part, workspace=part, run_step5=False, is_partition=True)
+    log2 = buf2.getvalue()
+    if "记录跳过" not in log2:
+        fails.append(f"分区零内容应记录跳过: {log2[-300:]!r}")
+    if "终止" in log2:
+        fails.append("分区零内容不应终止")
+    return fails
+
+
 def main() -> int:
     import tempfile
 
@@ -208,6 +292,9 @@ def main() -> int:
             ("超限跳过告警集成", test_oversize_partition_skip_warns(tmp)),
             ("双分区批次e2e", test_two_partition_batch_e2e(tmp)),
             ("分区子工作区流水线", test_partition_subworkspace_pipeline(tmp)),
+            ("零内容守卫决策点", test_empty_content_action()),
+            ("零内容守卫计数", test_content_file_count_excludes_bookkeeping()),
+            ("零内容守卫流水线级", test_zero_content_tree_guard(tmp)),
         ]
         for name, fl in groups:
             if fl:

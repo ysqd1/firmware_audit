@@ -125,7 +125,7 @@ def test_rule_decision() -> list[str]:
         action, _ = rule_decision([s])
         if action != "finalize":
             fails.append(f"rule_decision([{s}]) -> {action},期望 finalize")
-    # 无签名 → finalize(留树交 Step4)
+    # 无签名 → finalize(留树,Step5 strings_query 兜底)
     action, reason = rule_decision([])
     if action != "finalize":
         fails.append(f"rule_decision([]) -> {action},期望 finalize")

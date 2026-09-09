@@ -6,7 +6,7 @@ bus@0/aconnect@.../phandle 节点文件(实测 part05 61.6 万条目)。这里
 
 关键设计(2026-08-13 评审定稿):
   - preclassify 二分(fdt→skip, elf/pe/text→product, 其余→rule_decision)
-  - rule_decision 容器裁决(容器→continue, 无签名→finalize 留树交 Step4 分诊)
+  - rule_decision 容器裁决(容器→continue, 无签名→finalize 留树;字符串审计由 Step5 兜底)
   - binwalk 并行默认 8(每文件独立容器,线程安全)
   - 产物布局 <file>.extracted/<HEX>/... 与 -Me 同构,Step2 正则兼容(M0 实证)
   - 断点续传 manifest: guided_extract.json

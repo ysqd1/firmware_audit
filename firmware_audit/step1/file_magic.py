@@ -140,7 +140,7 @@ def rule_decision(sigs: list[str], fname: str = "", depth: int = 0) -> tuple[str
     Returns:
         (action, reason):
             ("skip", ...)     → fdt,硬跳过
-            ("finalize", ...) → ELF/文本 或 无容器签名(留树交 Step4 分诊)
+            ("finalize", ...) → ELF/文本 或 无容器签名(留树,字符串审计由 Step5 strings_query 兜底)
             ("continue", ...) → 识别出的容器(压缩流/固件容器/fs 镜像)
     """
     if any(s in ("fdt_be", "fdt_le") for s in sigs):
@@ -159,4 +159,4 @@ def rule_decision(sigs: list[str], fname: str = "", depth: int = 0) -> tuple[str
     hit = [s for s in sigs if s in container_sigs]
     if hit:
         return "continue", f"容器签名 {','.join(hit)},继续解包"
-    return "finalize", "无容器签名,留树交 Step4 分诊"
+    return "finalize", "无容器签名,留树(字符串审计可用 Step5 strings_query 兜底)"
