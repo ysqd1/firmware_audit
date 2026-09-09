@@ -2,7 +2,7 @@
 
 只测外部行为:给定非法参数调用 execute() → 断言 ok=False + 优雅错误文本
 (而非 Python 异常文案)。校验在 execute 入口拦截,_run 不触发,故可纯离线
-覆盖全部 15 个工具(含依赖 Docker 的 CLI 工具,构造不触发 Docker)。
+覆盖全部注册工具(含依赖 Docker 的 CLI 工具,构造不触发 Docker)。
 
 覆盖:
   - 每个工具:未知参数 / 类型错误 / 缺失必选 → ok=False + 可自纠错误文本
@@ -24,12 +24,13 @@ from firmware_audit.step5_agent.providers.tools.base import (
     validate_params,
 )
 
-# 契约侧 15 工具(与 spec 决策 2 清单一致;params 声明本身由各工具提供,
+# 契约侧工具清单(与注册表一致;params 声明本身由各工具提供,
 # 测试不重复编码参数清单——派生自 t.params,避免双源漂移)
 _CONTRACT_TOOLS = [
     "read_file", "list_files", "search_code", "strings_query", "imports_query",
-    "find_decompiled_function", "checksec", "cve_bin_tool_scan", "semgrep_scan",
-    "gitleaks_scan", "sandbox_verify", "binwalk_rescan", "xref_query",
+    "find_decompiled_function", "r2_list_functions", "r2_disassemble_function",
+    "r2_xref_query", "ghidra_decompile", "checksec", "cve_bin_tool_scan",
+    "semgrep_scan", "gitleaks_scan", "sandbox_verify", "binwalk_rescan",
     "cve_lookup", "web_search",
 ]
 
@@ -152,7 +153,7 @@ def _spec_from_tool(t) -> dict[str, dict]:
 
 
 def test_tools_declare_params() -> list[str]:
-    """全部 15 个工具声明了 params(契约 A 侧);params_doc 渲染出类型/必填信息。"""
+    """全部生产工具声明了 params(契约 A 侧);params_doc 渲染出类型/必填信息。"""
     fails: list[str] = []
     tools = _tools()
     for name in sorted(_CONTRACT_TOOLS):

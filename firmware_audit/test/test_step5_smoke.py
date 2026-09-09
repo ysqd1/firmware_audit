@@ -76,7 +76,7 @@ def test_react_real(llm, tools) -> list[str]:
     fails: list[str] = []
     docs = "\n".join(f"- {t.name}: {t.description}\n  参数: {t.params_doc}" for t in tools.values())
     prompt = SYSTEM_PROMPT.replace("{tool_docs}", docs)
-    task = (f"审计对象清单在 process/fileinfo.json;样本 ELF: {SAMPLE_ELF}。\n"
+    task = (f"样本 ELF(extracted 树内): {SAMPLE_ELF}。\n"
             "任务:用 imports_query 查它的危险导入,若 popen/strcpy/sprintf 任一存在,"
             "用 find_decompiled_function 取一个调用者函数确认,然后 Final Answer 汇总(中文)。")
     result = run_react_agent(llm, tools, prompt, task, max_iters=8)

@@ -23,7 +23,7 @@ from firmware_audit.step5_agent.providers.tools.cli_base import container_path
 from firmware_audit.step5_agent.providers.tools.cve_bin_tool_scan import (
     _extract_json, _flatten,
 )
-from firmware_audit.step5_agent.providers.tools.xref_query import _parse_r2_json
+from firmware_audit.step5_agent.providers.tools.r2_base import parse_r2_json as _parse_r2_json
 from firmware_audit.step5_agent.providers.tools.web_search import _parse_ddg
 from firmware_audit.step5_agent.providers.tools.cve_lookup import _format
 
@@ -122,8 +122,9 @@ def test_parse_r2_json() -> list[str]:
 
 
 def test_xref_data_symbol_hint(ctx) -> list[str]:
-    """xref_query 对 r2 data 符号 Invalid argument 应给可操作指引(2026-08-22 实发)。"""
-    import firmware_audit.step5_agent.providers.tools.xref_query as xq
+    """r2_xref_query 对 r2 data 符号 Invalid argument 应给可操作指引(2026-08-22 实发)。"""
+    import firmware_audit.step5_agent.providers.tools.r2_base as r2_base
+    import firmware_audit.step5_agent.providers.tools.r2_xref_query as xq
     fails: list[str] = []
     captured: dict = {}
 
@@ -132,10 +133,11 @@ def test_xref_data_symbol_hint(ctx) -> list[str]:
         # 复现实测: r2 对 data 符号报 Invalid argument,stdout 无 JSON
         return 0, "INFO: Analyze all...\nERROR: Invalid argument\n", "WARN: Relocs..."
 
-    orig = xq.run_in_sandbox
-    xq.run_in_sandbox = fake_run_in_sandbox
+    # r2 族共享名在 r2_base 命名空间(经 run_r2 调用),补丁挂那里
+    orig = r2_base.run_in_sandbox
+    r2_base.run_in_sandbox = fake_run_in_sandbox
     try:
-        r = xq.XrefQueryTool(ctx).execute(file_ref="bin/app", symbol="sym.video_device_path")
+        r = xq.R2XrefQueryTool(ctx).execute(file_ref="bin/app", symbol="sym.video_device_path")
         if r.ok:
             fails.append("data 符号查询应失败")
         elif "数据符号" not in (r.error or ""):
@@ -146,7 +148,7 @@ def test_xref_data_symbol_hint(ctx) -> list[str]:
         if "bin.relocs.apply=true" not in " ".join(captured.get("args", [])):
             fails.append(f"r2 命令应含 relocs.apply 参数: {captured.get('args')}")
     finally:
-        xq.run_in_sandbox = orig
+        r2_base.run_in_sandbox = orig
     return fails
 
 
@@ -231,15 +233,18 @@ def test_truncate_text() -> list[str]:
 # ---------- B. 工具级解析(mock 沙箱,双模式可用) ----------
 
 def _mk_tool(module: str, cls_name: str, ctx, ret):
-    """构造工具实例并 mock 其模块内 run_in_sandbox → ret=(rc,out,err)。
+    """构造工具实例并 mock 其 run_in_sandbox → ret=(rc,out,err)。
 
-    mock 挂模块属性,execute() 时生效;返回上下文管理器,
-    with 块退出时恢复原函数(run_in_sandbox 在 execute 时才被调用,
-    mock 生命周期必须覆盖到 execute 之后)。
+    补丁点按模块解析:工具模块自身 import 了 run_in_sandbox(checksec/semgrep
+    等直接调用)就挂模块属性;r2 族工具经 r2_base.run_r2 调用,共享名在
+    r2_base 命名空间,补丁必须挂那里(挂错处 mock 不生效会真调 Docker)。
+    mock 在 execute() 时生效;with 块退出恢复。
     """
     mod = importlib.import_module(f"{_TOOLS_PKG}.{module}")
-    orig = mod.run_in_sandbox
-    mod.run_in_sandbox = lambda *a, **kw: ret
+    target = mod if hasattr(mod, "run_in_sandbox") else importlib.import_module(
+        f"{_TOOLS_PKG}.r2_base")
+    orig = target.run_in_sandbox
+    target.run_in_sandbox = lambda *a, **kw: ret
 
     class _Restore:
         def __init__(self, tool):
@@ -249,7 +254,7 @@ def _mk_tool(module: str, cls_name: str, ctx, ret):
             return self.tool
 
         def __exit__(self, *exc):
-            mod.run_in_sandbox = orig
+            target.run_in_sandbox = orig
             return False
 
     return _Restore(getattr(mod, cls_name)(ctx))
@@ -383,7 +388,7 @@ def test_xref_symbol_prefix(ctx) -> list[str]:
     fails: list[str] = []
     out = ('anal warn\n'
            '[{"from": "0x104ea0", "fcn_name": "idlc_load_generator", "type": "CALL"}]')
-    with _mk_tool("xref_query", "XrefQueryTool", ctx, (1, out, "")) as t:
+    with _mk_tool("r2_xref_query", "R2XrefQueryTool", ctx, (1, out, "")) as t:
         # 裸符号应自动补 sym.imp. 前缀;rc=1 不可靠不影响判定
         r = t.execute(file_ref="bin/app", symbol="system")
         if not r.ok:
@@ -391,7 +396,7 @@ def test_xref_symbol_prefix(ctx) -> list[str]:
         elif not r.data or r.data[0]["fcn_name"] != "idlc_load_generator":
             fails.append(f"xref data 异常: {r.data}")
     # 无引用 → ok=True 空表
-    with _mk_tool("xref_query", "XrefQueryTool", ctx, (1, "[]", "")) as t2:
+    with _mk_tool("r2_xref_query", "R2XrefQueryTool", ctx, (1, "[]", "")) as t2:
         r2 = t2.execute(file_ref="bin/app", symbol="nothing")
         if not r2.ok or r2.data != []:
             fails.append("空数组应为 ok=True 空表")
@@ -454,7 +459,7 @@ def test_container_path_security(ctx) -> list[str]:
 # ---------- D. 沙箱挂载纪律(docker -v 宿主路径必须绝对) ----------
 
 def test_run_in_sandbox_absolute_mounts() -> list[str]:
-    """挂载宿主路径必须绝对(2026-08-19 checksec/xref_query 实发 bug)。
+    """挂载宿主路径必须绝对(2026-08-19 checksec/r2_xref_query 实发 bug)。
 
     相对路径(如 target/1/process/extracted)会被 Docker 当命名卷:
     卷名禁含 "/",daemon 报 create <path>: invalid characters →
@@ -499,43 +504,46 @@ def test_run_in_sandbox_absolute_mounts() -> list[str]:
     return fails
 
 
-# ---------- E. 路线一: 过滤概览注入 + semgrep SDK 排除 ----------
+# ---------- E. 现场概览注入(票05:脱 fileinfo,rglob extracted 现场统计) ----------
 
 def test_build_filtered_overview() -> list[str]:
-    """build_filtered_overview 从 fileinfo.json 产紧凑概览;缺失时回退。"""
+    """build_filtered_overview 对解包树现场统计(ADR-0011):无 fileinfo 也完整;
+    SDK 排除名单生效;扩展名粗分布;紧凑不铺文件名。"""
     import tempfile
     from firmware_audit.step5_agent.data.prompts import build_filtered_overview
     fails: list[str] = []
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        # 缺失 → 回退提示,不抛
-        if "缺失" not in build_filtered_overview(root):
-            fails.append("fileinfo.json 缺失应回退提示")
-        # 正常清单
-        data = [
-            {"rel_path": "unitree/bin/idlc", "type": "elf_exec"},
-            {"rel_path": "unitree/module/bashrunner/run.sh", "type": "script"},
-            {"rel_path": "etc/passwd", "type": "config"},
-            {"rel_path": "etc/dhcpcd.conf", "type": "config"},
-        ]
-        (root / "fileinfo.json").write_text(json.dumps(data), encoding="utf-8")
+        # 缺 extracted → 回退提示,不抛
+        if "不存在" not in build_filtered_overview(root):
+            fails.append("extracted/ 缺失应回退提示")
+        # 现场树:unitree(3 文件)+ etc(2)+ usr/lib(SDK 排除,不进统计)
+        for rel in ("unitree/bin/idlc", "unitree/module/run.sh", "unitree/conf/a.conf",
+                    "etc/passwd", "etc/dhcpcd.conf",
+                    "usr/lib/libc.so", "usr/local/lib/x.so"):
+            p = root / "extracted" / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x")
+        # 有 fileinfo.json 也不读不崩(退役中,内容故意为垃圾)
+        (root / "fileinfo.json").write_text("garbage-not-json", encoding="utf-8")
         ov = build_filtered_overview(root)
-        if "过滤后目录概览" not in ov:
-            fails.append("缺标题行")
+        if "现场概览" not in ov:
+            fails.append(f"缺标题行: {ov}")
         if "unitree/" not in ov or "etc/" not in ov:
             fails.append(f"缺顶层目录: {ov}")
-        if "elf_exec=1" not in ov or "config=2" not in ov:
-            fails.append(f"缺 type 分布: {ov}")
-        if "优先级:" not in ov:
-            fails.append("缺优先级行")
-        # 概览必须紧凑(净给全量之外的几句话),不应把每条 rel_path 单独铺开
+        if "- usr/" in ov:
+            fails.append(f"SDK 目录应被排除名单剔除: {ov}")
+        if ".conf=2" not in ov:
+            fails.append(f"缺扩展名粗分布: {ov}")
+        # 概览必须紧凑,不应把具体文件名单独铺开
         if "idlc" in ov or "passwd" in ov:
             fails.append("概览不应包含具体文件名(紧凑原则)")
     return fails
 
 
 def test_recon_brief_appends_overview() -> list[str]:
-    """build_recon_brief 末尾追加过滤概览(analysis 索引仍保留)。"""
+    """build_recon_brief 末尾追加现场概览;工件索引按 .c 归组(无 functions.json
+    依赖,ADR-0011 票05)。"""
     import tempfile
     from firmware_audit.step5_agent.data.prompts import build_recon_brief
     fails: list[str] = []
@@ -543,15 +551,24 @@ def test_recon_brief_appends_overview() -> list[str]:
         root = Path(td)
         a = root / "analysis" / "unitree" / "bin"
         a.mkdir(parents=True)
-        (a / "idlc.functions.json").write_text("[]", encoding="utf-8")
-        (root / "fileinfo.json").write_text(
-            json.dumps([{"rel_path": "unitree/bin/idlc", "type": "elf_exec"}]),
-            encoding="utf-8")
+        (a / "idlc.c").write_text("// decompile_success: 1\n", encoding="utf-8")
+        (a / "idlc.strings.json").write_text("{}", encoding="utf-8")
+        e = root / "extracted" / "unitree" / "bin"
+        e.mkdir(parents=True)
+        (e / "idlc").write_bytes(b"\x7fELF")
+        # 无 functions.json —— 索引仍归组 idlc(按 .c 存在性)
+        # 无 fileinfo.json —— 概览照常现场统计
         brief = build_recon_brief(root)
-        if "analysis/ 下共 1 个二进制" not in brief:
-            fails.append(f"analysis 索引缺失: {brief[:80]}")
-        if "过滤后目录概览" not in brief:
-            fails.append("应追加过滤概览")
+        if "analysis/ 下共 1 个已反编译工件组" not in brief:
+            fails.append(f"analysis .c 索引缺失: {brief[:120]}")
+        if "- unitree/bin/idlc [decompiled.c strings]" not in brief:
+            fails.append(f"索引应按 .c 归组并列边车 tag: {brief[:200]}")
+        if "现场概览" not in brief:
+            fails.append(f"应追加现场概览: {brief[-200:]}")
+        # extracted 也没有时概览给回退提示,不崩
+        brief2 = build_recon_brief(root / "nonexistent")
+        if "不存在" not in brief2:
+            fails.append(f"缺 extracted 应给提示: {brief2[:120]}")
     return fails
 
 

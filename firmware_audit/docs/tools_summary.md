@@ -1,5 +1,7 @@
 # 固件审计工具全览（tools\_summary）
 
+> **⚠ 过时声明（2026-09-09）**：本文按 Step0–Step4 批量流水线时代编写。ADR-0010/0011 落地后：Step2/3/4 相关章节（过滤/分类/批量反编译/分诊/fileinfo）已随代码删除；xref_query 更名 r2_xref_query，新增 r2_list_functions / r2_disassemble_function / ghidra_decompile；strings_query/imports_query 为"边车优先 + r2 兜底"混合型（"不触发重分析"等旧表述作废）。现役工具以代码注册表（providers/tools/）与 CONTEXT.md 术语表为准，本文仅存档。
+
 > 覆盖 `firmware_audit/` 全流水线（Step0–Step5）的可执行工具与核心函数。
 > 本文档逐节对应真实源码，字段/参数/错误码均以代码为准（2026-08-23 核对）。
 > 阅读入口：`main.py` 是流水线总调度；`docker/docker_utils.py` 是全部容器调用的基座。

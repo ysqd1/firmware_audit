@@ -4,7 +4,7 @@
 recursive/max_files + 项目根越界检查 + 排除目录 + 截断提示),按
 firmware_audit 工具层约定改造:
 - 白名单根 = process/(与 read_file 同根,复用 resolve + parents 判定)
-- recursive 时自动排除 SDK/系统库目录(与 Step2 过滤口径一致),
+- recursive 时自动排除 SDK/系统库目录(profile SEARCH_EXCLUDE_DIRS 名单),
   避免 LLM 在 extracted 全量树上撞 SDK 噪音
 - 超出 max_files 截断并提示省略数与可下钻路径(失败不崩,给 LLM 换路)
 """

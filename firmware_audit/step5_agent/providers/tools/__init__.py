@@ -2,7 +2,7 @@
 
 每工具一个子类文件;make_tools() 按上下文实例化,ReAct 循环按 name 分发。
 工具分三类:
-  CLI 类(checksec/cve_bin_tool_scan/xref_query/semgrep_scan/gitleaks_scan/binwalk_rescan)
+  CLI 类(checksec/cve_bin_tool_scan/r2_* 族/semgrep_scan/gitleaks_scan/binwalk_rescan)
   API 类(cve_lookup/web_search)
   读盘类(rest)
 make_tools(exclude=...) 支持按 name 排除可选工具(如 cve_bin_tool_scan 对嵌入式
@@ -16,16 +16,19 @@ from .checksec import ChecksecTool
 from .cve_bin_tool_scan import CveBinToolScanTool
 from .cve_lookup import CveLookupTool
 from .find_decompiled_function import FindDecompiledFunctionTool
+from .ghidra_decompile import GhidraDecompileTool
 from .gitleaks_scan import GitleaksScanTool
 from .imports_query import ImportsQueryTool
 from .list_files import ListFilesTool
+from .r2_disassemble_function import R2DisassembleFunctionTool
+from .r2_list_functions import R2ListFunctionsTool
+from .r2_xref_query import R2XrefQueryTool
 from .read_file import ReadFileTool
 from .sandbox_verify import SandboxVerifyTool
 from .search_code import SearchCodeTool
 from .semgrep_scan import SemgrepScanTool
 from .strings_query import StringsQueryTool
 from .web_search import WebSearchTool
-from .xref_query import XrefQueryTool
 
 # 默认开启的完整工具集(新增工具在此登记)
 _DEFAULT_TOOLS: tuple[type[AgentTool], ...] = (
@@ -35,8 +38,11 @@ _DEFAULT_TOOLS: tuple[type[AgentTool], ...] = (
     ReadFileTool,
     ListFilesTool,
     SearchCodeTool,
+    R2ListFunctionsTool,
+    R2DisassembleFunctionTool,
+    R2XrefQueryTool,
+    GhidraDecompileTool,
     ChecksecTool,
-    XrefQueryTool,
     CveBinToolScanTool,
     CveLookupTool,
     SemgrepScanTool,
@@ -70,6 +76,8 @@ def make_tools(ctx: ToolContext, exclude: set[str] | None = None) -> dict[str, A
 __all__ = ["AgentTool", "ToolContext", "ToolResult", "make_tools",
            "FindDecompiledFunctionTool", "ImportsQueryTool", "StringsQueryTool",
            "ReadFileTool", "ListFilesTool", "SearchCodeTool", "ChecksecTool",
-           "XrefQueryTool", "CveBinToolScanTool", "CveLookupTool",
+           "R2ListFunctionsTool", "R2DisassembleFunctionTool", "R2XrefQueryTool",
+           "GhidraDecompileTool",
+           "CveBinToolScanTool", "CveLookupTool",
            "SemgrepScanTool", "GitleaksScanTool", "SandboxVerifyTool",
            "BinwalkRescanTool", "WebSearchTool"]

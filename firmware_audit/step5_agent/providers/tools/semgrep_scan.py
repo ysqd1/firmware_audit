@@ -142,7 +142,7 @@ class SemgrepScanTool(AgentTool):
             lines.append("(达上限截断,可用更小 path 收窄)")
         if c_hint:
             lines.append("(反编译 C 命中是疑点信号,"
-                         "用 find_decompiled_function/xref_query 复查)")
+                         "用 find_decompiled_function/r2_xref_query 复查)")
         return "\n".join(lines[:60])
 
     def _format(self, results: list[dict], path: str) -> ToolResult:

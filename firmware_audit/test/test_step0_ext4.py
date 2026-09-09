@@ -500,7 +500,10 @@ def test_mount_backend_no_passwordless_sudo(tmp_path) -> list[str]:
 # --- 端到端:直读落点与分区递归同构(工单验收 #4) ---
 
 def test_run_pipeline_single_ext4_partition_e2e(tmp_path) -> list[str]:
-    """main 流水线对单 ext4 分区合成镜像:直读 + 分区递归跑通 Step2-3(--no-step5)。"""
+    """main 流水线对单 ext4 分区合成镜像:直读 + 分区递归跑通(--no-step5)。
+
+    ADR-0011 后流水线为 Step0→1→5:断言到"解包树就位"为止(Step5 已跳过)。
+    """
     if _skip_if_no_tools():
         return []
     fails: list[str] = []
@@ -510,9 +513,8 @@ def test_run_pipeline_single_ext4_partition_e2e(tmp_path) -> list[str]:
     _make_gpt_ext4_image(target / "single_ext4.img", with_kernel=False)
 
     from ..main import run_pipeline
-    from ..models import load_fileinfos
 
-    infos = run_pipeline(target, run_step5=False)
+    run_pipeline(target, run_step5=False)
 
     sub = target / "process" / "part01_APP"
     if not sub.is_dir():
@@ -524,15 +526,8 @@ def test_run_pipeline_single_ext4_partition_e2e(tmp_path) -> list[str]:
         fails.append("子工作区直读树缺 etc/passwd")
     if not (sub / "links.jsonl").is_file():
         fails.append("子工作区 links.jsonl 缺失")
-    if not (sub / "fileinfo.json").is_file():
-        fails.append("Step3 未产出 fileinfo.json(端到端未走通)")
-        return fails
-    got = load_fileinfos(sub / "fileinfo.json")
-    rels = {fi.rel_path.replace("\\", "/") for fi in got}
-    if "etc/passwd" not in rels:
-        fails.append(f"fileinfo 应含 etc/passwd,实际 {sorted(rels)}")
-    if len(infos) == 0:
-        fails.append("run_pipeline 应返回非空 FileInfo 列表")
+    if (sub / "fileinfo.json").exists():
+        fails.append("fileinfo.json 已退役,不应再产出")
     return fails
 
 

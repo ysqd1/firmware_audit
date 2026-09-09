@@ -2245,7 +2245,9 @@ def test_normalize_file_paths() -> list[str]:
 
 def test_verify_single_brief_pointers() -> list[str]:
     """verification 单实例简报指针(ADR-0008):全是工具路径(禁 process/ 前缀)、
-    源文件与 sidecar 均存在性检查、旧逻辑路径 file 也能剥前缀推导 sidecar。"""
+    源文件与边车三件套均存在性检查(ADR-0010 票04:后缀表缩为 .c/.strings.json/
+    .imports.json——.text.json 已退役、functions.json 新反编译不再产)、
+    旧逻辑路径 file 也能剥前缀推导 sidecar。"""
     from firmware_audit.step5_agent.data.prompts import build_verify_single_brief
 
     fails: list[str] = []
@@ -2255,8 +2257,13 @@ def test_verify_single_brief_pointers() -> list[str]:
         (root / "extracted" / "unitree" / "module" / "a.py").write_text("x=1\n",
                                                                         encoding="utf-8")
         (root / "analysis" / "unitree" / "module").mkdir(parents=True)
+        (root / "analysis" / "unitree" / "module" / "a.py.c").write_text(
+            "// decompile_success: 1\nint main(){}", encoding="utf-8")
+        # 即使盘上有退役产物(.text.json/.functions.json),也不进指针表
         (root / "analysis" / "unitree" / "module" / "a.py.text.json").write_text(
             '{"findings": []}', encoding="utf-8")
+        (root / "analysis" / "unitree" / "module" / "a.py.functions.json").write_text(
+            "[]", encoding="utf-8")
         # 工具路径 file:源文件指针 + sidecar 指针,零 process/ 前缀
         brief = build_verify_single_brief(root, {
             "title": "t", "file": "extracted/unitree/module/a.py"})
@@ -2264,8 +2271,11 @@ def test_verify_single_brief_pointers() -> list[str]:
             fails.append(f"简报不得含 process/ 前缀指针: {brief[:200]}")
         if "- extracted/unitree/module/a.py" not in brief:
             fails.append(f"应注入存在的源文件指针: {brief[:200]}")
-        if "- analysis/unitree/module/a.py.text.json" not in brief:
+        if "- analysis/unitree/module/a.py.c" not in brief:
             fails.append(f"应注入存在的 sidecar 指针: {brief[:200]}")
+        for stale in ("a.py.text.json", "a.py.functions.json"):
+            if f"- analysis/unitree/module/{stale}" in brief:
+                fails.append(f"退役产物 {stale} 不得进指针表(三件套制): {brief[:300]}")
         # ELF(无 extracted 源文件,只有边车):不给假源文件指针,sidecar 照给
         bin_dir = root / "analysis" / "unitree" / "bin"
         bin_dir.mkdir(parents=True)
@@ -2281,6 +2291,40 @@ def test_verify_single_brief_pointers() -> list[str]:
             "title": "t3", "file": "extracted/no/such.py"})
         if "相关工件指针" in brief3:
             fails.append(f"无任何存在工件时不应给指针段: {brief3[:200]}")
+    return fails
+
+
+def test_escalation_discipline_prompts() -> list[str]:
+    """票04 升级纪律内容断言:analysis/verification 提示词含"先 r2,信息不够才
+    ghidra_decompile";旧红线表述("据此判 false_positive"/"工件不存在"一刀切)
+    零残留。"""
+    from firmware_audit.step5_agent.data.prompts import (
+        AGENT_DISCIPLINE,
+        ANALYSIS_SYSTEM,
+        VERIFY_SYSTEM,
+    )
+
+    fails: list[str] = []
+    for name, prompt in (("ANALYSIS_SYSTEM", ANALYSIS_SYSTEM),
+                         ("VERIFY_SYSTEM", VERIFY_SYSTEM)):
+        for needle in ("ghidra_decompile", "升级"):
+            if needle not in prompt:
+                fails.append(f"{name} 应含升级纪律关键词 '{needle}'")
+    # analysis:流程段明示升级顺序(先 r2 后反编译)
+    if "先 r2,信息不够才反编译" not in ANALYSIS_SYSTEM:
+        fails.append("ANALYSIS_SYSTEM 应含升级顺序口诀")
+    # verification:红线为升级链表述(缺 .c → r2 → 反编译 → 仍零产出才 false)
+    for needle in ("升级链", "r2_list_functions", "ghidra_decompile",
+                   "反编译零产出", "不是\"证据不存在\""):
+        if needle not in VERIFY_SYSTEM:
+            fails.append(f"VERIFY_SYSTEM 红线应含升级链表述 '{needle}'")
+    if "据'文件不存在'直接判 false_positive" in VERIFY_SYSTEM or \
+            ("该条必须 verified=false" in VERIFY_SYSTEM
+             and "升级链" not in VERIFY_SYSTEM.split("该条必须 verified=false")[0][-200:]):
+        fails.append("VERIFY_SYSTEM 不得保留'产物缺失即误报'旧红线")
+    # 通用纪律不再把"复核阶段据此判 false_positive"当缺件结论
+    if "复核阶段据此判 false_positive" in AGENT_DISCIPLINE:
+        fails.append("AGENT_DISCIPLINE 旧缺件红线表述应已移除")
     return fails
 
 
@@ -2329,6 +2373,7 @@ def test_main() -> int:
         ("reconcile_edge_robustness", test_reconcile_edge_robustness),
         ("normalize_file_paths", test_normalize_file_paths),
         ("verify_single_brief_pointers", test_verify_single_brief_pointers),
+        ("escalation_discipline_prompts", test_escalation_discipline_prompts),
     ]:
         fl = fn()
         if fl:

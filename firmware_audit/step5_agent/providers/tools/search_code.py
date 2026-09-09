@@ -3,9 +3,9 @@
 参考 deepaudit 的 FileSearchTool(file_tool.py:keyword/file_pattern/directory/
 max_results + 越界防护),按 firmware_audit 特性**混合设计**:
 
-- 边车索引路: 搜索 process/analysis/ 下 Step4 预产边车——*.strings.json
+- 边车索引路: 搜索 process/analysis/ 下反编译边车——*.strings.json
   (ELF 字符串值,带 address/refs)、*.imports.json(导入符号)、*.text.json
-  (Step4 文本扫描命中)。快、零容器、带地址锚点。
+  (老工作区遗留,新反编译不再产)。快、零容器、带地址锚点。
 - 文本 grep 路: 对 extracted/ 文本文件(白名单扩展名)按行匹配;二进制嗅探
   跳过、SDK/系统库目录排除、大文件跳过。
 

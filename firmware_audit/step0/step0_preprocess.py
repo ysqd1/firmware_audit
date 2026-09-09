@@ -140,7 +140,7 @@ def _cleanup_skipped_part(out_dir: Path, index: int, name: str) -> None:
 
     旧产物位置与提取命名一致(见 _extract_partitions): process/ 根分区
     文件(out_dir/part<NN>_<name>.img)与分区子工作区(out_dir/part<NN>_<name>/,
-    含 extracted/analysis/fileinfo.json,整体删除)。
+    含 extracted/ 与 analysis/(按需反编译产物),整体删除)。
     用户确认自动清理: 不删会让残留目录误导"已处理过"。删除仅限流水线
     产物路径,不碰固件与分区源文件。
     """

@@ -8,9 +8,11 @@
 * **未经用户明确确认,不得自行开始修改代码**——先探索、提问、对齐方案,拿到用户点头再动手;领域事实先读 `CONTEXT.md` 与 `docs/adr/`(见 [docs/agents/domain.md](./docs/agents/domain.md))
 * 例外仅限用户当场明确指示"直接改"的琐碎修复(错字/单行);即便如此也要先一句话说明改什么,再动手
 
-固定 5 步流水线。Step1-4 已实现并验证通过(代码控制);Step5 架构现状(2026-08-28 起):**LLM orchestrator 编排**三个子 Agent(recon → analysis → verification),见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md) 与正文"Step5 Agent 审计"章节。早期(2026-08-16)"三 Agent 串行、无 orchestrator、控制流硬编码"的设计已演进。
+> **⚠ 架构现状(2026-09-09,ADR-0010/0011 已落地)**:流水线为 **Step0 → Step1 → Step5**(Step2 过滤/Step3 分类/Step4 批量反编译已删除,`--max-elf`/`--max-workers` 退役)。二进制分析由 Step5 的 r2 工具族(r2_list_functions / r2_disassemble_function / r2_xref_query)与唯一 Ghidra 入口 `ghidra_decompile`(幂等缓存 + sha256 去重)按需完成,升级纪律("先 r2,信息不够才反编译")写入提示词与缺件文案。**本文第一章(Step1-4 流水线角色)与第三章中"读 Step4 产出"的表述已过时,以 [ADR-0010](./docs/adr/0010-step5-r2-ghidra-escalation.md)、[ADR-0011](./docs/adr/0011-remove-step2-3-4.md) 与 CONTEXT.md 术语表为准**(全文重写另行安排)。requirements.md 已删除。
 
-## 一、已落地:Step1-4 流水线角色
+固定 5 步流水线(现 3 步,见上方架构现状)。Step5 架构(2026-08-28 起):**LLM orchestrator 编排**三个子 Agent(recon → analysis → verification),见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md) 与正文"Step5 Agent 审计"章节。早期(2026-08-16)"三 Agent 串行、无 orchestrator、控制流硬编码"的设计已演进。
+
+## 一、【已退役 2026-09-09,ADR-0011】Step1-4 流水线角色(仅存档,代码已删除)
 
 ### Step1 — Extractor(解包)
 
@@ -185,6 +187,8 @@ Step5 流程,不产出任何替代工件(无 survey/findings/report)。
 * Step1-4 已完成的固件分析结果不受影响
 
 ## 三、工具层实现
+
+> **⚠ 部分表述过时(2026-09-09,ADR-0010/0011)**:读盘类工具"读 Step4 产出"的说法已过时——strings_query/imports_query 现为"边车优先 + r2 兜底"混合型(兜底不限 ELF);边车唯一来源是 ghidra_decompile(边车三件套 .c/.strings.json/.imports.json,functions.json/meta.json 不再产出);新增 r2_list_functions/r2_disassemble_function;xref_query 已更名 r2_xref_query。工具清单以代码注册表与 CONTEXT.md 为准。
 
 ### 目录结构(2026-09-05 编排层包化定稿,ADR-0009:并列/附属关系入目录)
 

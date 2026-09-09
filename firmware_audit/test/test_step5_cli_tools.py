@@ -1,4 +1,4 @@
-"""Step5 CLI 工具单测:checksec / xref_query / cve_bin_tool_scan(真实沙箱容器)。
+"""Step5 CLI 工具单测:checksec / r2_xref_query / cve_bin_tool_scan(真实沙箱容器)。
 
 依赖 Docker + firm_audit/sandbox:latest + target/1 工件,任一缺失全部 SKIP。
 cve_bin_tool_scan 首跑需下载 CVE 库(NVD 无 key 限速,可能极慢),默认 SKIP,
@@ -60,10 +60,10 @@ def test_checksec(tools) -> list[str]:
     return fails
 
 
-def test_xref_query(tools) -> list[str]:
+def test_r2_xref_query(tools) -> list[str]:
     fails: list[str] = []
     # idlc 实测导入 popen(analysis/imports.json 确认),调用者是 idlc_load_generator
-    r = tools["xref_query"].execute(file_ref=SAMPLE_ELF, symbol="popen")
+    r = tools["r2_xref_query"].execute(file_ref=SAMPLE_ELF, symbol="popen")
     if not r.ok:
         fails.append(f"xref popen 失败: {r.error}")
     elif not r.data:
@@ -72,9 +72,81 @@ def test_xref_query(tools) -> list[str]:
         fails.append(f"popen 调用者应含 idlc_load_generator, got {r.data}")
 
     # 符号不存在 → 不 ok=True 的空表或明确报错都算通过(不崩即可)
-    r2 = tools["xref_query"].execute(file_ref=SAMPLE_ELF, symbol="definitely_not_a_symbol")
+    r2 = tools["r2_xref_query"].execute(file_ref=SAMPLE_ELF, symbol="definitely_not_a_symbol")
     if r2.ok and r2.data:
         fails.append("不存在符号不应有结果")
+    return fails
+
+
+def test_r2_list_functions(tools) -> list[str]:
+    """票01 Docker 门控真跑:aflj 函数清单(真实沙箱 + target/1 ELF)。"""
+    fails: list[str] = []
+    r = tools["r2_list_functions"].execute(file_ref=SAMPLE_ELF)
+    if not r.ok:
+        fails.append(f"r2_list_functions 失败: {r.error}")
+    elif not isinstance(r.data, list) or not r.data:
+        fails.append("idlc 应有函数条目")
+    elif not any(isinstance(d, dict) and d.get("name") for d in r.data):
+        fails.append(f"函数条目应含 name 字段: {r.data[:2]}")
+    # 非 ELF → 引导性拒绝(不付容器;extracted 下必有非 ELF 文本)
+    r2 = tools["r2_list_functions"].execute(file_ref="unitree/module/bashrunner/README.md")
+    if r2.ok:
+        fails.append("非 ELF 应被引导性拒绝")
+    elif "不是 ELF" not in (r2.error or ""):
+        fails.append(f"非 ELF 错误文案应引导: {r2.error}")
+    # 越界路径拒绝
+    if tools["r2_list_functions"].execute(file_ref="../../etc/passwd").ok:
+        fails.append("越界路径应被拒绝")
+    return fails
+
+
+def test_r2_disassemble_function(tools) -> list[str]:
+    """票01 Docker 门控真跑:pdf 单函数反汇编 + 未命中附函数名提示。"""
+    fails: list[str] = []
+    # main 符号存在(与 find_decompiled_function 的 main 对应)
+    r = tools["r2_disassemble_function"].execute(file_ref=SAMPLE_ELF, func_or_addr="sym.main")
+    if not r.ok:
+        fails.append(f"r2_disassemble sym.main 失败: {r.error}")
+    elif "sym.main" not in r.text:
+        fails.append(f"反汇编输出应含目标标注: {r.text[:120]}")
+    # 不存在的目标 → 错误附函数/符号名提示
+    r2 = tools["r2_disassemble_function"].execute(
+        file_ref=SAMPLE_ELF, func_or_addr="sym.definitely_not_here")
+    if r2.ok:
+        fails.append("不存在目标应 ok=False")
+    elif "sym." not in (r2.error or ""):
+        fails.append(f"未命中错误应附符号名提示: {r2.error[:200]}")
+    return fails
+
+
+def test_strings_imports_r2_fallback(tools, process_dir) -> list[str]:
+    """票02 Docker 门控真跑:无边车工作区(tmp 拷真实 ELF)自动 r2 兜底。"""
+    import shutil
+    import tempfile
+
+    from firmware_audit.step5_agent.providers.tools.base import ToolContext
+
+    fails: list[str] = []
+    src = process_dir / "extracted" / SAMPLE_ELF
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        dst = root / "extracted" / "sample.elf"
+        dst.parent.mkdir(parents=True)
+        shutil.copy2(src, dst)
+        ctx = ToolContext(process_dir=root)
+        fresh = dict(make_tools(ctx))
+        # strings 兜底:izz 对真实 ELF 出字符串;url 模式可能零命中但必须 ok
+        rs = fresh["strings_query"].execute(file_ref="sample.elf", pattern="url")
+        if not rs.ok:
+            fails.append(f"strings 兜底失败: {rs.error}")
+        elif "r2 izz" not in rs.text:
+            fails.append(f"strings 兜底来源标注异常: {rs.text[:120]}")
+        # imports 兜底:真实 ELF 导入表;危险表可能零命中但必须 ok
+        ri = fresh["imports_query"].execute(file_ref="sample.elf")
+        if not ri.ok:
+            fails.append(f"imports 兜底失败: {ri.error}")
+        elif "r2 iij" not in ri.text:
+            fails.append(f"imports 兜底来源标注异常: {ri.text[:120]}")
     return fails
 
 
@@ -246,6 +318,46 @@ def test_semgrep_dual_scan() -> list[str]:
     return fails
 
 
+def test_ghidra_decompile_smoke(tools, process_dir) -> list[str]:
+    """票03 Docker 门控真 Ghidra 冒烟(验收锚点):小 ELF 三件套完整 + 二次调用缓存命中。
+
+    tmp 工作区(不污染 target/1);真容器分钟级,仅在 ghidra 镜像可用时跑。
+    """
+    import shutil
+    import tempfile
+
+    from firmware_audit.docker.docker_utils import docker_available
+    from firmware_audit.step5_agent.providers.tools.base import ToolContext
+    from firmware_audit.step5_agent.providers.tools.ghidra_decompile import GHIDRA_IMAGE
+
+    if not docker_available(GHIDRA_IMAGE):
+        pytest.skip(f"Docker 或镜像 {GHIDRA_IMAGE} 不可用")
+
+    fails: list[str] = []
+    src = process_dir / "extracted" / "unitree/opt/lib/vlc/plugins/control/libdummy_plugin.so"
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "extracted").mkdir(parents=True)
+        shutil.copy2(src, root / "extracted" / "sample.so")
+        ctx = ToolContext(process_dir=root)
+        fresh = make_tools(ctx)["ghidra_decompile"]
+        r = fresh.execute(file_ref="sample.so")
+        if not r.ok:
+            fails.append(f"真 Ghidra 反编译失败: {r.error}")
+            return fails
+        ana = root / "analysis"
+        for suf in (".c", ".imports.json", ".strings.json"):
+            if not (ana / f"sample{suf}").is_file():
+                fails.append(f"三件套缺 sample{suf}")
+        if "个函数" not in r.text:
+            fails.append(f"Observation 应含函数数: {r.text[:160]}")
+        # 二次调用:缓存命中,零容器语义(Observation 文案判别)
+        r2 = fresh.execute(file_ref="sample.so")
+        if not r2.ok or "缓存命中" not in r2.text:
+            fails.append(f"二次调用应缓存命中: {r2.error or r2.text[:160]}")
+    return fails
+
+
 def test_main() -> int:
     if not _ready():
         return 0
@@ -253,7 +365,11 @@ def test_main() -> int:
 
     cases = [
         ("checksec", lambda: test_checksec(tools)),
-        ("xref_query", lambda: test_xref_query(tools)),
+        ("r2_xref_query", lambda: test_r2_xref_query(tools)),
+        ("r2_list_functions", lambda: test_r2_list_functions(tools)),
+        ("r2_disassemble_function", lambda: test_r2_disassemble_function(tools)),
+        ("strings_imports_r2_fallback", lambda: test_strings_imports_r2_fallback(tools, _CANDIDATE[0])),
+        ("ghidra_decompile_smoke", lambda: test_ghidra_decompile_smoke(tools, _CANDIDATE[0])),
         ("semgrep_scan", lambda: test_semgrep_scan(tools)),
         ("gitleaks_scan", lambda: test_gitleaks_scan(tools)),
         ("sandbox_verify", lambda: test_sandbox_verify(tools)),

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from ...file_rules import is_search_excluded
 from .artifacts import _resolve_survey_path, artifact_summary, load_survey
 
 # ---- Final Answer 工件 schema(三 Agent 共用 findings 结构) ----
@@ -59,7 +60,7 @@ AGENT_DISCIPLINE = """纪律(违反会被系统拦截或强制干预):
 - 工具先行: 输出 Final Answer 前必须至少调用过一次工具查证;从未调工具的直接结论会被系统拒绝退回
 - 禁止同参空转: 同一工具+完全相同参数最多调用 3 次,第 4 次起系统直接拦截不执行;失败的工具调用最多原样重试 1 次,然后必须换参数或换工具
 - 证据可溯源: 每条 finding 的 evidence/addr/cve 必须逐字来自某次 Observation,禁止编造、拼凑或凭记忆补写
-- 不猜路径: 工具报"文件不存在/产物缺失"时禁止猜测相似路径反复尝试;侦察阶段记疑点即可,复核阶段据此判 false_positive
+- 不猜路径: 工具报"文件不存在/产物缺失"时禁止猜测相似路径反复尝试;侦察/分析阶段记疑点即可,产物缺失 ≠ 证据不存在(复核的缺件处理走其升级链硬纪律)
 - 截断可回读: Observation 被截断时按末尾提示用 read_file 分页取回原文,不要凭截断片段推断被省略的内容
 - 预算优先级: 迭代有限,优先 critical/high 与网络可达入口;SDK 库/低危信号靠后,单个疑点最多 3-4 轮取证"""
 
@@ -82,12 +83,16 @@ ANALYSIS_DIR_DOC = """工作区锚点(所有路径都是**工具路径**——�
   照抄 search_code/semgrep/gitleaks 命中的路径即可,不要自行剥前缀
 
 函数命名规则(工具衔接,重要——用错名必失败):
+- 工具名前缀即数据来源: r2_* 三件(r2_list_functions/r2_disassemble_function/r2_xref_query)
+  是对原始 ELF **现算**(秒级,不落盘);find_decompiled_function 只**读缓存**(已反编译的 .c 边车,毫秒级);
+  ghidra_decompile 是**升级层**(分钟级容器,反编译并落盘边车,幂等缓存+sha256 去重)
 - find_decompiled_function 只认 Ghidra 命名: 真实符号名(如 main/CallSystem)或 FUN_<8位十六进制地址>
-- xref_query 返回 r2 命名: fcn.<hex> 或 mangled C++ 方法名,**不能直接**传给 find_decompiled_function
-- 从 xref 结果定位函数体的正确路径: read_file 读 analysis/<rel>/<name>.functions.json,
-  按 callees 包含目标危险函数(system/popen/strcpy 等)反查真实函数名;该条目的 address 字段去掉 0x 补齐 8 位即 FUN_ 名
+- r2_xref_query 返回 r2 命名: fcn.<hex> 或 mangled C++ 方法名,**不能直接**传给 find_decompiled_function
+- 从 r2_xref_query 结果定位函数体的正确路径: 老工件 read_file 读 analysis/<rel>/<name>.functions.json,
+  按 callees 包含目标危险函数(system/popen/strcpy 等)反查真实函数名,该条目的 address 字段去掉 0x 补齐 8 位即 FUN_ 名;
+  新反编译产物没有 functions.json(边车三件套制),改用 r2_list_functions 现算函数清单 + r2_disassemble_function 读函数体
 - 禁止手工换算或拼凑函数名(如给 fcn.<hex> 加减基址猜 FUN_ 名,极易差一位导致反复失败);
-  functions.json 里查不到对应函数就放弃该取证路径并如实记录"""
+  functions.json/r2 清单里查不到对应函数就放弃该取证路径并如实记录"""
 
 # ---- recon v3 survey 工件 schema(2026-08-29,无 findings/判级字段) ----
 SURVEY_SCHEMA_DOC = """{
@@ -202,14 +207,16 @@ ANALYSIS_SYSTEM = f"""## 1 角色与使命
 ## 4 执行流程
 取证流程(每个疑点独立走完再换下一个):
 1. 读 survey.json: 按可达性与风险排序——网络入口与 recommended_actions 的 high/medium 优先,SDK 库误报高发区放后
-2. 定位代码: 先 search_code 按关键词/正则全局定位(边车索引覆盖 ELF 字符串/导入,extracted+analysis 文本按行 grep——缺省 '.' 即全部审计内容,一次拿全命中文件与行);再用 find_decompiled_function 看可疑函数逻辑 → xref_query 查调用链(入口可达性)→ imports_query/strings_query 补充上下文
+2. 定位代码: 先 search_code 按关键词/正则全局定位(边车索引覆盖 ELF 字符串/导入,extracted+analysis 文本按行 grep——缺省 '.' 即全部审计内容,一次拿全命中文件与行);再用 r2 层看二进制(r2_list_functions 列函数清单 → r2_disassemble_function 读单函数反汇编 → r2_xref_query 查调用链)→ 已有边车时 find_decompiled_function 看反编译 C → imports_query/strings_query 补充上下文。
+   **升级纪律(先 r2,信息不够才反编译)**: r2 层信息不够(如必须读反编译 C 才能判定数据流)时,才对单个 ELF 调 ghidra_decompile(幂等缓存,analysis 阶段反编译过的文件复核时零成本复用);禁止一上来就反编译,也不必为"看看有什么"反编译——分钟级容器只为真正需要的文件买单
 3. 判定三问(每问都要有 Observation 支撑):
    a. 危险操作真实存在?(反编译里确有 system/strcpy/拼接,而非同名符号或字符串)
    b. 外部可控?(参数来自网络输入/配置/命令行,而非编译期常量)
    c. 有无缓解?(长度校验/白名单/转义在调用前真实生效)
 4. 组件类疑点: cve_bin_tool_scan 命中的 CVE 用 cve_lookup 核对影响版本区间;版本对不上就排除,不要"版本接近也算"
-5. 佐证检索(可选): web_search 查厂商公告/公开利用;检索结果只是线索,不能直接写进 evidence
-6. 落盘: 取证确认的进 findings;证据不足的降 confidence(low)或丢弃,并在 summary 说明丢弃原因
+5. 系统信任库纪律: etc/ssl/certs、ca-certificates 等目录下的发行版自带 CA/证书不是厂商硬编码凭证,不作可疑上报(ADR-0011:is_system_trust 标记已退役,此判定为提示词纪律);厂商自签、非常规位置的证书才值得取证
+6. 佐证检索(可选): web_search 查厂商公告/公开利用;检索结果只是线索,不能直接写进 evidence
+7. 落盘: 取证确认的进 findings;证据不足的降 confidence(low)或丢弃,并在 summary 说明丢弃原因
 
 ## 5 判定与输出规范
 Final Answer 的 JSON 结构:
@@ -259,7 +266,7 @@ VERIFY_SYSTEM = f"""## 1 角色与使命
 
 ## 4 执行流程
 复核这一条 finding(独立判断):
-1. 静态复核: find_decompiled_function/xref_query 重看证据,确认漏洞逻辑真实存在(不是规则误报或同名巧合);imports_query/strings_query 复核导入类与硬编码类 finding
+1. 静态复核: 先按 finding 的 file 验证原始文件存在(read_file),缺反编译 .c 时走**升级链**(见 ## 6 第 1 条),有边车则 find_decompiled_function/r2_xref_query 重看证据,确认漏洞逻辑真实存在(不是规则误报或同名巧合);r2 层(r2_list_functions/r2_disassemble_function)可对未反编译的 ELF 独立取证;imports_query/strings_query 复核导入类与硬编码类 finding——注意系统信任库纪律: 发行版自带 CA/证书(etc/ssl/certs 等)不作可疑凭证,上游把它当 finding 时判误报
 2. CVE 复核: cve_lookup 核对该 CVE 是否真影响此组件版本区间;版本对不上 → verified=false
 3. 保护机制复核: finding 声称"无 NX/无 PIE"时用 checksec 实测确认,不沿用上游说法
 4. 动态复核(可执行验证的 finding 优先): 命令注入/反序列化/脚本逻辑类用 sandbox_verify 写 Fuzzing Harness 实测(模板见本节点 4 之后)
@@ -305,7 +312,7 @@ Final Answer 的 JSON 结构(verified/rationale 是本阶段必填字段;**title
 
 ## 6 红线与边界
 防幻觉硬纪律(逐条强制执行,违反即误判):
-1. 文件必须存在: 先用 read_file/find_decompiled_function 按 finding 的 file 验证——工具返回"文件不存在/产物缺失/路径越界"时,该条必须 verified=false,rationale 写"工件不存在";禁止猜测相似路径(不加后缀、换目录、找兄弟文件),禁止脑补"应该在某处"
+1. 升级链(缺件处理,ADR-0010): "没人反编译过"不是"证据不存在"。finding 的 file 先用 read_file 验证原始文件存在;缺反编译 .c 时按链推进——先用 r2 层(r2_list_functions/r2_disassemble_function/r2_xref_query)独立查证 → r2 信息不够 → ghidra_decompile 反编译 → **反编译后仍缺失/超时零产出** → 才可判 verified=false,rationale 写"反编译零产出";原始文件本身不存在/路径越界仍直接 verified=false,rationale 写"工件不存在"
 2. 证据必须吻合: finding 的 evidence 片段要在你本次的 Observation 里真实出现;文件存在但内容对不上(如同名函数里没有该调用)→ verified=false,rationale 写"证据与工件不符"
 3. 信息缺失不脑补: finding 缺 file/evidence 等关键字段时不替它补;标 verified=false 或降 confidence,rationale 写"关键字段缺失"
 4. 单条必达: Final Answer 只输出简报注入的这一条 finding(title/file 必须一致),verified/rationale 必填;不许静默丢弃、不许换成别的 finding、不许混入第二条
@@ -369,55 +376,50 @@ def save_system_prompt(agent_dir: Path, system_prompt: str) -> None:
 
 # ---- 任务简报(init user 消息) ----
 
-# 文件 type → 审计价值排序(概览展示顺序用;值越小越优先)
-_OVERVIEW_TYPE_RANK = {"elf_exec": 0, "script": 1, "config": 2,
-                       "text": 3, "elf_lib": 4, "unknown": 5}
-
 
 def build_filtered_overview(process_dir: Path, max_dirs: int = 15) -> str:
-    """基于 Step2 过滤清单(process/fileinfo.json)的紧凑目录概览。
+    """解包树现场概览(ADR-0011 票05):rglob extracted 现场统计,不读 fileinfo.json。
 
-    只给"顶层目录 + type 分布 + 优先级",不 dump 全量行(2047)。
-    fileinfo.json 本身已被 Step2 剔除 SDK/系统库,故概览天然干净,
-    LLM 据此知道审计目标集,不必下钻 extracted 撞 SDK 噪音。
-    缺失/解析失败/空清单时回退到一句提示(早期工作区或测试)。
+    顶层目录 × 文件数(套 profile SEARCH_EXCLUDE 的 SDK 排除名单,与
+    list_files/search_code 口径一致)+ 扩展名粗分布(无真类型分类——精细
+    分型由 recon 用 list_files 现场做)。fileinfo.json 存在与否均不读写。
+    extracted/ 缺失时一句提示(未解包的工作区)。
     """
-    fi = process_dir / "fileinfo.json"
-    if not fi.is_file():
-        return ("提示: fileinfo.json 缺失(工作区根,未跑 Step2 或早期工作区)。"
-                "需要目录概览请用 read_file 列 extracted;"
-                "注意 usr/local/lib、usr/lib 等 SDK/系统库目录低价值、优先跳过。")
-    try:
-        data = json.loads(fi.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return "提示: fileinfo.json 解析失败;按 extracted 直接看,SDK/系统库目录低价值。"
-    if not isinstance(data, list):
-        return "提示: fileinfo.json 结构异常;按 extracted 直接看,SDK/系统库目录低价值。"
-
-    dir_by_type: dict[str, dict[str, int]] = {}
-    for f in data:
-        rel = (f.get("rel_path") or "").strip()
-        if not rel:
+    extracted = process_dir / "extracted"
+    if not extracted.is_dir():
+        return ("提示: extracted/ 不存在(本工作区未解包),目录概览不可用;"
+                "用 list_files 确认工作区结构。")
+    dir_counts: dict[str, int] = {}
+    ext_counts: dict[str, int] = {}
+    total = 0
+    for p in extracted.rglob("*"):
+        if not p.is_file():
             continue
-        top = rel.split("/", 1)[0]
-        t = f.get("type") or "unknown"
-        d = dir_by_type.setdefault(top, {})
-        d[t] = d.get(t, 0) + 1
+        rel = p.relative_to(extracted).as_posix()
+        parts = rel.split("/")
+        # SDK 排除:任一祖先目录前缀命中名单即不计(与 list_files 逐目录判定同口径)
+        if any(is_search_excluded("/".join(parts[:i])) for i in range(1, len(parts) + 1)):
+            continue
+        total += 1
+        # 根目录散文件(.step1_done/guided_extract.json 等解包簿记)单独归桶,
+        # 不冒充顶层目录
+        top = parts[0] + "/" if len(parts) > 1 else "(根目录散文件)"
+        dir_counts[top] = dir_counts.get(top, 0) + 1
+        ext = p.suffix.lower() or "(无扩展名)"
+        ext_counts[ext] = ext_counts.get(ext, 0) + 1
 
-    def _rank(kv) -> tuple:
-        best = min((_OVERVIEW_TYPE_RANK.get(t, 9) for t in kv[1]), default=9)
-        return (best, -sum(kv[1].values()))
-
-    lines = [f"过滤后目录概览(Step2 保留 {len(data)} 文件;SDK/系统库已剔除):"]
-    for i, (top, by_type) in enumerate(sorted(dir_by_type.items(), key=_rank)):
+    if not total:
+        return "提示: extracted/ 为空或全部命中 SDK 排除名单,现场概览不可用。"
+    lines = [f"解包树现场概览(共 {total} 文件;SDK/系统库目录已按排除名单剔除):"]
+    for i, (top, n) in enumerate(sorted(dir_counts.items(), key=lambda kv: (-kv[1], kv[0]))):
         if i >= max_dirs:
-            lines.append(f"…(共 {len(dir_by_type)} 个顶层目录,余下省略,用 read_file 按相对路径下钻)")
+            lines.append(f"…(共 {len(dir_counts)} 个顶层目录,余下省略,用 list_files 下钻)")
             break
-        types = ", ".join(
-            f"{t}={n}" for t, n in sorted(by_type.items(), key=lambda kv: _OVERVIEW_TYPE_RANK.get(kv[0], 9)))
-        lines.append(f"- {top}/  {types}")
-    rank_label = " > ".join(_OVERVIEW_TYPE_RANK)  # elf_exec > script > ...
-    lines.append(f"优先级: {rank_label}。下钻用 read_file 按相对路径;无需下钻被剔除的 SDK 目录。")
+        lines.append(f"- {top}  {n} 文件")
+    ext_s = ", ".join(f"{e}={n}" for e, n in
+                      sorted(ext_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:8])
+    lines.append(f"扩展名粗分布: {ext_s}。"
+                 "精细分型用 list_files 现场看;usr/lib 等 SDK 目录低价值、优先跳过。")
     return "\n".join(lines)
 
 
@@ -529,27 +531,25 @@ def build_recon_brief(process_dir: Path, max_entries: int = 120) -> str:
     analysis = process_dir / "analysis"
     if not analysis.is_dir():
         base = (survey_head or ("任务:侦察固件攻击面。\n"  # noqa: MEM201 条件分支,不可提前拼接
-                                "(analysis/ 不存在——先确认 Step1-4 已跑完。)\n\n"))
+                                "(analysis/ 不存在——尚无反编译产物,深挖取证由下游 analysis 完成。)\n\n"))
         return base + build_filtered_overview(process_dir)
 
+    # 工件索引按 .c 存在性归组(ADR-0011 票05:不再依赖 functions.json;
+    # 新反编译产物是边车三件套 .c/.strings.json/.imports.json)
     groups: dict[str, list[str]] = {}
-    for p in analysis.rglob("*.functions.json"):
-        rel = p.relative_to(analysis).as_posix()
-        stem = rel[: -len(".functions.json")]
-        groups.setdefault(stem, []).append("functions")
-    for p in analysis.rglob("*.imports.json"):
-        rel = p.relative_to(analysis).as_posix()
-        groups.setdefault(rel[: -len(".imports.json")], []).append("imports")
-    for p in analysis.rglob("*.strings.json"):
-        rel = p.relative_to(analysis).as_posix()
-        groups.setdefault(rel[: -len(".strings.json")], []).append("strings")
+    for p in analysis.rglob("*.c"):
+        stem = p.relative_to(analysis).as_posix()[: -len(".c")]
+        tags = ["decompiled.c"]
+        for suf, tag in ((".imports.json", "imports"), (".strings.json", "strings")):
+            if (analysis / f"{stem}{suf}").is_file():
+                tags.append(tag)
+        groups[stem] = tags
 
-    lines = [f"任务:侦察固件攻击面。analysis/ 下共 {len(groups)} 个二进制的工件:"]
+    lines = [f"任务:侦察固件攻击面。analysis/ 下共 {len(groups)} 个已反编译工件组"
+             "(边车三件套;索引只列这些,未反编译文件直接看 extracted/ 原树):"]
     for stem in sorted(groups):
         kinds = " ".join(sorted(groups[stem]))
-        has_c = (analysis / (stem + ".c")).is_file()
-        suffix = " +decompiled.c" if has_c else ""
-        lines.append(f"- {stem} [{kinds}]{suffix}")
+        lines.append(f"- {stem} [{kinds}]")
     if len(lines) > max_entries + 1:
         kept, dropped = lines[: max_entries + 1], len(lines) - max_entries - 1
         lines = kept + [f"...(还有 {dropped} 个省略,可用工具按路径查询)"]
@@ -674,10 +674,11 @@ def build_verify_single_brief(process_dir: Path, finding: dict) -> str:
             if (process_dir / "extracted" / rel).is_file():
                 pointers.append(f"- extracted/{rel}")
             ana = process_dir / "analysis"
+            # 边车三件套(ADR-0010 票04:.text.json 随 Step2-4 退役不再预产;
+            # functions.json 新反编译不再产,不在指针表)
             pointers += [
                 f"- analysis/{rel}{suf}"
-                for suf in (".c", ".imports.json", ".strings.json",
-                            ".functions.json", ".text.json")
+                for suf in (".c", ".strings.json", ".imports.json")
                 if (ana / f"{rel}{suf}").is_file()
             ]
             if pointers:

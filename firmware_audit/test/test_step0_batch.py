@@ -1,19 +1,18 @@
-"""Step0 分区批次失败行为测试(工单 02:跳过必告警 / 空分区不杀整批)。
+"""Step0 分区批次行为测试(闸门跳过告警 + 双分区批次端到端)。
 
-验收对照(.scratch/step0-fs-extract/issues/02-batch-failure-behavior.md):
+验收对照(.scratch/step0-fs-extract/issues/02-batch-failure-behavior.md 及
+ADR-0011 退役后的新语义):
   - 非直读路径上,分区超限被跳过时输出含分区名/大小/上限的告警行
     (ext4 分区不受闸门约束,天然不触发此告警)
-  - 分区递归中单分区 Step2 过滤为 0 文件:记录(分区名+原因)并继续其余分区;
-    批次结束时汇总哪些分区被跳过;顶层(非分区)固件过滤为空仍终止
-  - 空分区跳过判定为小决策点(main.empty_filter_action),有秒级单测
-  - 两分区合成镜像(一空一正常)集成测试:--no-step5 下正常分区完成、
-    空分区被记录、整体退出码 0
+  - 双 ext4 分区合成镜像:两个分区各自完成解包(--no-step5),整体退出码 0
+    (ADR-0011 后无 Step2 过滤,原"空分区跳过"语义消亡——每个解出的树
+    都直接进 Step5,批次不再有过滤性跳过)
 
 fixture 策略(复用工单 01 的合成镜像套路):
   - 告警行为:纯 Python GPT 布局 + env 压低 STEP0_PARTITION_MAX_SIZE_GB,
     小分区即触发闸门,不造 50GB 稀疏文件
-  - 空分区批次:双 ext4 分区(APP 正常内容 / RECROOTFS 只含黑名单路径
-    usr/share/doc → Step2 过滤为 0)——ext4 直读产物不经 Docker,测试确定
+  - 双分区批次:双 ext4 分区(APP 正常内容 / RECROOTFS 只含 SDK 路径
+    usr/share/doc)——ext4 直读产物不经 Docker,测试确定
 
 用法:
     python -m firmware_audit.test.test_step0_batch
@@ -28,7 +27,7 @@ from pathlib import Path
 
 from ..step0 import step0_preprocess
 from ..step0.step0_preprocess import partition_skip_message
-from ..main import empty_filter_action, main as main_cli, run_pipeline
+from ..main import main as main_cli, run_pipeline
 from .test_step0_split import make_gpt_image
 from .test_step0_ext4 import _make_ext4_fs, _skip_if_no_tools
 
@@ -36,24 +35,6 @@ try:
     import pytest
 except ImportError:  # 独立模式(python -m)无 pytest
     pytest = None
-
-
-# --- 决策点:空分区跳过判定(秒级纯函数) ---
-
-def test_empty_filter_action() -> list[str]:
-    """小决策点:分区批次内跳过续批,顶层单固件终止(语义保持不变)。"""
-    fails: list[str] = []
-    action, reason = empty_filter_action(True)
-    if action != "skip":
-        fails.append(f"分区模式应判定 skip,实际 {action!r}")
-    if not reason:
-        fails.append("skip 分支应携带原因(供日志记录分区名+原因)")
-    action_top, reason_top = empty_filter_action(False)
-    if action_top != "terminate":
-        fails.append(f"顶层模式应判定 terminate(语义不变),实际 {action_top!r}")
-    if "Step2 过滤后无文件" not in reason_top:
-        fails.append(f"terminate 原因应保持原终止文案口径,实际 {reason_top!r}")
-    return fails
 
 
 # --- 闸门跳过告警:消息构造(纯函数) ---
@@ -123,14 +104,15 @@ def test_oversize_partition_skip_warns(tmp_path) -> list[str]:
     return fails
 
 
-# --- 两分区批次集成(一空一正常,--no-step5,整体退出码 0) ---
+# --- 双分区批次集成(--no-step5,整体退出码 0) ---
 
 def _make_two_ext4_partitions_image(img_path: Path) -> None:
-    """双 ext4 分区 GPT 镜像:APP 正常 / RECROOTFS 只含黑名单路径。
+    """双 ext4 分区 GPT 镜像:APP 正常 / RECROOTFS 只含 SDK 路径。
 
-    RECROOTFS 的内容树非空(直读成功、写标记),但全部落在 Step2 黑名单
-    (usr/share)→ 过滤为 0 文件,即工单语境的"空分区"(RECROOTFS 原型是
-    target/3 解出空树的分区)。ext4 直读不经 Docker,测试确定。
+    RECROOTFS 的内容树非空(直读成功、写标记),全部落在搜索过滤名单
+    (usr/share)——ADR-0011 前它会被 Step2 过滤为 0 而跳过;退役后每个
+    解出的树都直接进 Step5,本用例验证"树内容不决定批次命运"。
+    ext4 直读不经 Docker,测试确定。
     """
     build = img_path.parent
     plan = [
@@ -155,7 +137,7 @@ def _make_two_ext4_partitions_image(img_path: Path) -> None:
 
 
 def test_two_partition_batch_e2e(tmp_path) -> list[str]:
-    """一空一正常双分区:正常分区完成、空分区被记录、批次汇总、退出码 0。"""
+    """双分区:各自完成解包(--no-step5 跳过审计),退出码 0,无 fileinfo 产物。"""
     if _skip_if_no_tools():
         return []
     fails: list[str] = []
@@ -170,64 +152,48 @@ def test_two_partition_batch_e2e(tmp_path) -> list[str]:
         with contextlib.redirect_stdout(buf):
             rc = main_cli([str(target), "--no-step5"])
     except SystemExit as e:
-        fails.append(f"空分区不应杀死整批(仍 SystemExit({e.code}))")
+        fails.append(f"双分区批次不应失败(仍 SystemExit({e.code}))")
         return fails
 
     if rc != 0:
         fails.append(f"整体退出码应为 0,实际 {rc}")
     log = buf.getvalue()
 
-    # 正常分区:完整走完 Step2-4(fileinfo.json 产出)
-    sub_ok = target / "process" / "part01_APP"
-    if not (sub_ok / "fileinfo.json").is_file():
-        fails.append("正常分区 part01_APP 未产出 fileinfo.json(未完成审计)")
-    else:
-        from ..models import load_fileinfos
-        rels = {fi.rel_path.replace("\\", "/")
-                for fi in load_fileinfos(sub_ok / "fileinfo.json")}
-        if "etc/passwd" not in rels:
-            fails.append(f"part01_APP 的 fileinfo 应含 etc/passwd,实际 {sorted(rels)}")
-    # 空分区:直读产物在(标记/树),但不再进入 Step3-4,无 fileinfo.json
-    sub_empty = target / "process" / "part02_RECROOTFS"
-    if not (sub_empty / "extracted" / ".step1_done").is_file():
-        fails.append("空分区 part02_RECROOTFS 的直读标记缺失(前置直读未发生)")
-    if (sub_empty / "fileinfo.json").exists():
-        fails.append("被跳过的空分区不应产出 fileinfo.json")
-    # 记录与汇总:分区名+原因进日志,批次结束有跳过清单
-    if "part02_RECROOTFS" not in log or "过滤" not in log:
-        fails.append("空分区跳过应有含分区名+原因的记录行")
-    if "批次汇总" not in log or "part02_RECROOTFS" not in log:
-        fails.append("批次结束应汇总被跳过的分区清单")
+    # 两个分区都完成解包(ADR-0011:无 Step2,树内容不决定批次命运)
+    for name in ("part01_APP", "part02_RECROOTFS"):
+        sub = target / "process" / name
+        if not (sub / "extracted" / ".step1_done").is_file():
+            fails.append(f"{name} 的直读标记缺失(分区未完成解包)")
+    if not (target / "process" / "part01_APP" / "extracted" / "etc" / "passwd").is_file():
+        fails.append("part01_APP 解包树缺 etc/passwd")
+    # fileinfo.json 概念退役:流水线不再产出
+    if (target / "process" / "part01_APP" / "fileinfo.json").exists():
+        fails.append("fileinfo.json 已退役,不应再产出")
+    if "所有分区审计完成" not in log:
+        fails.append(f"批次末应有完成汇总: {log[-300:]}")
     return fails
 
 
-# --- 顶层(非分区)固件过滤为空:语义不变,仍终止 ---
+# --- 分区子工作区:直接跑 run_pipeline(单分区递归路径) ---
 
-def test_top_level_empty_filter_terminates(tmp_path) -> list[str]:
-    """顶层单固件(zip 只含黑名单路径)过滤为空 → sys.exit(1) 语义保持。"""
+def test_partition_subworkspace_pipeline(tmp_path) -> list[str]:
+    """分区子工作区(workspace=分区目录本身)走 run_pipeline --no-step5 不崩。"""
     fails: list[str] = []
-    import zipfile
-    tmp_path = tmp_path / "top"  # 独立模式 main() 共享 tmp,各测试隔离
+    tmp_path = tmp_path / "sub"
     tmp_path.mkdir(exist_ok=True)
-    target = tmp_path / "tgt"
-    target.mkdir()
-    with zipfile.ZipFile(target / "fw.zip", "w") as z:
-        z.writestr("usr/share/doc/junk.txt", "noise\n")
+    (tmp_path / "extracted" / "etc").mkdir(parents=True)
+    (tmp_path / "extracted" / "etc" / "passwd").write_text(
+        "root:x:0:0\n", encoding="utf-8")
+    (tmp_path / "extracted" / ".step1_done").write_text("ok", encoding="utf-8")
 
     buf = io.StringIO()
-    exited = False
-    try:
-        with contextlib.redirect_stdout(buf):
-            run_pipeline(target, run_step5=False)
-    except SystemExit as e:
-        exited = True
-        if e.code != 1:
-            fails.append(f"顶层过滤为空应 sys.exit(1),实际退出码 {e.code!r}")
-    if not exited:
-        fails.append("顶层(非分区)固件过滤为空仍应终止,实际正常返回")
-    if "Step2 过滤后无文件" not in buf.getvalue():
-        fails.append(f"终止原因应保持原口径'Step2 过滤后无文件',日志: "
-                     f"{buf.getvalue()[-300:]!r}")
+    with contextlib.redirect_stdout(buf):
+        run_pipeline(tmp_path, workspace=tmp_path, run_step5=False)
+    log = buf.getvalue()
+    if "跳过 Step1" not in log:
+        fails.append(f"应识别已有解包跳过 Step1: {log[-300:]}")
+    if "跳过 Step5" not in log:
+        fails.append(f"--no-step5 应跳过 Step5: {log[-300:]}")
     return fails
 
 
@@ -238,11 +204,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         groups = [
-            ("空分区跳过决策点", test_empty_filter_action()),
             ("闸门跳过告警消息", test_partition_skip_message()),
             ("超限跳过告警集成", test_oversize_partition_skip_warns(tmp)),
             ("双分区批次e2e", test_two_partition_batch_e2e(tmp)),
-            ("顶层空过滤仍终止", test_top_level_empty_filter_terminates(tmp)),
+            ("分区子工作区流水线", test_partition_subworkspace_pipeline(tmp)),
         ]
         for name, fl in groups:
             if fl:

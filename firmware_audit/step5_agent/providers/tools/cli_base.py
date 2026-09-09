@@ -43,12 +43,16 @@ def container_path(ctx: ToolContext, file_ref: str,
     """file_ref → /work/<base>/<rel>;含路径穿越(../)或越界时返回 None。
 
     base="extracted"(默认,ELF/脚本取证)或 "analysis"(边车产物)。
+    工具路径宽容(ADR-0008,票02):带 base 同名前缀的引用
+    ("extracted/unitree/x"——findings.file 的统一口径)剥前缀后解析,
+    与 resolve_analysis_file 的宽容同源;extracted 树内真实同名顶层目录
+    会被遮蔽,接受该代价。
     注:file_ref 为 None 时保持原契约(.strip() 抛 AttributeError,由 execute
     统一捕获为"失败不崩"),不静默转成空串去碰 Docker。空串按越界拒绝
     (C4 起,原行为是放行到挂载根——那本是不该暴露的边界,故收敛为拒绝)。
     """
     root = (ctx.process_dir / base).resolve()
-    ref = file_ref.strip().replace("\\", "/")
+    ref = file_ref.strip().replace("\\", "/").removeprefix(base + "/")
     if resolve_within(root, ref) is None:
         return None
     return f"/work/{base}/{ref}"

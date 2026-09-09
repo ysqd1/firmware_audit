@@ -16,7 +16,7 @@ class ReadFileTool(AgentTool):
     description = "读取 process/ 目录下的工件文件(分页,默认前 200 行):前序 Agent 的 JSON 工件、报告、反编译 .c 等。"
     params = {
         "path": {"type": "str", "required": True,
-                 "desc": "相对 process/ 的工件路径(如 fileinfo.json 或 extracted/unitree/...)"},
+                 "desc": "相对 process/ 的工件路径(如 extracted/unitree/run.sh 或 agent/1_recon/survey.json)"},
         "offset": {"type": "int", "default": 0, "desc": "起始行号(0 基)"},
         "limit": {"type": "int", "default": DEFAULT_LINES, "desc": "最多读取行数"},
     }

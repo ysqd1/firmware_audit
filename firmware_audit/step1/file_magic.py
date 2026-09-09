@@ -7,7 +7,7 @@ rule_decision"的链路工作,全部为纯函数,可单测。
     preclassify  = 快速二分: 把"确定性的"送走(fdt→skip, elf/pe/text→product),
                    其余一律交 rule_decision。绝不在此裁决容器。
     rule_decision = 容器裁决者: 对 preclassify 筛剩下的,识别出容器魔数→continue,
-                   无容器签名→finalize(留树,不透明文件交给 Step4 分诊)。
+                   无容器签名→finalize(留树;不透明文件的字符串审计由 Step5 strings_query 兜底)。
     二者无重叠: preclassify 输出的 product 绝不包含容器;rule_decision 只处理
     preclassify 筛剩下的。单测锁定此边界(test_step1_guided.py)。
 """

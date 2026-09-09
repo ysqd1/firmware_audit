@@ -33,7 +33,10 @@ from firmware_audit.step5_agent.run_step5 import step5_run
 # ---- fixtures ----
 
 def _make_process(td: Path) -> Path:
-    """伪造最小 Step4 工件:1 个二进制的三件套 sidecar。"""
+    """伪造最小工作区:extracted/(启动门)+ 1 个二进制的三件套 sidecar。"""
+    ext = td / "process" / "extracted" / "unitree" / "bin"
+    ext.mkdir(parents=True)
+    (ext / "idlc").write_bytes(b"\x7fELF")
     ana = td / "process" / "analysis" / "unitree" / "bin"
     ana.mkdir(parents=True)
     (ana / "idlc.imports.json").write_text(json.dumps([
@@ -501,7 +504,7 @@ def test_no_key_error_locates_env_file() -> list[str]:
             envf = Path(td) / ".env"
             envf.write_text("# 只有注释,没有 key\n", encoding="utf-8")
             llm_client._ENV_ANCHORS = [Path(td)]
-            (Path(td) / "analysis").mkdir()  # 过 step5_run 的工件前置检查
+            (Path(td) / "extracted").mkdir()  # 过 step5_run 的解包启动门(ADR-0011)
             try:
                 step5_run(Path(td))
                 fails.append("无 key 时应抛 LLMError")
@@ -572,6 +575,18 @@ def test_tool_permissions_and_threshold() -> list[str]:
         fails.append("verification 应授权 search_code")
     if "search_code" in perms.get("recon", set()):
         fails.append("recon 不应授权 search_code(铺面枚举阶段不做正文检索)")
+
+    # r2 族 + ghidra_decompile(ADR-0010):仅授 analysis/verification,
+    # recon 保持广度角色不授(深挖/分钟级升级调用不进铺面阶段)
+    r2_family = {"r2_list_functions", "r2_disassemble_function", "r2_xref_query",
+                 "ghidra_decompile"}
+    for name in ("analysis", "verification"):
+        missing = r2_family - perms.get(name, set())
+        if missing:
+            fails.append(f"{name} 应授权 r2 工具族: {sorted(missing)}")
+    leak = r2_family & perms.get("recon", set())
+    if leak:
+        fails.append(f"recon 不应授权 r2 工具族(广度角色不深挖): {sorted(leak)}")
 
     # v3 守护:recon max_iters 保持 20(spec 明确不变)
     from firmware_audit.step5_agent.runner import RECON_CFG
@@ -677,6 +692,43 @@ def test_compact_at_600k_threshold() -> list[str]:
     msgs = cm.build_messages()
     if len(msgs) != 3 + len(cm.recent):  # system+init+summary+recent
         fails.append(f"构建消息数不符: {len(msgs)}")
+    return fails
+
+
+def test_startup_gate_requires_extracted() -> list[str]:
+    """启动门新语义(ADR-0011):仅 extracted/ 的工作区放行;无解包产物拒绝
+    且文案指向 Step1;老工作区(analysis/ 边车当缓存)照样放行。"""
+    from firmware_audit.step5_agent.providers.llm_client import LLMError
+    from firmware_audit.step5_agent.run_step5 import step5_run
+
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+
+        # 仅 extracted/(无任何 analysis/ 工件)→ 过门,死在无 key(而非 FileNotFoundError)
+        only_ext = root / "fresh"
+        (only_ext / "extracted").mkdir(parents=True)
+        class _NoKeyLLM:
+            available = False
+        try:
+            step5_run(only_ext, llm=_NoKeyLLM())
+            fails.append("无 key 应抛 LLMError(启动门已过)")
+        except LLMError:
+            pass
+        except FileNotFoundError as e:
+            fails.append(f"仅 extracted/ 的工作区应过启动门: {e}")
+
+        # 无 extracted/ → 拒绝,文案指向 Step1
+        empty = root / "bare"
+        empty.mkdir()
+        try:
+            step5_run(empty, llm=_NoKeyLLM())
+            fails.append("无 extracted/ 应被启动门拒绝")
+        except LLMError:
+            fails.append("无 extracted/ 应在无 key 检查之前被门拒绝")
+        except FileNotFoundError as e:
+            if "extracted/" not in str(e) or "Step1" not in str(e):
+                fails.append(f"拒绝文案应指向 extracted/ 与 Step1: {e}")
     return fails
 
 

@@ -1,6 +1,6 @@
 # 固件安全审计(Firmware Security Audit)
 
-对嵌入式设备(当前为宇树 Unitree)固件做安全审计的流水线:解包、过滤、分类、反编译/提取,最后由三个 LLM Agent 按序侦查、取证、复核,产出带证据链的审计报告。产物全部落在 `target/<N>/process/` 工作区下。
+对嵌入式设备(当前为宇树 Unitree)固件做安全审计的流水线:预解压与解包(Step0-1),随后由三个 LLM Agent 按序侦查、取证、复核(Step5,按需调用 r2/Ghidra 工具),产出带证据链的审计报告。产物全部落在 `target/<N>/process/` 工作区下。
 
 ## 语言
 
@@ -18,20 +18,12 @@ _Avoid_: 输出目录(out 是单个分区的子目录)
 Step1 把固件解包出的文件目录树(`process/extracted/`),只读,是后续所有分析的原始材料。
 _Avoid_: 解包根, extracted
 
-**FileInfo**:
-单个被审计文件的元信息与状态(`models.py`),由 Step3 创建,Step4 填充 `arch/decompiled_path/ghidra_status`,Step5 填充 `audit_status/findings`。`type` 字段即分类类型集。
-_Avoid_: 文件对象, 条目
-
-**分类类型集 (file type set)**:
-Step3 `_classify_one` 对每个文件判定的类型:`elf_exec / elf_lib / script / source / config / text / crypto_x509 / crypto_ssh / crypto_gpg / crypto_pkcs12 / crypto_private_key / crypto_public_key / crypto_unknown / unknown`。其中 `crypto_unknown`(密码学扩展名但 file 未识别)绝不定 `unknown`,避免 Step5 漏审(`agents.md:51` 用 `crypto_*` 通配缩写,代码与 tools_summary.md 为全列)。
-_Avoid_: 分类, 文件类型(与 file 命令输出混淆)
-
 **工件 (artifact)**:
 Agent 阶段在 `process/agent/<seq>_<type>/` 下落盘的产物——`survey.json`、`findings.json`、`verified_findings.json`,以及编排痕迹。JSON 解析失败时降级为同名 `.md`。
 _Avoid_: 产出文件, 中间文件
 
 **调查工作区产物 (analysis sidecar)**:
-Step4 在 `process/analysis/` 下按文件相对路径产出的反编译 C 与程序信息 JSON(`.c / .functions.json / .imports.json / .symbols.json / .strings.json / .text.json / .meta.json`)——Agent 阶段读盘类工具(strings_query/imports_query/find_decompiled_function)的数据源。
+ghidra_decompile 在 `process/analysis/` 下按文件相对路径产出的**边车三件套**(`.c / .strings.json / .imports.json`)——strings_query/imports_query 的边车优先数据源、find_decompiled_function 的读源、semgrep 双扫的 analysis/*.c 路。由 Step5 工具按需产出并幂等缓存(ADR-0010),不再是流水线批量产物;functions.json/meta.json 无工具消费者,不落盘。
 _Avoid_: 边车文件(实现细节), 反编译产物
 
 **工具路径 (tool path)**:
@@ -39,27 +31,27 @@ _Avoid_: 边车文件(实现细节), 反编译产物
 _Avoid_: process/ 前缀形态(`process/analysis/...` 没有任何工具能打开), 相对路径(歧义:相对谁)
 
 **逻辑路径 (logical path)**:
-相对固件根的路径(`unitree/...`,与 fileinfo.json 的 rel_path、analysis 边车命名同构)——**纯内部键**,只存在于 Step0-4 代码与 CLI 工具(semgrep/gitleaks)的原始容器输出里;进入任何 Agent 工件或工具入参前必须换算成工具路径。
+相对固件根的路径(`unitree/...`,与 analysis 边车命名同构)——**纯内部键**,只存在于解包侧代码与 CLI 工具(semgrep/gitleaks)的原始容器输出里;进入任何 Agent 工件或工具入参前必须换算成工具路径。
 _Avoid_: 固件路径, 物理路径
 
 **文档声明(requirements.md / rules.md / agents.md)**:
-`requirements.md` 是 Step5 需求文档,`rules.md` 是代码规范铁律,`agents.md` 是 Agent 架构与工具层设计。这三份文档里的**部分条款已过时**,与代码现状不一致处以下文术语表和代码为准。
+`requirements.md` 已删除(2026-09-09,ADR-0011 收尾;旧 Step5 需求快照失去宿主);`rules.md` 是代码规范铁律,`agents.md`(AGENTS.md)是 Agent 架构与工具层设计。这两份里的**部分条款已过时**(尤其 Step1-4 相关章节,见 ADR-0010/0011),与代码现状不一致处以下文术语表、docs/adr/ 和代码为准。
 _Avoid_: 把它们当现状说明书
 
 ### 阶段与角色
 
-**Step0-4 流水线 (pipeline)**:
-固定顺序的规则化处理阶段:Step0 预解压/磁盘镜像分区提取 → Step1 引导式解包 → Step2 过滤去重 → Step3 文件分类 → Step4 反编译/提取。纯代码,不依赖 LLM。
+**预处理流水线 (pipeline)**:
+固定顺序的规则化处理阶段:Step0 预解压/磁盘镜像分区提取 → Step1 引导式解包。纯代码,不依赖 LLM。原 Step2 过滤/Step3 分类/Step4 反编译已决定删除(ADR-0011),反编译降为 Step5 的按需工具(ADR-0010)。
 
 **Step5 (Agent 审计)**:
-LLM 驱动的审计阶段,由一个 orchestrator 编排三个子 Agent(recon→analysis→verification)对 Step1-4 产物做侦查、取证、复核,产出最终报告。
+LLM 驱动的审计阶段,由一个 orchestrator 编排三个子 Agent(recon→analysis→verification)对解包树与反编译边车做侦查、取证、复核,产出最终报告。
 
 **子 Agent (sub-agent)**:
 Step5 的三个执行角色之一,由 orchestrator 通过 `dispatch_agent` 调度。三者在代码里是 `AgentConfig` 的**不同配置实例,非子类**。
 _Avoid_: 阶段, 子任务(会与 pipeline 阶段混淆)
 
 **recon(侦查 Agent)**:
-第一个子 Agent。对解包固件做中立广度调查,产出攻击面清单(`survey.json`)——只铺面、不深挖、不判级。
+第一个子 Agent。对解包固件做中立广度调查,产出攻击面清单(`survey.json`)——只铺面、不深挖、不判级。不授 r2 工具族与 ghidra_decompile(ADR-0010)。
 _Avoid_: 侦察, 铺面阶段
 
 **analysis(深度分析 Agent)**:
@@ -124,7 +116,7 @@ _Avoid_: 步(step 已用于索引)
 一次 Agent 执行的完整留痕 `transcript.jsonl`(输入输出/工具调用/耗时/用量),编排层还有 orchestrator 自己的 transcript。可追溯审计用,不进上下文。
 
 **工具 (tool)**:
-Agent 在 Action 里调用的能力,统一 `AgentTool.execute(**kw) → ToolResult` 接口,返回 `{ok, text, data, error, elapsed, raw}`。分三类:读盘类(读 Step4 工件,毫秒级)、CLI 类(subprocess 调容器内 CLI)、API 类(urllib 调 HTTP)。
+Agent 在 Action 里调用的能力,统一 `AgentTool.execute(**kw) → ToolResult` 接口,返回 `{ok, text, data, error, elapsed, raw}`。按数据来源分三类:读盘类(读工作区/边车,毫秒级)、CLI 类(subprocess 调容器内 CLI)、API 类(urllib 调 HTTP);另有唯一的**产物生产工具** ghidra_decompile(调容器并把边车落盘,ADR-0010)。
 _Avoid_: 函数(与 Ghidra 函数混淆), 命令
 
 **接口契约 (interface contract)**:
@@ -132,11 +124,11 @@ _Avoid_: 函数(与 Ghidra 函数混淆), 命令
 _Avoid_: 参数说明(params_doc 只是声明侧), 工具签名(那是 execute 执行侧)
 
 **读盘类工具 (read-disk tool)**:
-直接读 Step4 工件、不调容器的工具:`list_files`/`read_file`/`search_code`/`strings_query`/`imports_query`/`find_decompiled_function`。廉价、毫秒级。
+直接读工作区文件与边车、不调容器的工具:`list_files`/`read_file`/`search_code`/`strings_query`/`imports_query`/`find_decompiled_function`。廉价、毫秒级。其中 strings_query/imports_query 是**边车优先 + r2 兜底的混合型**:缺边车时降级为 CLI 通道现算(ADR-0010),不再报"未找到"。
 _Avoid_: 本地工具, 便宜工具
 
 **CLI 类工具 (CLI tool)**:
-经 `run_docker` 调容器内 CLI 的工具:`checksec`/`xref_query`/`cve_bin_tool_scan`/`semgrep_scan`/`gitleaks_scan`/`binwalk_rescan`/`sandbox_verify`。贵、走网络隔离。
+经 `run_docker` 调容器内 CLI 的工具:`checksec`/`r2_list_functions`/`r2_disassemble_function`/`r2_xref_query`/`cve_bin_tool_scan`/`semgrep_scan`/`gitleaks_scan`/`binwalk_rescan`/`sandbox_verify`。贵、走网络隔离;strings_query/imports_query 的 r2 兜底路也走此类通道(ADR-0010)。
 
 **API 类工具 (API tool)**:
 宿主 Python 用 urllib 调外部 HTTP API 的工具:`cve_lookup`/`web_search`。带节流/缓存/降级。
@@ -179,13 +171,9 @@ _Avoid_: 预算, 剩余轮次(仅含 steps/max_iters)
 两处含义,均在术语表内不冲突:① 工件解析失败(JSON → `.md`),调度状态记为 degraded;② 工具失败降级兜底("失败不崩"原则)——返回 ok=False 并记录失败原因,不中断整体流程。
 
 **断点续跑 (resume / checkpoint)**:
-已存在 `.json` 工件且非 force 时,对应子 Agent 调度标记为 skipped,加载已有工件直接跳过;仅 `.md` 降级工件则默认重跑(可由 `STEP5_RESUME_DEGRADED=0` 关闭)。上游缺件时下游调度被拒。
+已存在 `.json` 工件且非 force 时,对应子 Agent 调度标记为 skipped,加载已有工件直接跳过;仅 `.md` 降级工件则默认重跑(可由 `STEP5_RESUME_DEGRADED=0` 关闭)。上游缺件时下游调度被拒。边车侧的对应机制是 ghidra_decompile 的幂等缓存(ADR-0010)。
 
 ### 审计判定
-
-**审计状态 (audit_status)**:
-FileInfo 上的审计结论字段,值域 `pending / passed / suspicious / failed`(Step4 文本扫描与 Step5 填充)。
-_Avoid_: 状态, 审核状态
 
 **严重度 (severity)**:
 finding 的严重度等级,值域 `critical / high / medium / low / info`(`data/artifacts.py:SEVERITIES`,排序权重表 `SEVERITY_RANK` 由它派生的单一出处),orchestrator 汇总与复核取前 K 时按此排序。
@@ -207,32 +195,36 @@ _Avoid_: 风险, 严重度(severity 是另一个维度)
 一条 finding 从疑点(HIT)到结论的支撑材料:工具 Observation 原文(file/line/code 片段)、交叉引用、CVE 详情。要求逐字可溯源,禁止编造。
 _Avoid_: 证据(单条是 evidence,整条链是 evidence chain)
 
-### 工具与数据(Step4-5)
+### 工具与数据(分析工具与边车)
 
-**Ghidra 反编译 (Ghidra decompilation)**:
-Step4 用 Ghidra Headless 容器对 ELF 批量反编译,产出 `.c` 与 functions/imports/symbols/strings JSON。带 `-analysisTimeoutPerFile 300` 截断防止大型共享库陷入无限循环。
-_Avoid_: 反编译(单独用会与 find_decompiled_function 混淆)
+**升级调用 (escalation)**:
+两级二进制分析模型(ADR-0010):r2 廉价层(r2_list_functions / r2_disassemble_function / r2_xref_query,及 strings_query/imports_query 的 r2 兜底——秒级、不落盘、不反编译)先行,LLM 判断信息不够才升级调用 ghidra_decompile(分钟级、落盘边车三件套、幂等缓存)。升级规则写在提示词与缺件报错文案里;verification 红线按升级链改写:缺 `.c` → r2 层查证 → 信息不够 → 反编译 → 仍缺失/零产出 → 才判 false_positive。
+_Avoid_: fallback(中英混排), 反编译升级
+
+**ghidra_decompile**:
+Step5 唯一的 Ghidra 入口:对单个 ELF 反编译并落盘边车三件套(`.c/.strings.json/.imports.json`),幂等缓存(`extractinfo_version` 匹配即跳过 + sha256 去重)。带 `-analysisTimeoutPerFile 300` 截断防止大型共享库陷入无限循环。原 Step4 批量反编译已退役(ADR-0010/0011)。
+_Avoid_: 反编译(单独用会与 find_decompiled_function 混淆), 批量反编译
 
 **危险函数表 (dangerous function table)**:
-imports_query 使用的导入风险分级表,值域 high(命令执行/内存不安全)/ medium(权限/动态加载)/ low(网络/随机),集中配置。与文本扫描的硬编码文本模式是两套独立的东西。
-_Avoid_: 黑名单(与 step2 过滤名单混淆), 危险模式表(会与 _TEXT_PATTERNS 撞名)
+imports_query 使用的导入风险分级表,值域 high(命令执行/内存不安全)/ medium(权限/动态加载)/ low(网络/随机),集中配置。与硬编码文本模式是两套独立的东西。
+_Avoid_: 黑名单(与已退役的 step2 过滤名单混淆), 危险模式表(会与 _TEXT_PATTERNS 撞名)
 
 **硬编码文本模式 (hardcoded-text patterns)**:
-Step4 文本扫描(`_TEXT_PATTERNS`)用于识别硬编码 URL/IP/密钥/口令的正则模式集。命中只标记"检出",不代表有问题,需人工确认(如 paho-mqtt 的 token 误报)。与 imports_query 的危险函数表是两套独立的东西,勿混。
+`_TEXT_PATTERNS` 正则模式集(URL/IP/密钥/口令),现由 strings_query 的 `pattern` 参数在**查询时过滤**边车或 r2 兜底的字符串(原 Step4 预产 .text.json 已退役,ADR-0011)。命中只标记"检出",不代表有问题,需人工确认(如 paho-mqtt 的 token 误报)。与 imports_query 的危险函数表是两套独立的东西,勿混。
 _Avoid_: 危险模式表, 文本正则(太泛)
 
 **系统信任库 (system trust store)**:
-固件里位于标准系统信任目录(`etc/ssl/certs` 等)下的证书,Step3 标记 `is_system_trust=True`,表示"非厂商硬编码凭证",Step5 不应作可疑点上报。
+固件里位于标准系统信任目录(`etc/ssl/certs` 等)下的证书,表示"非厂商硬编码凭证"。原 Step3 的 `is_system_trust` 标记随 Step2-4 退役(ADR-0011);"系统 CA 不作可疑点上报"降为 Agent 提示词纪律。
 _Avoid_: 信任文件, 系统证书
 
 **敏感配置 (sensitive config)**:
-`etc/` 下需要审计的配置文件(白名单 `WHITELIST_ETC` 指定的),与系统标准配置(直接排除)不同——敏感配置强制保留送审。
+`etc/` 下需要审计的配置文件,与发行版标准配置相对。原白名单强制保留机制(WHITELIST_ETC)随 Step2 退役(ADR-0011);现在所有解包文件对 Agent 可见,该区分只是审计常识。
 
 **SDK 系统库目录 (SDK/system library dir)**:
-`usr/lib`、`usr/local/lib`、`usr/share`、`lib`、`opt` 等目录。Step2 过滤黑名单排除;Step5 的 list_files/search_code 递归下钻时自动跳过(SDK 噪音)。与厂商自研目录(`home/unitree/`)相对。
+`usr/lib`、`usr/local/lib`、`usr/share`、`lib`、`opt` 等目录。Step5 的 list_files/search_code/semgrep 按 profile 的 `SEARCH_EXCLUDE_DIRS` 自动跳过(SDK 噪音;原 Step2 过滤黑名单已退役)。与厂商自研目录(`home/unitree/`)相对。
 
 **逻辑路径 (logical path)**:
-剥掉 binwalk 解包嵌套前缀(`<name>.extracted/<N>/`、`<fstype>-root/`)后的固件内相对路径,白/黑名单按它匹配。例:`foo.tar.xz.extracted/0/etc/passwd → etc/passwd`。
+剥掉 binwalk 解包嵌套前缀(`<name>.extracted/<N>/`、`<fstype>-root/`)后的固件内相对路径,analysis 边车按它命名。例:`foo.tar.xz.extracted/0/etc/passwd → etc/passwd`。
 _Avoid_: 相对路径(带嵌套前缀的是物理相对路径)
 
 **镜像分区 (disk-image partition)**:
@@ -275,7 +267,7 @@ _Avoid_: 沙箱(那是 sandbox_verify), 权限
 CLI 类工具一律 `--network none` 跑容器;唯一例外是 API 类(cve_lookup/web_search)需要出网。binwalk_rescan 也走 none。
 
 **Docker 容器 (container)**:
-Step0-4 的 binwalk/file/ghidra 与 Step5 的 CLI 类工具在容器内执行,宿主机只跑 Python。统一经 `docker_utils.run_docker` 调用(returncode/stdout/stderr,不抛异常,超时返回 124)。唯一例外:Step0 ext4 直读的 debugfs/mount 后端在宿主原生执行(debugfs 用户态读镜像,不进内核;见 ext4 直读)。
+Step0-1 的 binwalk 与 Step5 的 CLI 类工具、ghidra_decompile 在容器内执行,宿主机只跑 Python。统一经 `docker_utils.run_docker` 调用(returncode/stdout/stderr,不抛异常,超时返回 124)。唯一例外:Step0 ext4 直读的 debugfs/mount 后端在宿主原生执行(debugfs 用户态读镜像,不进内核;见 ext4 直读)。
 _Avoid_: 沙箱(指具体镜像 firm_audit/sandbox), Docker 命令
 
 **沙箱 (sandbox)**:
@@ -293,13 +285,11 @@ _Avoid_: 预处理(太泛), 解压
 Step0 对磁盘镜像中 ext4 分区(超级块魔数命中)的原生文件树读取——不经 dd+binwalk,直接产出该分区的解包树与 Step1 完成标记,下游零改动。双后端:debugfs(默认,用户态零特权)/ mount(快路,需 root)。取代 2026-09-06 的手工旁路。
 _Avoid_: 旁路(指当年手工方案), 挂载(特指 mount 后端)
 
-**不透明固件分诊 (opaque triage)**:
-Step4 对 unknown/可疑 text 的纯规则分诊(`triage.py`),按头特征/熵分类为 firmware_hex / firmware_srec / voice_resource / allwinner_boot0 / opaque_privformat / opaque_firmware / opaque_unknown,绝不静默消失。
-_Avoid_: 分类(那是 Step3), 兜底
+**不透明固件 (opaque firmware)**:
+file 识别不出类型的二进制(unknown/裸 blob)。审计路径结构性存在:无过滤的 list_files 天然看见、strings_query 的 r2 兜底(izz 任意文件)可提取字符串线索、binwalk_rescan 出签名表("无签名"本身是可引用 Observation)。原规则分诊随 Step4 退役(ADR-0011),分诊七类与魔数知识留 git 历史。
+_Avoid_: 垃圾文件, 未知格式
 
 **profile**:
-固件机型名单文件(`profiles/<name>.yaml`),外置白/黑名单、系统信任库/标准目录、构建产物模式,换机型只需新增 profile 不改代码。当前默认 `nano-ubuntu`。
+固件机型名单文件(`profiles/<name>.yaml`)。ADR-0011 后只剩 `SEARCH_EXCLUDE_DIRS` 一段——Step5 工具(list_files/search_code/semgrep)与简报现场概览消费的 SDK 搜索排除名单;`main.run_pipeline` 经 `file_rules.configure(--profile)` 切换。换机型只需改 profile 不改代码。当前默认 `nano-ubuntu`。
 _Avoid_: 配置(与固件 config 文件混淆), 机型
 
-**系统信任库 vs 系统标准目录**:
-信任库目录(SYSTEM_TRUST_DIRS)只**标记**(`is_system_trust`,证书仍可查);标准目录(SYSTEM_STD_DIRS)直接**排除**(发行版模板/样例,审计无价值)。两者语义不同,勿混。

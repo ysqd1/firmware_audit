@@ -101,11 +101,11 @@ def test_imports_query(tools) -> list[str]:
 def test_format_hits_trigger() -> list[str]:
     """format_hits 触发层指引(2026-08-23,三层策略第 2 层):
 
-    call_sites 为空 → 附加"用 xref_query 补查,勿判未调用"指引;
+    call_sites 为空 → 附加"用 r2_xref_query 补查,勿判未调用"指引;
     全部有调用点 → 无指引。构造数据,不依赖真实工件。
     """
     fails: list[str] = []
-    hint = "请用 xref_query"
+    hint = "请用 r2_xref_query"
 
     # 1. call_sites 全空 → 必须带指引
     all_empty = [
@@ -169,27 +169,35 @@ def test_read_file(tools, process_dir) -> list[str]:
     if r.ok:
         fails.append("越界路径应被拒绝")
 
-    r2 = tools["read_file"].execute(path="fileinfo.json", limit=5)
-    if not r2.ok:
-        fails.append(f"读 fileinfo.json 失败: {r2.error}")
-    elif len(r2.text.splitlines()) > 7:  # header + 5 行 + 截断提示
-        fails.append("limit 生效失败")
+    # 自造探针文件(不依赖工作区内容——fileinfo.json 已随 Step2-4 退役)
+    probe = process_dir / ".read_file_probe.json"
+    probe.write_text('{"k": "v"}\nline2\nline3\nline4\nline5\nline6\n', encoding="utf-8")
+    r5 = None
+    try:
+        r2 = tools["read_file"].execute(path=".read_file_probe.json", limit=5)
+        if not r2.ok:
+            fails.append(f"读探针文件失败: {r2.error}")
+        elif len(r2.text.splitlines()) > 7:  # header + 5 行 + 截断提示
+            fails.append("limit 生效失败")
 
-    # offset 越界
-    r3 = tools["read_file"].execute(path="fileinfo.json", offset=10**9)
-    if r3.ok:
-        fails.append("offset 超界应报错")
+        # offset 越界
+        r3 = tools["read_file"].execute(path=".read_file_probe.json", offset=10**9)
+        if r3.ok:
+            fails.append("offset 超界应报错")
+
+        # 未知参数优雅拦截(ADR-0004):recursive 传给 read_file → 列出合法参数而非 TypeError
+        r5 = tools["read_file"].execute(path=".read_file_probe.json", recursive=True)
+    finally:
+        probe.unlink(missing_ok=True)
+    if r5 is None or r5.ok or "未知参数 recursive" not in (r5.error or "") \
+            or "path/offset/limit" not in (r5.error or ""):
+        fails.append(f"recursive 应被优雅拦截, got ok={getattr(r5, 'ok', None)} err={getattr(r5, 'error', None)}")
 
     # None 缺参快速失败(不静默转空串列根,C4 契约回归 guard;
     # ADR-0004 起改为契约层优雅类型错误,不再暴露 Python 异常文案)
     r4 = tools["read_file"].execute(path=None)
     if r4.ok or "类型错误" not in (r4.error or ""):
         fails.append(f"None 缺参应优雅失败, got ok={r4.ok} err={r4.error}")
-
-    # 未知参数优雅拦截(ADR-0004):recursive 传给 read_file → 列出合法参数而非 TypeError
-    r5 = tools["read_file"].execute(path="fileinfo.json", recursive=True)
-    if r5.ok or "未知参数 recursive" not in (r5.error or "") or "path/offset/limit" not in (r5.error or ""):
-        fails.append(f"recursive 应被优雅拦截, got ok={r5.ok} err={r5.error}")
     return fails
 
 
@@ -202,7 +210,9 @@ def test_make_tools_exclude() -> list[str]:
 
     full = _mk(ctx)
     for name in ("semgrep_scan", "gitleaks_scan", "sandbox_verify",
-                 "binwalk_rescan", "web_search", "cve_bin_tool_scan"):
+                 "binwalk_rescan", "web_search", "cve_bin_tool_scan",
+                 "r2_list_functions", "r2_disassemble_function",
+                 "r2_xref_query", "ghidra_decompile"):
         if name not in full:
             fails.append(f"默认注册表缺 {name}")
 
@@ -211,6 +221,11 @@ def test_make_tools_exclude() -> list[str]:
         fails.append("exclude={'cve_bin_tool_scan'} 后 cve_bin_tool_scan 仍存在")
     if len(part) != len(full) - 1:
         fails.append(f"排除后数量异常: {len(part)} vs {len(full) - 1}")
+
+    # 新工具(r2 族/ghidra_decompile)同样受 exclude 机制管辖(spec Testing Decision 2)
+    part2 = _mk(ctx, exclude={"ghidra_decompile", "r2_xref_query"})
+    if "ghidra_decompile" in part2 or "r2_xref_query" in part2:
+        fails.append("exclude 对新工具未生效")
 
     # 环境变量默认排除(显式 exclude=None 时生效)
     old = os.environ.get("STEP5_EXCLUDE_TOOLS")

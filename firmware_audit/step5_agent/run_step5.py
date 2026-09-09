@@ -81,8 +81,10 @@ def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
     llm 用于测试注入(ScriptedLLM);None 时按环境变量建 LLMClient。
     唯一路径=LLM 编排(ADR-0006:pipeline 快速模式已删,所有运行都产报告)。"""
     process_dir = resolve_workspace(Path(target_dir))
-    if not (process_dir / "analysis").is_dir() and not (process_dir / "agent").is_dir():
-        raise FileNotFoundError(f"工作区无 analysis/ 工件: {process_dir}(先跑 Step1-4)")
+    # 启动门(ADR-0011):只需解包产物——Agent 直接面向解包树工作,反编译
+    # 边车由 ghidra_decompile 按需产出;老工作区已有 analysis/ 照样放行(当缓存)
+    if not (process_dir / "extracted").is_dir():
+        raise FileNotFoundError(f"工作区无 extracted/ 解包产物: {process_dir}(先跑 Step1 解包)")
 
     base = llm or LLMClient()
     if not base.available:
