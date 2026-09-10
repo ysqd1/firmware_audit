@@ -2,7 +2,8 @@
 
 只测外部行为(spec Testing Decisions Seam 1):边车命中零容器;缺边车自动 r2
 兜底(izz 不限 ELF / iij 仅 ELF);pattern 双路过滤;都不可得 → 引导性报错。
-mock 补丁点:r2 族共享名 run_in_sandbox 在 r2_base 命名空间(经 run_r2 调用)。
+mock 补丁点:r2 族共享名 run_in_sandbox 在 r2_base 命名空间(经 run_r2 调用);
+替身用共享 ReplaySpy + patched(票02 评审收编,原 ReplaySpy/_install 删除)。
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from firmware_audit.step5_agent.providers.tools import r2_base
 from firmware_audit.step5_agent.providers.tools.base import ToolContext
 from firmware_audit.step5_agent.providers.tools.imports_query import ImportsQueryTool
 from firmware_audit.step5_agent.providers.tools.strings_query import StringsQueryTool
+from firmware_audit.test.replay_spy import ReplaySpy, patched
 
 _ELF_MAGIC = b"\x7fELF" + b"\x02\x01\x01" + b"\x00" * 8
 
@@ -44,27 +46,8 @@ def _make_ctx(root: Path, *, sidecar: bool = True) -> ToolContext:
     return ToolContext(process_dir=root)
 
 
-class _SandboxSpy:
-    def __init__(self, *replays):
-        self.replays = list(replays)
-        self.calls: list[dict] = []
-
-    def __call__(self, args, entrypoint, ctx, timeout=120, extra_mounts=None):
-        self.calls.append({"args": list(args), "entrypoint": entrypoint,
-                           "timeout": timeout})
-        return self.replays.pop(0) if self.replays else (0, "", "")
-
-    @property
-    def last(self) -> dict:
-        if not self.calls:
-            raise AssertionError("不应有容器调用")
-        return self.calls[-1]
-
-
-def _install(spy: _SandboxSpy):
-    orig = r2_base.run_in_sandbox
-    r2_base.run_in_sandbox = spy
-    return lambda: setattr(r2_base, "run_in_sandbox", orig)
+def _install(spy: ReplaySpy):
+    return patched(r2_base, run_in_sandbox=spy)
 
 
 def _izzj(pairs: list[tuple[str, str]]) -> str:
@@ -77,7 +60,7 @@ def _izzj(pairs: list[tuple[str, str]]) -> str:
 
 def test_strings_sidecar_hit_zero_container() -> list[str]:
     fails: list[str] = []
-    spy = _SandboxSpy()
+    spy = ReplaySpy()
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -104,7 +87,7 @@ def test_strings_fallback_with_pattern_non_elf() -> list[str]:
         ("0x2000", "just a plain string"),
         ("0x3000", "https://second.example.org/y"),
     ])
-    spy = _SandboxSpy((0, izzj, ""))
+    spy = ReplaySpy((0, izzj, ""))
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -119,14 +102,14 @@ def test_strings_fallback_with_pattern_non_elf() -> list[str]:
         fails.append(f"pattern 应过滤掉非命中项: {r.data}")
     elif "r2 izz" not in r.text:
         fails.append(f"text 应注明来源 r2 izz: {r.text[:120]}")
-    if spy.last["entrypoint"] != "r2" or "izzj" not in " ".join(spy.last["args"]):
+    if spy.last["args"][1] != "r2" or "izzj" not in " ".join(spy.last["args"][0]):
         fails.append(f"兜底应为 r2 izzj 命令: {spy.last['args']}")
     return fails
 
 
 def test_strings_both_unavailable_guidance() -> list[str]:
     fails: list[str] = []
-    spy = _SandboxSpy((1, "", "r2 error"))
+    spy = ReplaySpy((1, "", "r2 error"))
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -168,7 +151,7 @@ def test_strings_step4_patterns_migrated() -> list[str]:
         ("0x3000", "nothing"),
     ])
     # 两次 execute 各回放一次(模式间互不共享结果)
-    spy = _SandboxSpy((0, izzj, ""), (0, izzj, ""))
+    spy = ReplaySpy((0, izzj, ""), (0, izzj, ""))
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -191,7 +174,7 @@ def test_imports_fallback_grading_and_hint() -> list[str]:
         {"name": "socket", "plt": "0x00401070", "bind": "GLOBAL", "type": "FUNC"},
         {"name": "safe_func", "plt": "0x00401080", "bind": "GLOBAL", "type": "FUNC"},
     ])
-    spy = _SandboxSpy((0, iij, ""))
+    spy = ReplaySpy((0, iij, ""))
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -215,7 +198,7 @@ def test_imports_fallback_grading_and_hint() -> list[str]:
 
 def test_imports_sidecar_hit_zero_container() -> list[str]:
     fails: list[str] = []
-    spy = _SandboxSpy()
+    spy = ReplaySpy()
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -235,7 +218,7 @@ def test_imports_sidecar_hit_zero_container() -> list[str]:
 def test_imports_non_elf_guided_rejection() -> list[str]:
     """导入是 ELF 概念:非 ELF 引导性拒绝(指向 strings_query),零容器。"""
     fails: list[str] = []
-    spy = _SandboxSpy()
+    spy = ReplaySpy()
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:

@@ -9,7 +9,8 @@
     危险字符目标在工具层拒绝(命令拼接面)
   - 非 ELF 守卫同款复用于 r2_disassemble_function
 
-mock 补丁点:r2 族共享名 run_in_sandbox 在 r2_base 命名空间(经 run_r2 调用)。
+mock 补丁点:r2 族共享名 run_in_sandbox 在 r2_base 命名空间(经 run_r2 调用);
+替身用共享 ReplaySpy + patched(票02 评审收编,原 _SandboxSpy/_install 删除)。
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ from firmware_audit.step5_agent.providers.tools.r2_disassemble_function import (
 from firmware_audit.step5_agent.providers.tools.r2_list_functions import (
     R2ListFunctionsTool,
 )
+from firmware_audit.test.replay_spy import ReplaySpy, patched
 
 _ELF_MAGIC = b"\x7fELF" + b"\x02\x01\x01" + b"\x00" * 8
 
@@ -40,30 +42,9 @@ def _make_ctx(root: Path) -> ToolContext:
     return ToolContext(process_dir=root)
 
 
-class _SandboxSpy:
-    """run_in_sandbox 替身:按序回放 (rc, out, err),记录每次调用的 args/timeout。"""
-
-    def __init__(self, *replays):
-        self.replays = list(replays)
-        self.calls: list[dict] = []
-
-    def __call__(self, args, entrypoint, ctx, timeout=120, extra_mounts=None):
-        self.calls.append({"args": list(args), "entrypoint": entrypoint,
-                           "timeout": timeout})
-        return self.replays.pop(0) if self.replays else (0, "", "")
-
-    @property
-    def last(self) -> dict:
-        if not self.calls:
-            raise AssertionError("不应有容器调用")
-        return self.calls[-1]
-
-
-def _install(spy: _SandboxSpy):
+def _install(spy: ReplaySpy):
     """补丁 r2_base.run_in_sandbox,返回恢复函数(try/finally 配对)。"""
-    orig = r2_base.run_in_sandbox
-    r2_base.run_in_sandbox = spy
-    return lambda: setattr(r2_base, "run_in_sandbox", orig)
+    return patched(r2_base, run_in_sandbox=spy)
 
 
 def test_list_functions_ok_and_timeout() -> list[str]:
@@ -72,7 +53,7 @@ def test_list_functions_ok_and_timeout() -> list[str]:
         {"name": "main", "offset": "0x00400890", "size": 64},
         {"name": "fcn.00400900", "offset": "0x00400900", "size": 128},
     ])
-    spy = _SandboxSpy((1, "WARN anal\n" + aflj, ""))
+    spy = ReplaySpy((1, "WARN anal\n" + aflj, ""))
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -88,11 +69,12 @@ def test_list_functions_ok_and_timeout() -> list[str]:
     if "bin/app" not in r.text or "2 个函数" not in r.text:
         fails.append(f"text 应汇总函数数: {r.text[:120]}")
     # 接口边界:entrypoint=r2、-A + aflj、timeout=600(ADR-0010 定值)
-    if spy.last["entrypoint"] != "r2":
-        fails.append(f"entrypoint 应为 r2: {spy.last['entrypoint']}")
-    if spy.last["timeout"] != 600:
-        fails.append(f"aflj timeout 应为 600(ADR-0010): {spy.last['timeout']}")
-    args = spy.last["args"]
+    # (run_in_sandbox 以位置参数收 (命令表, entrypoint, ctx),timeout 走 kwargs)
+    if spy.last["args"][1] != "r2":
+        fails.append(f"entrypoint 应为 r2: {spy.last['args'][1]}")
+    if spy.last["kwargs"].get("timeout") != 600:
+        fails.append(f"aflj timeout 应为 600(ADR-0010): {spy.last['kwargs']}")
+    args = spy.last["args"][0]
     if args[0] != "-q" or "-A" not in args or "aflj" not in args:
         fails.append(f"命令应含 -q/-A/aflj: {args}")
     if not args[-1].endswith("/work/extracted/bin/app"):
@@ -104,7 +86,7 @@ def test_list_functions_failure_guides_downgrade() -> list[str]:
     """超时/无输出 → ok=False,文案引导 r2_disassemble_function 便宜路径。"""
     fails: list[str] = []
     for rc, out, err in ((124, "", "docker run timed out after 600s"), (0, "", "")):
-        spy = _SandboxSpy((rc, out, err))
+        spy = ReplaySpy((rc, out, err))
         restore = _install(spy)
         try:
             with tempfile.TemporaryDirectory() as td:
@@ -122,7 +104,7 @@ def test_list_functions_failure_guides_downgrade() -> list[str]:
 def test_list_functions_non_elf_and_escape() -> list[str]:
     """非 ELF/路径越界/文件缺失 → 引导性 ok=False,零容器调用。"""
     fails: list[str] = []
-    spy = _SandboxSpy()
+    spy = ReplaySpy()
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -147,7 +129,7 @@ def test_list_functions_non_elf_and_escape() -> list[str]:
 def test_disassemble_ok_and_miss_hint() -> list[str]:
     fails: list[str] = []
     # 命中:pdf 产出反汇编
-    spy = _SandboxSpy((0, "/  (fcn) main 64\n0x00400890  push rbp\n", ""))
+    spy = ReplaySpy((0, "/  (fcn) main 64\n0x00400890  push rbp\n", ""))
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -155,7 +137,7 @@ def test_disassemble_ok_and_miss_hint() -> list[str]:
             r = R2DisassembleFunctionTool(ctx).execute(file_ref="bin/app",
                                                        func_or_addr="sym.main")
             # 未命中:第一次 pdf 空 → 第二次 f 列 flags 附提示
-            spy2 = _SandboxSpy((0, "", ""), (0,
+            spy2 = ReplaySpy((0, "", ""), (0,
                 "0x00400890 512 sym.main\n0x00401000 16 sym.imp.system\n"
                 "0x00402000 32 sym.dohicky\n", ""))
             r2_base.run_in_sandbox = spy2  # 换替身不动恢复函数(同一 orig)
@@ -168,7 +150,7 @@ def test_disassemble_ok_and_miss_hint() -> list[str]:
     elif "push rbp" not in r.text:
         fails.append("text 应含反汇编体")
     else:
-        cmd = " ".join(spy.last["args"])
+        cmd = " ".join(spy.last["args"][0])
         if "af @ sym.main" not in cmd or "pdf @ sym.main" not in cmd:
             fails.append(f"命令应为 af+pdf 便宜路径: {cmd}")
 
@@ -179,10 +161,10 @@ def test_disassemble_ok_and_miss_hint() -> list[str]:
     if len(spy2.calls) != 2:
         fails.append(f"未命中应触发一次 f 提示调用: {spy2.calls}")
     else:
-        hint_cmd = " ".join(spy2.calls[1]["args"])
+        hint_cmd = " ".join(spy2.calls[1]["args"][0])
         if hint_cmd.count("-c") != 1 or " f" not in hint_cmd:
             fails.append(f"提示调用应为 f(flags)命令: {hint_cmd}")
-        if spy2.calls[1]["timeout"] > r2_base.R2_DEFAULT_TIMEOUT:
+        if spy2.calls[1]["kwargs"].get("timeout", 0) > r2_base.R2_DEFAULT_TIMEOUT:
             fails.append("提示调用不应超过廉价超时")
     return fails
 
@@ -190,7 +172,7 @@ def test_disassemble_ok_and_miss_hint() -> list[str]:
 def test_disassemble_rejects_unsafe_target() -> list[str]:
     """危险字符目标(命令拼接面)工具层拒绝,零容器调用。"""
     fails: list[str] = []
-    spy = _SandboxSpy()
+    spy = ReplaySpy()
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:
@@ -209,7 +191,7 @@ def test_disassemble_rejects_unsafe_target() -> list[str]:
 
 def test_disassemble_non_elf_guard() -> list[str]:
     fails: list[str] = []
-    spy = _SandboxSpy()
+    spy = ReplaySpy()
     restore = _install(spy)
     try:
         with tempfile.TemporaryDirectory() as td:

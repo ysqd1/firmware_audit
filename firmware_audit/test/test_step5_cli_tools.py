@@ -218,12 +218,18 @@ def test_sandbox_verify(tools) -> list[str]:
 
 def test_binwalk_rescan(tools) -> list[str]:
     fails: list[str] = []
-    # 签名复扫:统一沙箱装了 binwalk 直跑;旧镜像自动回退专用 binwalk 镜像
+    # 签名复扫:binwalk 专用镜像直跑(沙箱装不下,见 binwalk_rescan 模块注释)
     r = tools["binwalk_rescan"].execute(file_ref=SAMPLE_ELF)
     if not r.ok:
         fails.append(f"binwalk_rescan 失败: {r.error}")
     elif "签名复扫" not in r.text:
         fails.append(f"binwalk 输出异常: {r.text[:200]}")
+    # 票02 真跑回归:不存在文件 → 宿主预检引导性拒绝(幽灵扫描修复)
+    r2 = tools["binwalk_rescan"].execute(file_ref="no/such/ghost.bin")
+    if r2.ok:
+        fails.append("不存在文件应 ok=False(幽灵扫描)")
+    elif "文件不在解包树" not in (r2.error or "") or "list_files" not in (r2.error or ""):
+        fails.append(f"缺失文件错误应引导 list_files: {r2.error}")
     # 越界路径拒绝
     if tools["binwalk_rescan"].execute(file_ref="../../etc/passwd").ok:
         fails.append("binwalk 越界路径应被拒绝")
