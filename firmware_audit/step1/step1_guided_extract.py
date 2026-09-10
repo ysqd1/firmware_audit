@@ -20,11 +20,18 @@ from pathlib import Path
 
 from ..docker.docker_utils import run_docker, docker_available
 from ..gates import resolve_max_files_per_extraction, resolve_max_total_files
+from .align_table import ALIGN_TABLE
 from .file_magic import sniff_magic, preclassify, rule_decision
 import contextlib
 
 BINWALK_IMAGE = "binwalk"
 CONTAINER_WS = "/work/ws"
+
+# 嗅探窗口:4KB 基线,但必须覆盖对齐表最大锚点(如 iso9660 的 0x8000)——
+# 否则锚定条目在生产永不命中(且测试直喂 sniff_magic 会掩盖,漂移守护也测不到)
+_SNIFF_WINDOW = max(
+    4096, max((off + len(magic) for _n, off, magic, _note in ALIGN_TABLE), default=0)
+)
 
 # 深度上限:正常 Android 固件链路 bootimg(0)→ramdisk.gz(1)→cpio(2)→
 # init/ELF(3)= 3-4 层到底;6 = 正常链路 ≤4 + 2 层异常余量(压缩套压缩)。
@@ -252,7 +259,7 @@ def extract_guided(
                 continue  # 断点续传: 已 done 跳过
 
             try:
-                head = path.read_bytes()[:4096]
+                head = path.read_bytes()[:_SNIFF_WINDOW]
             except OSError:
                 head = b""
             sigs = sniff_magic(head, path.name)

@@ -31,7 +31,6 @@ def test_align_signatures_route_to_binwalk() -> list[str]:
         (b"-rom1fs-" + b"\x00" * 64, "romfs"),
         (b"x\x9c" + b"\xab" * 64, "zlib"),
         (b"\x03\x00\x00\x00\x01\x00\x00\x00\xff\xff" + b"\x00" * 16, "yaffs"),
-        (b"\x00\xd5\x08\x00" + b"\x00" * 64, "arcadyan"),
     ]
     for head, want in cases:
         sigs = sniff_magic(head)
@@ -49,24 +48,38 @@ def test_align_signatures_route_to_binwalk() -> list[str]:
 
 
 def test_align_offset_anchored_entries() -> list[str]:
-    """偏移锚定条目:iso9660@0x8001 / uefi_pi_volume@40 / efigpt@510。"""
+    """偏移锚定条目:按 vendor MAGIC_OFFSET 的真实布局断言。
+
+    锚定依据(vendor 源码):arcadyan 0x68 / dkbs 7 / apfs 0x20 / dms 4 /
+    pchrom 16 / vxworks_symtab 8 / iso9660 0x8000(扇区 16,含前导类型字节)/
+    uefi_pi_volume 40 / efigpt 510。
+    """
     fails: list[str] = []
 
     def _head(off: int, magic: bytes) -> bytes:
         return b"\x00" * off + magic + b"\x00" * 32
 
-    iso = sniff_magic(_head(0x8001, b"\x01CD001\x01\x00"))
-    if "iso9660" not in iso:
-        fails.append(f"iso9660 应在偏移 0x8001 命中,实际 {iso}")
-    fv = sniff_magic(_head(40, b"_FVH"))
-    if "uefi_pi_volume" not in fv:
-        fails.append(f"uefi_pi_volume 应在偏移 40 命中,实际 {fv}")
-    gpt = sniff_magic(_head(510, b"\x55\xaaEFI PART"))
-    if "efigpt" not in gpt:
-        fails.append(f"efigpt 应在偏移 510 命中,实际 {gpt}")
-    # 偏移不足时不误报
-    if "iso9660" in sniff_magic(b"\x01CD001\x01\x00" + b"\x00" * 16):
-        fails.append("短于 0x8001 的文件不应命中 iso9660")
+    cases = [
+        ("iso9660", 0x8000, b"\x01CD001\x01\x00"),
+        ("uefi_pi_volume", 40, b"_FVH"),
+        ("efigpt", 510, b"\x55\xaaEFI PART"),
+        ("arcadyan", 0x68, b"\x00\xd5\x08\x00"),
+        ("dkbs", 7, b"_dkbs_"),
+        ("apfs", 0x20, b"NXSB"),
+        ("dms", 4, b"0><1"),
+        ("pchrom", 16, b"\x5a\xa5\xf0\x0f"),
+        ("vxworks_symtab", 8, b"\x00\x00\x05\x00\x00\x00\x00\x00"),
+    ]
+    for want, off, magic in cases:
+        sigs = sniff_magic(_head(off, magic))
+        if want not in sigs:
+            fails.append(f"{want} 应在偏移 {off:#x} 命中(vendor 锚定),实际 {sigs}")
+    # 偏移不足时不误报(负例:锚点之前的文件不命中)
+    for want, off, magic in (("iso9660", 0x8000, b"\x01CD001\x01\x00"),
+                             ("efigpt", 510, b"\x55\xaaEFI PART"),
+                             ("uefi_pi_volume", 40, b"_FVH")):
+        if want in sniff_magic(magic + b"\x00" * 16):
+            fails.append(f"短于锚点 {off:#x} 的文件不应命中 {want}")
     return fails
 
 
@@ -93,7 +106,8 @@ def test_existing_formats_unchanged() -> list[str]:
 
 
 def test_ignore_list_semantics() -> list[str]:
-    """忽略清单语义:S-record 文本仍走 text→product(不被对齐表抢路由)。"""
+    """忽略清单语义:S-record 文本仍走 text→product(不被对齐表抢路由);
+    csman 弱 ASCII 魔数的文本误报走 continue(已知取舍),空产出后留树兜底。"""
     fails: list[str] = []
     srec = b"S00300004844521B\nS10700000000F0\n"
     sigs = sniff_magic(srec)
@@ -107,11 +121,16 @@ def test_ignore_list_semantics() -> list[str]:
     overlap = {n for n, _ in IGNORE_LIST} & align_names
     if overlap:
         fails.append(f"签名同时出现在对齐表与忽略清单: {sorted(overlap)}")
+    # csman 弱魔数文本误报:确认走 continue(取舍已声明,钉住行为防漂移)
+    a2, r2 = rule_decision(sniff_magic(b"SCRIPTS = [\n"))
+    if a2 != "continue" or "csman" not in r2:
+        fails.append(f"csman 文本误报应 continue(声明取舍),实际 {(a2, r2)!r}")
     return fails
 
 
 def test_extract_guided_routes_shrs(tmp_path: Path) -> list[str]:
-    """引导解包循环:SHRS 候选交 extractor(注入 fake)——对齐表消费的端到端证据。"""
+    """引导解包循环:SHRS 候选交 extractor(注入 fake)——对齐表消费的端到端证据;
+    空产出误报(csman 弱魔数文本)原文件留树,不丢失审计对象。"""
     fails: list[str] = []
     from ..step1.step1_guided_extract import extract_guided
 
@@ -128,6 +147,14 @@ def test_extract_guided_routes_shrs(tmp_path: Path) -> list[str]:
                    check_docker=False)
     if "fw.bin" not in called:
         fails.append(f"SHRS 候选应交 extractor(fake 记录),实际 {called}")
+
+    # 误报路径:csman 弱魔数文本 → 路由但空产出 → 原文件留树
+    fw2 = tmp_path / "note.txt"
+    fw2.write_bytes(b"SCRIPTS = [\n")
+    out2 = tmp_path / "out2"
+    extract_guided(fw2, out2, extractor=fake_extractor, check_docker=False)
+    if not fw2.exists():
+        fails.append("空产出的误报文件应留树(失败不丢审计对象)")
     return fails
 
 
@@ -186,6 +213,11 @@ def test_align_table_covers_binwalk_extractable() -> list[str]:
         fails.append(
             f"binwalk 可解签名未入对齐表/忽略清单(镜像升级后表落后,target/4 病根): "
             f"{sorted(unaligned)};请补对齐表条目或在 IGNORE_LIST 登记理由")
+    # 哨兵:防"解析出空集 → 断言空转"的假绿(输出格式漂移时守护必须响亮死掉)
+    if "shrs" not in extractable:
+        fails.append(
+            f"漂移守护哨兵失败:解析结果不含已知签名 shrs(可解集 {len(extractable)} 项),"
+            "binwalk -L 输出格式可能已漂移,解析器需更新")
     return fails
 
 
