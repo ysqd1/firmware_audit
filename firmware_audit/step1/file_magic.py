@@ -10,10 +10,17 @@ rule_decision"的链路工作,全部为纯函数,可单测。
                    无容器签名→finalize(留树;不透明文件的字符串审计由 Step5 strings_query 兜底)。
     二者无重叠: preclassify 输出的 product 绝不包含容器;rule_decision 只处理
     preclassify 筛剩下的。单测锁定此边界(test_step1_guided.py)。
+
+对齐表(2026-09-10,票01):路由与 binwalk 签名库可解集对齐的声明在
+align_table.py(厂商加密固件 SHRS 被 finalize 的教训),sniff_magic/rule_decision
+共同消费;为什么不"全交 binwalk"的三条理由(静默失败/容器成本/fdt 旧疾)见该模块
+docstring。
 """
 from __future__ import annotations
 
 import math
+
+from .align_table import ALIGN_TABLE, ALIGN_NAMES
 
 # --- 魔数表: (魔数 bytes, 名称)。按重要性排序,命中返回名称列表。 ---
 # fdt 大/小端最前(part05 61.6 万条目的根因,必须先于一切拦截)
@@ -76,6 +83,11 @@ def sniff_magic(data: bytes, fname: str = "") -> list[str]:
         if data.startswith(magic):
             sigs.append(name)
     for off, magic, name in _OFFSET_MAGIC_TABLE:
+        if len(data) > off and data[off : off + len(magic)] == magic:
+            sigs.append(name)
+    # 对齐表(binwalk 可解集路由声明):offset 0 条目与 _MAGIC_TABLE 同语义,
+    # 非 0 条目与 _OFFSET_MAGIC_TABLE 同语义;命中名即 binwalk 签名名
+    for name, off, magic, _note in ALIGN_TABLE:
         if len(data) > off and data[off : off + len(magic)] == magic:
             sigs.append(name)
     if not sigs and _looks_like_text(data):
@@ -149,13 +161,14 @@ def rule_decision(sigs: list[str], fname: str = "", depth: int = 0) -> tuple[str
     if any(s in ("elf", "pe", "text") for s in sigs):
         return "finalize", "ELF/PE/文本,不需继续解"
 
+    # 核心容器集(标准格式)+ 对齐表(binwalk 可解集路由声明,SHRS 等厂商格式)
     container_sigs = {
         "gzip", "xz", "lzma", "lz4", "zstd", "bzip2",          # 压缩流
         "cpio", "cpio_newc", "cpio_odc", "tar", "7z", "zip",   # 归档
         "squashfs", "cramfs", "jffs2", "ubifs", "ubi",         # fs 镜像
         "ext4", "fat",                                          # 磁盘文件系统
         "bootimg", "vendor_boot", "uimage",                     # 固件容器
-    }
+    } | ALIGN_NAMES
     hit = [s for s in sigs if s in container_sigs]
     if hit:
         return "continue", f"容器签名 {','.join(hit)},继续解包"

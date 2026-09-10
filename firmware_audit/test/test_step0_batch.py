@@ -261,9 +261,9 @@ def test_zero_content_tree_guard(tmp_path) -> list[str]:
     if not exited:
         fails.append("顶层零内容树应响亮终止")
     log = buf.getvalue()
-    for token in ("解包零内容", "终止", "SHRS"):
+    for token in ("解包零内容", "终止", "binwalk", "解密工具"):
         if token not in log:
-            fails.append(f"终止输出应含 {token!r}(加密头指引),日志: {log[-300:]!r}")
+            fails.append(f"终止输出应含 {token!r}(对齐后仍解不了的指引),日志: {log[-300:]!r}")
 
     # 分区:同样零内容,但跳过返回不终止
     part = tmp_path / "part"

@@ -327,16 +327,17 @@ def run_pipeline(
         step1_marker.write_text("ok", encoding="utf-8")
         print(f"[main] 认证解包树(无标记但结构完整),补写 {step1_marker.name}")
 
-    # 零内容守卫:Step2 退役后由本守卫兜底——解包零内容(如厂商加密头固件)
-    # 时,顶层响亮终止、分区内跳过续批,不再静默放行进 Step5 空转
+    # 零内容守卫:解包路由已与 binwalk 可解集对齐(align_table),仍零内容即
+    # "binwalk 也解不了"——顶层响亮终止、分区内跳过续批,不再静默放行进 Step5 空转
     if content_file_count(extracted_dir) == 0:
         action, reason = empty_content_action(is_partition)
         if action == "skip":
             print(f"[main] 分区 {target_dir.name}: {reason},记录跳过,其余分区继续")
             return
         print(f"[main] {reason},终止")
-        print("[main] 提示: 固件可能带厂商加密/私有头(如 D-Link SHRS),标准解包器不识别;"
-              "可先用厂商解密工具处理,或人工确认格式后再放入 target 目录重跑")
+        print("[main] 提示: 解包路由已与 binwalk 可解签名集对齐,零内容说明 binwalk 不识别"
+              "该固件(厂商私有/加密格式);可先用厂商解密工具处理,或人工确认格式后再"
+              "放入 target 目录重跑")
         sys.exit(1)
 
     # Step5 Agent 审计(recon→analysis→verification 串行;无 API key 或
