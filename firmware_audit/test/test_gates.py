@@ -29,7 +29,8 @@ from ..gates import (
 )
 
 _ENV_NAMES = ("STEP0_PARTITION_MAX_SIZE_GB", "STEP1_MAX_TOTAL_FILES",
-              "STEP1_MAX_FILES_PER_EXTRACTION")
+              "STEP1_MAX_FILES_PER_EXTRACTION",
+              "STEP1_DEEP_RESCAN_MIN_BYTES", "STEP1_DEEP_RESCAN")
 
 
 class _EnvScope:

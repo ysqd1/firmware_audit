@@ -7,6 +7,8 @@ bus@0/aconnect@.../phandle 节点文件(实测 part05 61.6 万条目)。这里
 关键设计(2026-08-13 评审定稿):
   - preclassify 二分(fdt→skip, elf/pe/text→product, 其余→rule_decision)
   - rule_decision 容器裁决(容器→continue, 无签名→finalize 留树;字符串审计由 Step5 兜底)
+  - 深层复扫(票04): 无签名 finalize 且体积 ≥ 阈值时,binwalk -e -M 全偏移
+    复扫一次(initramfs 深层 rootfs 物化;副本递容器,原件永存)
   - binwalk 并行默认 8(每文件独立容器,线程安全)
   - 产物布局 <file>.extracted/<HEX>/... 与 -Me 同构,Step2 正则兼容(M0 实证)
   - 断点续传 manifest: guided_extract.json
@@ -19,9 +21,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ..docker.docker_utils import run_docker, docker_available
-from ..gates import resolve_max_files_per_extraction, resolve_max_total_files
+from ..gates import (
+    resolve_deep_rescan_enabled,
+    resolve_deep_rescan_min_bytes,
+    resolve_max_files_per_extraction,
+    resolve_max_total_files,
+)
 from .align_table import ALIGN_TABLE
-from .file_magic import sniff_magic, preclassify, rule_decision
+from .file_magic import FINALIZE_UNSIGNED_REASON, sniff_magic, preclassify, rule_decision
 import contextlib
 
 BINWALK_IMAGE = "binwalk"
@@ -42,6 +49,80 @@ MAX_DEPTH = 6
 # EXTRACTION / STEP1_MAX_TOTAL_FILES)见 gates.py——消费点调 resolve_*,
 # 默认值不在本模块重复定义
 _MANIFEST_NAME = "guided_extract.json"
+
+# 深层复扫副本前缀(票04):副本是纯簿记(原件留树),任何终态都不允许残留;
+# 崩溃残留的副本文件在 extract_guided 入口统一清。注意入口清只删文件不删
+# 目录——成功复扫的产物目录若仍带前缀(rename 失败的保底形态),绝不可当
+# 残留误删(2026-09-10 评审发现:误删会静默丢掉已入账的 rootfs)
+_DEEP_RESCAN_PREFIX = "_deeprescan_"
+
+
+def _deep_rescan(path: Path, seq: int, parent: Path) -> tuple[list[Path], str]:
+    """大体积无签名文件的全偏移复扫(票04):binwalk -e -M 单发 + 守卫三件套。
+
+    为什么对副本操作:binwalk -e -d 成功提取后会消费输入文件(2026-09-10
+    实测,gzip 样本解出后输入消失;纯 scan 模式不消费)。finalize 语义是
+    "留树",原件必须永存——副本递进去被吃,产物入树,原件一字节不动。
+
+    流程:
+      1. 拷贝 <parent>/_deeprescan_<seq>_<原名>(副本名带前缀,与内容文件
+         可肉眼区分,也绝不会再进候选队列)
+      2. binwalk -e -M -x dtb(-M 递归到底,直捣 initramfs 深层;-x dtb 恒
+         排除设备树,fdt 旧疾不因 -M 复活)
+      3. 产出 > 单次上限(env STEP1_MAX_FILES_PER_EXTRACTION)或零产出
+         → 删产物+副本,over_guard / empty(原件不受影响)
+      4. 正常 → ok:产物目录从簿记前缀归位成标准 <seq>_<原名>.extracted
+         (与容器解包产物同构;防止入口清残留时把成功产物误当垃圾),
+         副本删除(成功路径多半已被 binwalk 消费,missing_ok 兜底)
+
+    Returns:
+        (产出文件列表, 状态): "ok" / "empty" / "over_guard" / "failed"
+    """
+    copy = parent / f"{_DEEP_RESCAN_PREFIX}{seq:06d}_{path.name}"
+    extracted_dir = parent / f"{copy.name}.extracted"
+    try:
+        shutil.copy2(path, copy)
+    except OSError as e:
+        print(f"[Step1] 复扫副本创建失败 {path.name}: {e}")
+        return [], "failed"
+
+    _rc, _stdout, _stderr = run_docker(
+        BINWALK_IMAGE,
+        ["-e", "-M", f"{CONTAINER_WS}/{copy.name}", "-x", "dtb", "-d", CONTAINER_WS],
+        mounts=[(parent, CONTAINER_WS)],
+        env={"BINWALK_RM_EXTRACTION_SYMLINK": "1"},
+        timeout=600,
+    )
+
+    files = _collect_files(extracted_dir)
+    if not files or len(files) > resolve_max_files_per_extraction():
+        status = "empty" if not files else "over_guard"
+        shutil.rmtree(extracted_dir, ignore_errors=True)
+        copy.unlink(missing_ok=True)
+        return [], status
+
+    # 产物目录归位标准命名;失败保底保留前缀(内容无损,入口清不动目录)
+    final_dir = parent / f"{seq:06d}_{path.name}.extracted"
+    try:
+        extracted_dir.rename(final_dir)
+    except OSError:
+        final_dir = extracted_dir
+    copy.unlink(missing_ok=True)
+    return _collect_files(final_dir), "ok"
+
+
+def _cleanup_deep_rescan_residue(output_dir: Path) -> None:
+    """清崩溃残留的复扫副本(只删文件,绝不删目录——见 _DEEP_RESCAN_PREFIX 注)。
+
+    崩溃残留的半成品产物目录不在此清:其内容是真实扫描产物,留树由候选
+    决策正常处置(finalize/复用),删掉反而可能丢已解出的内容。
+    """
+    if not output_dir.is_dir():
+        return
+    for stale in output_dir.glob(f"{_DEEP_RESCAN_PREFIX}*"):
+        with contextlib.suppress(OSError):
+            if stale.is_file():
+                stale.unlink()
 
 
 def _load_manifest(output_dir: Path) -> dict:
@@ -134,12 +215,43 @@ def _collect_files(directory: Path) -> list[Path]:
     return files
 
 
+def _safe_size(path: Path) -> int:
+    """文件字节数;stat 失败按 0(永不触发深层复扫,失败不崩)。"""
+    with contextlib.suppress(OSError):
+        return path.stat().st_size
+    return 0
+
+
+def _rel_of(f: Path, output_dir: Path) -> str:
+    """树内文件 → 正斜杠 rel(manifest/候选队列的统一键形态);树外文件退文件名。"""
+    try:
+        return str(f.relative_to(output_dir)).replace("\\", "/")
+    except ValueError:
+        return f.name
+
+
+def _bump_total(total_files: int, added: int) -> tuple[int, bool]:
+    """全树文件数记账 + 守卫判定;越限由调用方打印与处置(两处消息不同)。"""
+    total_files += added
+    return total_files, total_files > resolve_max_total_files()
+
+
+def _already_extracted_sibling(path: Path) -> bool:
+    """同名 .extracted/ 兄弟目录已存在且非空(上层已递归解出该容器)。"""
+    sibling = path.parent / f"{path.name}.extracted"
+    try:
+        return sibling.is_dir() and any(sibling.iterdir())
+    except OSError:
+        return False
+
+
 def extract_guided(
     firmware_path: Path,
     output_dir: Path,
     max_depth: int = MAX_DEPTH,
     max_workers: int = 8,
     extractor=None,
+    deep_rescanner=None,
     check_docker: bool = True,
     resume: bool = False,
     scan_tree: bool = False,
@@ -152,6 +264,9 @@ def extract_guided(
         max_depth: 最大递归层数(默认 6)
         max_workers: binwalk 并行容器数(默认 8,用户拍板)
         extractor: 解包函数注入点(单测用 fake;None → _binwalk_extract_one)
+        deep_rescanner: 深层复扫注入点(单测用 fake;None → _deep_rescan)。
+                大体积无签名文件 finalize 前的守卫全偏移复扫(票04),
+                开关/阈值见 gates.resolve_deep_rescan_*
         check_docker: 是否检查 Docker/镜像(单测传 False 跳过)
         resume: 断点续解模式。固件文件可能已被改名进解包树,不检查存在性;
                 候选树从 manifest 重建(done continue 的 files)+ 树里未记录
@@ -179,6 +294,9 @@ def extract_guided(
     output_dir.mkdir(parents=True, exist_ok=True)
     if extractor is None:
         extractor = _binwalk_extract_one
+    if deep_rescanner is None:
+        deep_rescanner = _deep_rescan
+    _cleanup_deep_rescan_residue(output_dir)
 
     manifest = _load_manifest(output_dir)
     # 新 seq 从现有最大 seq+1 开始:断点续传时新产物绝不与旧同名冲突
@@ -209,7 +327,7 @@ def extract_guided(
                     continue
             except OSError:
                 continue
-            frel = str(f.relative_to(output_dir)).replace("\\", "/")
+            frel = _rel_of(f, output_dir)
             if frel in (_MANIFEST_NAME, ".step1_done") or frel in renamed:
                 continue
             if frel not in manifest:
@@ -293,9 +411,54 @@ def extract_guided(
             if action == "skip":
                 manifest[rel] = {"seq": -1, "depth": d, "action": "skip",
                                  "reason": reason, "done": True}
-            elif action == "finalize":
+            elif (action == "continue"
+                  and _already_extracted_sibling(path)):
+                # 防重复解包(票04 e2e 实测):同名 .extracted/ 兄弟目录已非空,
+                # 说明内容已被上层递归解出(binwalk -M 复扫产物的常态)——重解
+                # 只会把同一份 rootfs 铺两遍。纯文件系统检查,resume 天然一致;
+                # 兄弟目录不存在/为空时照常路由(7z 兜底机会保留)。
                 manifest[rel] = {"seq": -1, "depth": d, "action": "finalize",
-                                 "reason": reason, "sigs": sigs, "done": True}
+                                 "reason": "同名 .extracted 已非空(上层已递归解出),跳过重解",
+                                 "sigs": sigs, "done": True}
+            elif action == "finalize":
+                # 深层复扫(票04):无签名 finalize 的最后机会。只对
+                # FINALIZE_UNSIGNED_REASON 触发——文本/ELF(product)、SDK 容器、
+                # max_depth 终局、全树守卫等其余 finalize 一律不复扫;且
+                # ① 开关开 ② 体积 ≥ 阈值 ③ 全树守卫未触发 ④ 还有下一层
+                # 可供产物决策(d+1 < max_depth,否则复扫是纯浪费)。
+                if (reason == FINALIZE_UNSIGNED_REASON
+                        and resolve_deep_rescan_enabled()
+                        and not over_total
+                        and d + 1 < max_depth
+                        and _safe_size(path) >= resolve_deep_rescan_min_bytes()):
+                    seq = next_seq
+                    next_seq += 1
+                    try:
+                        rfiles, rstatus = deep_rescanner(path, seq, output_dir)
+                    except Exception as e:
+                        print(f"[Step1] 复扫异常 {rel}: {e}")
+                        rstatus, rfiles = "failed", []
+                    rec = {"seq": seq, "depth": d, "action": "finalize",
+                           "reason": reason, "sigs": sigs, "done": True,
+                           "deep_rescan": rstatus}
+                    if rstatus == "ok":
+                        rels = []
+                        for f in rfiles:
+                            frel = _rel_of(f, output_dir)
+                            rels.append(frel)
+                            next_candidates.append((f, d + 1, frel))
+                        rec["files"] = rels
+                        total_files, over = _bump_total(total_files, len(rfiles))
+                        if over:
+                            over_total = True
+                            print(f"[Step1] 全树文件数守卫: 已 {total_files} 文件,停止新增解包")
+                    elif rstatus == "over_guard":
+                        print(f"[Step1] deep_rescan over_guard: {rel} "
+                              f"复扫产出超限已删除(原件留树)")
+                    manifest[rel] = rec
+                else:
+                    manifest[rel] = {"seq": -1, "depth": d, "action": "finalize",
+                                     "reason": reason, "sigs": sigs, "done": True}
             else:  # continue
                 if over_total:
                     manifest[rel] = {"seq": -1, "depth": d, "action": "finalize",
@@ -353,20 +516,15 @@ def extract_guided(
                         "seq": seqs[id(path)], "depth": depth, "action": "continue",
                         "renamed_to": renamed_to,
                         "reason": reasons.get(id(path), ""),
-                        "files": [str(f.relative_to(output_dir)).replace("\\", "/")
-                                  for f in files],
+                        "files": [_rel_of(f, output_dir) for f in files],
                         "done": True,
                     }
-                    total_files += len(files)
-                    if total_files > resolve_max_total_files():
+                    total_files, over = _bump_total(total_files, len(files))
+                    if over:
                         over_total = True
                         print(f"[Step1] 全树文件数守卫: 已 {total_files} 文件,停止新增解包")
                     for f in files:
-                        try:
-                            frel = str(f.relative_to(output_dir)).replace("\\", "/")
-                        except ValueError:
-                            frel = f.name
-                        next_candidates.append((f, depth + 1, frel))
+                        next_candidates.append((f, depth + 1, _rel_of(f, output_dir)))
                 elif status == "over_guard":
                     over_guard_count += 1
                     manifest[rel] = {"seq": seqs[id(path)], "depth": depth,

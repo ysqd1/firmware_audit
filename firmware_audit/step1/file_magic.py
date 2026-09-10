@@ -66,6 +66,11 @@ _OFFSET_MAGIC_TABLE: list[tuple[int, bytes, str]] = [
 # 文本启发式:可打印占比阈值
 _TEXT_PRINTABLE_RATIO = 0.9
 
+# 无签名 finalize 的 reason 唯一出处:rule_decision 产出,extract_guided 的
+# 深层复扫触发条件消费(票04)。改文案必须走本常量——字面量散落会让触发
+# 判断与产出静默脱钩。
+FINALIZE_UNSIGNED_REASON = "无容器签名,留树(字符串审计可用 Step5 strings_query 兜底)"
+
 
 def sniff_magic(data: bytes, fname: str = "") -> list[str]:
     """嗅探文件头(前 4KB)命中魔数列表;无命中走文本启发式。
@@ -172,4 +177,4 @@ def rule_decision(sigs: list[str], fname: str = "", depth: int = 0) -> tuple[str
     hit = [s for s in sigs if s in container_sigs]
     if hit:
         return "continue", f"容器签名 {','.join(hit)},继续解包"
-    return "finalize", "无容器签名,留树(字符串审计可用 Step5 strings_query 兜底)"
+    return "finalize", FINALIZE_UNSIGNED_REASON
