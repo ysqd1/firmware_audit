@@ -28,16 +28,40 @@ CVE_CACHE_MOUNT = "/home/sandbox/.cache"
 CVE_CACHE_ENV = "FIRMWARE_AUDIT_CVE_CACHE_DIR"
 
 
-def resolve_cve_cache_dir(process_dir: Path) -> Path:
+def resolve_cve_cache_dir(process_dir: Path, env=None) -> Path:
     """CVE 缓存宿主目录:env FIRMWARE_AUDIT_CVE_CACHE_DIR 覆盖,缺省 per-target。
 
     缺省/空白 = process_dir/.cve_cache(与既有行为逐字节一致);env 非空时
     用指定目录(~ 展开),预热一次跨 target 复用。
+    env 参数供预检纯函数注入测试(缺省读真实环境变量,行为不变)。
     """
-    raw = os.environ.get(CVE_CACHE_ENV, "").strip()
+    raw = (os.environ if env is None else env).get(CVE_CACHE_ENV, "").strip()
     if raw:
         return Path(raw).expanduser()
     return process_dir / ".cve_cache"
+
+
+def _cache_has_cvedb(cache_dir: Path) -> bool:
+    """cvedb 库判据:cve-bin-tool 3.4 缓存根 <cache>/cve-bin-tool/ 下有 *.db
+    (cve.db 主库 + version_map.db;实测预热库两 db 并存,有其一即可用)。"""
+    root = cache_dir / "cve-bin-tool"
+    return root.is_dir() and any(root.glob("*.db"))
+
+
+def cve_cache_preflight_warning(process_dir: Path, env=None) -> str | None:
+    """Step5 启动预检(2026-09-11 票01):CVE 缓存无库时返回一行警告,有库返回 None。
+
+    只告警不阻断、不改工具行为(工单定稿:不做自动回退共享库,写并发另议)。
+    没有它,recon 会在码 40 "Database does not exist" 三连败后静默放弃,
+    survey.components=0 全审计无 CVE 数据且运行结束无人知晓(target/5 基线实测)。
+    """
+    cache = resolve_cve_cache_dir(process_dir, env)
+    if _cache_has_cvedb(cache):
+        return None
+    return (f"预检告警: CVE 缓存库缺失({cache}),cve_bin_tool_scan 将报 "
+            f"'Database does not exist' 且 recon 拿不到任何 CVE 数据。"
+            f"修法: 设 {CVE_CACHE_ENV}=firmware_audit/.cve_cache 指向预热共享库"
+            f"(预热命令见 README)")
 
 
 class CveBinToolScanTool(AgentTool):

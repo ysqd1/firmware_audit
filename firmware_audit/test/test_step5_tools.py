@@ -556,6 +556,60 @@ def test_cve_cache_dir_env(tmp_path: Path) -> list[str]:
     return fails
 
 
+def test_cve_cache_preflight_warning() -> list[str]:
+    """票01:Step5 启动预检纯函数——空库给带修法提示的警告,有库 None,env 注入同源生效。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        proc = root / "p"
+        proc.mkdir()
+
+        # 空工作区(无 .cve_cache)→ 警告,含 env 变量名(修法)与实际解析目录
+        w = cbt.cve_cache_preflight_warning(proc, env={})
+        if not w or "FIRMWARE_AUDIT_CVE_CACHE_DIR" not in w:
+            fails.append(f"空库应给含修法提示的警告, got: {w}")
+        if w and str(proc / ".cve_cache") not in w:
+            fails.append(f"警告应指明实际解析的缓存目录, got: {w}")
+
+        # env 指到有库目录 → None;env 指到空目录 → 警告且指向 env 目录
+        ready = root / "shared"
+        (ready / "cve-bin-tool").mkdir(parents=True)
+        (ready / "cve-bin-tool" / "cve.db").write_text("", encoding="utf-8")
+        if cbt.cve_cache_preflight_warning(
+                proc, env={cbt.CVE_CACHE_ENV: str(ready)}) is not None:
+            fails.append("共享库就绪(cve-bin-tool/*.db 存在)应零告警")
+        void = root / "void"
+        w2 = cbt.cve_cache_preflight_warning(
+            proc, env={cbt.CVE_CACHE_ENV: str(void)})
+        if not w2 or str(void) not in w2:
+            fails.append(f"env 指到空目录应告警且指向该目录, got: {w2}")
+
+        # 库判据稳健性:仅 version_map.db 也算有库(3.4 实测两 db 并存)
+        map_only = root / "map_only" / "cve-bin-tool"
+        map_only.mkdir(parents=True)
+        (map_only / "version_map.db").write_text("", encoding="utf-8")
+        if cbt.cve_cache_preflight_warning(
+                proc,
+                env={cbt.CVE_CACHE_ENV: str(map_only.parent)}) is not None:
+            fails.append("仅有 version_map.db 也应视为有库")
+    return fails
+
+
+def test_env_example_documents_cve_cache() -> list[str]:
+    """票01:.env.example 应含激活的 FIRMWARE_AUDIT_CVE_CACHE_DIR= 行与一行注释。"""
+    fails: list[str] = []
+    p = Path(__file__).resolve().parents[1] / ".env.example"
+    lines = p.read_text(encoding="utf-8").splitlines()
+    hit = [ln for ln in lines if ln.startswith("FIRMWARE_AUDIT_CVE_CACHE_DIR=")]
+    if not hit:
+        fails.append(".env.example 缺激活的 FIRMWARE_AUDIT_CVE_CACHE_DIR= 行(票01 需求1)")
+    elif "firmware_audit/.cve_cache" not in hit[0]:
+        fails.append(f"FIRMWARE_AUDIT_CVE_CACHE_DIR 应指向共享预热库, got: {hit[0]}")
+    if not any(ln.startswith("#") and "CVE 缓存" in ln for ln in lines):
+        fails.append("FIRMWARE_AUDIT_CVE_CACHE_DIR 应配一行中文注释")
+    return fails
+
+
 def test_main() -> int:
     # 纯单测组:不依赖 target/1 工件,SKIP 门槛之外先跑
     standalone_failures = 0

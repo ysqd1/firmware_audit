@@ -1010,6 +1010,61 @@ def test_unreviewed_section_through_step5_run() -> list[str]:
     return fails
 
 
+def test_preflight_warning_printed_at_startup() -> list[str]:
+    """票01:step5_run 启动路径消费预检——缓存无库打印告警行(先于无 key 终止),
+    缓存就绪零输出。"""
+    import contextlib
+    import io
+
+    from firmware_audit.step5_agent.providers.llm_client import LLMError
+    from firmware_audit.step5_agent.providers.tools import cve_bin_tool_scan as cbt
+    from firmware_audit.step5_agent.run_step5 import step5_run
+
+    fails: list[str] = []
+    old = os.environ.get(cbt.CVE_CACHE_ENV)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            ws = root / "fresh"
+            (ws / "extracted").mkdir(parents=True)
+
+            class _NoKeyLLM:
+                available = False
+
+            # 默认 per-target 空库 → 启动输出含告警行(带修法提示)
+            os.environ.pop(cbt.CVE_CACHE_ENV, None)
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                try:
+                    step5_run(ws, llm=_NoKeyLLM())
+                    fails.append("无 key 应抛 LLMError")
+                except LLMError:
+                    pass
+            out = buf.getvalue()
+            if "预检告警" not in out or "FIRMWARE_AUDIT_CVE_CACHE_DIR" not in out:
+                fails.append(f"启动输出应含预检告警行, got: {out[:300]}")
+
+            # 缓存就绪 → 零告警
+            ready = root / "shared"
+            (ready / "cve-bin-tool").mkdir(parents=True)
+            (ready / "cve-bin-tool" / "cve.db").write_text("", encoding="utf-8")
+            os.environ[cbt.CVE_CACHE_ENV] = str(ready)
+            buf2 = io.StringIO()
+            with contextlib.redirect_stderr(buf2):
+                try:
+                    step5_run(ws, llm=_NoKeyLLM())
+                except LLMError:
+                    pass
+            if "预检告警" in buf2.getvalue():
+                fails.append(f"缓存就绪应零告警, got: {buf2.getvalue()[:300]}")
+    finally:
+        if old is None:
+            os.environ.pop(cbt.CVE_CACHE_ENV, None)
+        else:
+            os.environ[cbt.CVE_CACHE_ENV] = old
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
