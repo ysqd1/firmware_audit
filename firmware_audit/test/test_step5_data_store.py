@@ -51,6 +51,68 @@ def test_extract_json_object() -> list[str]:
     return fails
 
 
+# 票02(target/5 e2e 实测缩样):recon Final Answer 在字符串值里过度转义。
+# 真实字节:role_evidence 中 \" 是合法转义(10 处),唯一非法转义是 \$(\$SERVER);
+# json.loads 报 Invalid \escape → extract_json_object 返回 None → survey 降级
+# .md → 编排层按弹性机制全额补跑 recon(白烧约 50 万 token)。
+# 源码字串里 \\$ 产生原文的 \$,\\" 产生原文的 \"(与降级 survey.md 字节一致)。
+T5_OVERESCAPE_RAW = (
+    '侦察结论 {\n'
+    '  "schema_version": 3,\n'
+    '  "arch_snapshot": {\n'
+    '    "top_level_dirs": ["bin", "etc_ro", "www"],\n'
+    '    "components_grouped": [\n'
+    '      {"name": "bin/lighttpd", "size": null, "role": "主 web 服务器",\n'
+    '       "role_evidence": ["etc_ro/lighttpd/lighttpd.conf: server.port = 80, '
+    '\\$SERVER[\\"socket\\"] == \\"0.0.0.0:443\\" ssl.engine enable"]}\n'
+    '    ]\n'
+    '  },\n'
+    '  "summary": "攻击面概览"\n'
+    '} 全文完'
+)
+
+
+def test_extract_json_object_overescape_repair() -> list[str]:
+    """票02:过度转义修复保守档——原文解析失败且错误类型为 Invalid \\escape 时,
+    剥掉非法转义的反斜杠后重试;接受条件三合一(原文确属该错误类型/归一化后
+    能完整解析/通过工件形状校验),缺一维持 None 降级,不产"修出来的错数据"。
+
+    fixture = target/5 实测缩样(降级 survey.md components_grouped 片段)。
+    验收:
+    1. 先红:现状返回 None;后绿:返回 dict 且 schema 形状正确,
+       role_evidence 解码后含 $SERVER["socket"] == "0.0.0.0:443"
+    2. 反向:真损坏(修复触发但仍解析失败)→ 照旧 None
+    3. 反向:修复能解析但形状不符(无 survey/finding 结构键)→ None
+    4. \\uXXXX 类转义错误行为不变(保持降级;门槛语义见实现结构)
+    """
+    fails: list[str] = []
+    obj = extract_json_object(T5_OVERESCAPE_RAW)
+    if obj is None:
+        fails.append("缩样应经修复档解析为 dict(先红:现状为 None)")
+        return fails
+    if obj.get("schema_version") != 3 or not isinstance(obj.get("arch_snapshot"), dict):
+        fails.append(f"schema 形状应正确(survey v3): {obj}")
+    grouped = (obj.get("arch_snapshot") or {}).get("components_grouped") or []
+    if len(grouped) != 1 or grouped[0].get("name") != "bin/lighttpd":
+        fails.append(f"components_grouped 应完整解析: {grouped}")
+    ev = " ".join(grouped[0].get("role_evidence") or [])
+    if '$SERVER["socket"] == "0.0.0.0:443"' not in ev:
+        fails.append(f"role_evidence 应解码过度转义为原文语义: {ev!r}")
+    # 反向 1:修复档触发但归一化后仍解析失败 → 照旧 None(降级路径不变)
+    if extract_json_object('{"schema_version": 3, "summary": "截断 \\$x') is not None:
+        fails.append("真损坏 JSON(修复后仍失败)应照旧 None")
+    # 反向 2:修复能解析但形状不符(无任何 survey/finding 结构键)→ None
+    if extract_json_object('{"note": "cost \\$5"}') is not None:
+        fails.append("修复后形状不符应 None(保守,不产修复数据)")
+    # 反向 3:其他转义错误类型(\uXXXX)行为不变——保持降级 None。
+    # 注:\u 是合法转义对、不会被剥,故本例对"类型门槛"不敏感(删门也过),
+    # 它锁的是 \uXXXX 类错误整体不被修复档触碰的行为;门槛由实现结构保证。
+    if extract_json_object(
+            '{"arch_snapshot": {"dirs": ["x"]}, "summary": "bad \\uZZZZ escape"}') is not None:
+        fails.append("Invalid \\uXXXX escape 类错误应保持降级 None(不进修复档)")
+    return fails
+
+
 def test_save_aggregate_and_roundtrip() -> list[str]:
     fails: list[str] = []
     with tempfile.TemporaryDirectory() as td:
@@ -129,6 +191,7 @@ def test_main() -> int:
     failures = 0
     for name, fn in [
         ("extract_json_object", test_extract_json_object),
+        ("extract_json_object_overescape_repair", test_extract_json_object_overescape_repair),
         ("save_aggregate_and_roundtrip", test_save_aggregate_and_roundtrip),
         ("stamp_provenance_policies", test_stamp_provenance_policies),
         ("rewrite_artifact", test_rewrite_artifact),

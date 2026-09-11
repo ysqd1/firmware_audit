@@ -255,17 +255,79 @@ def extract_json_object(text: str) -> dict | None:
 
     宽容 JSON 提取的单一出处(T6 收编):survey 解析与编排层 report.json
     副产品共用;调用方先剥围栏(strip_fence)。非 dict/解析失败返回 None。
+
+    过度转义修复保守档(票02,2026-09-11):原文解析失败且错误类型恰为
+    Invalid \\escape 时,剥掉非法转义的反斜杠重试一次。接受条件三合一,缺一
+    维持 None 降级:①原文确属该错误类型(Invalid \\uXXXX 等不触发);
+    ②归一化后能完整解析;③解析结果通过工件形状校验(_artifact_shaped,
+    survey v3 键或 findings 容器)。target/5 实测:recon Final Answer 字符串值
+    里 \\$SERVER 的 \\$ 是唯一非法转义(\\\" 均合法),整份 14787 字符合格侦察
+    因它降级 → 编排层白烧约 50 万 token 补跑。
     """
     if not text:
         return None
     start, end = text.find("{"), text.rfind("}")
     if start == -1 or end <= start:
         return None
+    cand = text[start : end + 1]
     try:
-        obj = json.loads(text[start : end + 1])
+        obj = json.loads(cand)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError as e:
+        # startswith 而非全等:不同 CPython 构建/版本的解码器 msg 可能带后缀
+        # (如 repr 形态);"Invalid \uXXXX escape" 等其他错误不会误匹配
+        if not e.msg.startswith("Invalid \\escape"):
+            return None
+    repaired = _strip_invalid_escapes(cand)
+    try:
+        obj = json.loads(repaired)
     except json.JSONDecodeError:
         return None
-    return obj if isinstance(obj, dict) else None
+    if isinstance(obj, dict) and _artifact_shaped(obj):
+        return obj
+    return None
+
+
+# 合法 JSON 字符串转义字符("\/ b f n r t u;\\ 与 \u 靠第二个字符落在此集合放行)
+_JSON_VALID_ESCAPES = frozenset('"\\/bfnrtu')
+
+# 工件形状校验键(票02 修复档接受条件 3):survey v3 结构键或 findings 容器键,
+# 至少其一存在才接受修复结果——防止"归一化碰巧能解析"的错误数据混进工件链。
+# 只收结构键(schema_version 是值不受验的标签,不入选);键集与 _normalize_survey
+# 的 survey v3 输出键平行,survey 结构演进时需同步(现状规模可接受,不抽单一出处)。
+_ARTIFACT_SHAPE_KEYS = ("arch_snapshot", "components", "entry_points",
+                        "high_risk_areas", "recommended_actions")
+
+
+def _strip_invalid_escapes(text: str) -> str:
+    """剥掉非法转义的反斜杠(纯函数,票02):\\X 且 X ∉ 合法转义集 → X。
+
+    线性扫描合法转义对(含 \\\\ 与 \\u)原样保留,避免把"合法反斜杠对 +
+    非法转义"(如 \\\\$)二次破坏;只处理字符串内部形态,结构字符不碰。
+    """
+    out: list[str] = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\" and i + 1 < n:
+            if text[i + 1] in _JSON_VALID_ESCAPES:
+                out.append(text[i:i + 2])
+            else:
+                out.append(text[i + 1])
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _artifact_shaped(obj) -> bool:
+    """工件形状校验(票02):dict 含 findings 列表或任一 survey v3 结构键。"""
+    if not isinstance(obj, dict) or not obj:
+        return False
+    if isinstance(obj.get("findings"), list):
+        return True
+    return any(k in obj for k in _ARTIFACT_SHAPE_KEYS)
 
 
 _REMOVE = object()
