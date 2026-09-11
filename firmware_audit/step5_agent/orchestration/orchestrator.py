@@ -139,6 +139,8 @@ Action Input: {"conclusion": "<审计结论>"}
 禁止编造未在素材中出现的 finding/路径/统计。
 
 报告写作纪律(ADR-0007 对账红线,逐条强制执行;系统会用机器对账核对):
+- 条目标题必须**逐字复制**素材里该条 finding 的 title 原文:禁止缩写、改写、
+  删路径、增删字词或重排语序——标题是对账的匹配钥匙,对不上即记 unmatched 假警报
 - 每条 finding 的 severity/confidence/verified 枚举值**逐字抄写**素材里的原值
   (工件 verified_findings.json 是唯一真值),禁止改写或凭印象补写——素材
   confidence=low 就写 low,不得写 high

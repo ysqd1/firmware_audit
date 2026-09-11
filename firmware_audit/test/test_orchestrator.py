@@ -2145,7 +2145,9 @@ def test_orchestrator_prompt_reconcile_redlines() -> list[str]:
     for needle in ("逐字抄写", "唯一真值", "禁止引用或", "转述其他条目的 rationale",
                    "跨条目串条", "保留工件 rationale 的核心事实与限定", "**位置：**",
                    "**severity：**", "**置信度：**", "**复核结论：**", "初值",
-                   "不得只写在详情散文里"):
+                   "不得只写在详情散文里",
+                   # 票05:标题逐字复制红线(标题是对账匹配钥匙)
+                   "逐字复制", "禁止缩写", "删路径", "标题是对账的匹配钥匙"):
         if needle not in prompt:
             fails.append(f"提示词应含对账红线 '{needle}'")
     return fails
@@ -2205,6 +2207,163 @@ def test_reconcile_edge_robustness() -> list[str]:
         fails.append(f"HIGH 分区下三条 severity 均应提取成功,不得 unparsed: {s}")
     if "rationale_warnings" in s:
         fails.append("summary 不应再含 rationale_warnings(理由内容不检查)")
+    return fails
+
+
+# ---- 票05(target5-e2e-fixes,2026-09-11):对账假警报双侧修 ----
+# 匹配侧缩样 = target/5 e2e 实测对照:orchestrator 写报告时把工件标题缩写
+# (WebDAV 条目 98→67 字符,中间删路径 /etc_ro/lighttpd/lighttpd.user;storage/
+# SVN/rsstest 三条尾部截断),归一化精确相等全灭 → 4/7 unmatched 假警报,
+# 内容与 severity 实际零差异。标题逐字取自实测产物。
+
+_T5_PFX = "extracted/000002_decompressed.bin.extracted/8AB758/decompressed.bin.extracted/0"
+
+# 工件侧 = target/5 verified_findings.json 缩样(标题/file/confidence/severity 原值)
+FUZZY_FINDINGS = [
+    {"title": "rcS 无条件启动 telnetd 且运行时生成密码字段为空的 UID0 /bin/sh passwd, 叠加串口裸 shell",
+     "severity": "high", "confidence": "medium", "verified": True,
+     "file": f"{_T5_PFX}/etc_ro/rcS"},
+    {"title": "webdav.sh 启动的 8080 端口 WebDAV 对全路径可写且 basic auth 的 userfile /etc_ro/lighttpd/lighttpd.user 缺失且无生成逻辑",
+     "severity": "high", "confidence": "medium", "verified": True,
+     "file": f"{_T5_PFX}/etc_ro/lighttpd/lighttpd_webdav.conf"},
+    {"title": "storage.sh 创建密码字段为空且 shell 为 /bin/sh 的 anonymous(UID 500)账号并生成匿名 FTP 配置, 与无条件 telnetd 链式叠加",
+     "severity": "medium", "confidence": "medium", "verified": True,
+     "file": f"{_T5_PFX}/sbin/storage.sh"},
+    {"title": "固件内两处 SVN 1.6 工作副本残留泄露内网仓库 URL/开发者用户名/UUID(www/.svn 与 www/rsstest/.svn)",
+     "severity": "low", "confidence": "high", "verified": True,
+     "file": f"{_T5_PFX}/www/.svn/entries"},
+    {"title": "www/rsstest/ 遗留 5 个无认证 RSS 测试页, fwupgrade_test.asp 为无凭据固件上传表单(POST /goform/rssfwupgd.xgi)",
+     "severity": "low", "confidence": "medium", "verified": True,
+     "file": f"{_T5_PFX}/www/rsstest/fwupgrade_test.asp"},
+    {"title": "chpasswd.sh 将明文口令经命令行参数传入并落盘 /tmp/tmpchpw 后再喂给 chpasswd",
+     "severity": "low", "confidence": "high", "verified": True,
+     "file": f"{_T5_PFX}/sbin/chpasswd.sh"},
+]
+
+# 报告侧标题 = target/5 report.md 实测形态
+T5_EXACT = ("rcS 无条件启动 telnetd 且运行时生成密码字段为空的 UID0 /bin/sh "
+            "passwd,叠加串口裸 shell")            # 仅逗号后空格差异,归一化即等(精确匹配)
+T5_DELPATH = ("webdav.sh 启动的 8080 端口 WebDAV 对全路径可写且 basic auth 的 "
+              "userfile 缺失且无生成逻辑")          # 67 字符,中间删路径(difflib 0.818 兜底)
+T5_TRUNC1 = ("storage.sh 创建密码字段为空且 shell 为 /bin/sh 的 anonymous(UID 500)"
+             "账号并生成匿名 FTP 配")               # 尾部截断(前缀兜底)
+T5_TRUNC2 = "固件内两处 SVN 1.6 工作副本残留泄露内网仓库 URL/开发者用户名/UUID"
+T5_TRUNC3 = ("www/rsstest/ 遗留 5 个无认证 RSS 测试页,fwupgrade_test.asp "
+             "为无凭据固件上传表单")                # severity 故意错报 low→medium
+T5_CHPASSWD = "chpasswd.sh 将明文口令经命令行参数传入并落盘 /tmp/tmpchpw 后再喂给 chpasswd"
+T5_GHOST = "telnetd 服务由外部配置按需拉起,存在关闭手段"   # 真不一致条目(须保持 unmatched)
+
+FUZZY_MD = f"""# 固件安全审计报告
+## 发现清单
+### HIGH
+#### 1. {T5_EXACT}
+- **位置：** `{_T5_PFX}/etc_ro/rcS`
+- **severity：** high
+- **置信度：** medium → **复核结论：✓ 已证实**
+#### 2. {T5_DELPATH}
+- **位置：** `{_T5_PFX}/etc_ro/lighttpd/lighttpd_webdav.conf`
+- **severity：** high
+- **置信度：** medium → **复核结论：✓ 已证实**
+#### 3. {T5_TRUNC1}
+- **位置：** `{_T5_PFX}/sbin/storage.sh`
+- **severity：** medium
+- **置信度：** medium → **复核结论：✓ 已证实**
+### LOW
+#### 4. {T5_TRUNC2}
+- **位置：** `{_T5_PFX}/www/.svn/entries`
+- **severity：** low
+- **置信度：** high → **复核结论：✓ 已证实**
+#### 5. {T5_TRUNC3}
+- **位置：** `{_T5_PFX}/www/rsstest/fwupgrade_test.asp`
+- **severity：** medium
+- **置信度：** medium → **复核结论：✓ 已证实**
+#### 6. {T5_CHPASSWD}
+- **位置：** `{_T5_PFX}/sbin/chpasswd.sh`
+- **severity：** low
+- **置信度：** high → **复核结论：✓ 已证实**
+## 误报剔除
+### ✗ fwupload.cgi 将调用者传入的字符串参数直接传给 system() 执行(存疑保留)
+- **位置：** `{_T5_PFX}/sbin/fwupload.cgi`
+- **severity：** high
+- **置信度：** low → **复核结论：** ✗ 误报
+#### 7. {T5_GHOST}
+- **位置：** `{_T5_PFX}/etc_ro/rcS`
+- **severity：** high
+- **置信度：** medium → **复核结论：✓ 已证实**
+"""
+
+
+def test_reconcile_fuzzy_title_fallback() -> list[str]:
+    """票05:对账匹配模糊兜底——归一化精确相等失败后,标题前缀一致或 difflib
+    序列重合度 ≥0.8 视为同一 finding;仍失败才 unmatched。
+
+    fixture = target/5 实测缩样(67/98 字符标题对照),先红:现状 4 条缩写
+    全 unmatched;后绿:4 条全部 matched 且确定性事实比对正常。
+    验收:
+    1. 4 条缩写条目(中间删路径 + 3 条尾部截断)全部 fuzzy matched;
+       内容零差异的 3 条 status=ok
+    2. 精确匹配语义不变(条目 1 仅标点差异 → exact)
+    3. 反向:真不一致条目(标题不对应任何 finding)仍 unmatched(match=none)
+    4. 模糊匹配不改变确定性比对:matched 条目 severity 错报(low→medium)仍 mismatch
+    5. match 字段留痕 + summary.fuzzy 计数(标题漂移对操作者可见)
+    6. 分区头关闭条目(target/5 实测):误报剔除区 ### ✗ 条目的标签行
+       (file=fwupload/severity=high/confidence=low)不得串写进前一条目 6
+    """
+    fails: list[str] = []
+    from firmware_audit.step5_agent.orchestration.reconciliation import reconcile_report
+    result = reconcile_report(FUZZY_MD, FUZZY_FINDINGS)
+    items = result.get("items", [])
+    if len(items) != 7:
+        fails.append(f"应解析 7 个条目(✗ 误报条目是无编号 3# 分区,不入条目): {len(items)}")
+        return fails
+    by_title = {it.get("title"): it for it in items}
+    # 1. 后绿:4 条缩写条目全部 fuzzy matched;内容零差异的 3 条 ok
+    for t, want_ok in ((T5_DELPATH, True), (T5_TRUNC1, True),
+                       (T5_TRUNC2, True), (T5_TRUNC3, False)):
+        it = by_title.get(t)
+        if it is None:
+            fails.append(f"缩写条目应被解析: {t[:30]}…")
+            continue
+        if it.get("matched") is not True or it.get("match") != "fuzzy":
+            fails.append(f"缩写条目应 fuzzy matched: {t[:30]}… → "
+                         f"match={it.get('match')} status={it.get('status')}")
+        want = "ok" if want_ok else "mismatch"
+        if it.get("status") != want:
+            fails.append(f"缩写条目 status 应为 {want}: {t[:30]}… → "
+                         f"{it.get('status')} checks={it.get('checks')}")
+    # 4. severity 错报(low→medium)确定性比对不受模糊匹配影响
+    drift = by_title.get(T5_TRUNC3, {}).get("checks", {}).get("severity", {})
+    if drift.get("ok") is not False or drift.get("artifact") != "low" \
+            or drift.get("report") != "medium":
+        fails.append(f"severity 错报应 ok=False 并带双方原值: {drift}")
+    # 2. 精确匹配语义不变
+    exact = by_title.get(T5_EXACT)
+    if not exact or exact.get("match") != "exact" or exact.get("status") != "ok":
+        fails.append(f"仅标点差异条目应 exact matched ok: "
+                     f"match={exact and exact.get('match')} status={exact and exact.get('status')}")
+    # 6. 误报剔除区 ### ✗ 的标签行不得串写进前一条目(条目 6 紧邻 ✗ 分区)
+    ch = by_title.get(T5_CHPASSWD)
+    if not ch or ch.get("match") != "exact" or ch.get("status") != "ok":
+        fails.append(f"条目 6 应 exact ok: {ch and (ch.get('match'), ch.get('status'))}")
+    else:
+        for key, want in (("file", f"{_T5_PFX}/sbin/chpasswd.sh"),
+                          ("severity", "low"), ("confidence", "high")):
+            c = ch.get("checks", {}).get(key, {})
+            if c.get("report") != want or c.get("ok") is not True:
+                fails.append(f"条目 6 的 {key} 被 ✗ 分区标签串写污染: {c}")
+    # 3. 反向:真不一致仍 unmatched
+    ghost = by_title.get(T5_GHOST)
+    if not ghost or ghost.get("matched") is not False or ghost.get("status") != "unmatched":
+        fails.append(f"真不一致条目应保持 unmatched: {ghost and ghost.get('status')}")
+    if ghost and ghost.get("match") != "none":
+        fails.append(f"unmatched 条目 match 应为 none: {ghost.get('match')}")
+    # 5. 汇总留痕:fuzzy 计数让标题漂移在 summary 层可见
+    s = result.get("summary", {})
+    if s.get("fuzzy") != 4:
+        fails.append(f"summary.fuzzy 应为 4(4 条缩写匹配): {s}")
+    if s.get("matched") != 6 or s.get("ok") != 5 or s.get("mismatch") != 1 \
+            or s.get("unmatched") != 1:
+        fails.append(f"summary 计数应 matched=6/ok=5/mismatch=1/unmatched=1: {s}")
     return fails
 
 
@@ -2371,6 +2530,7 @@ def test_main() -> int:
         ("report_reconciliation_integration", test_report_reconciliation_integration),
         ("orchestrator_prompt_reconcile_redlines", test_orchestrator_prompt_reconcile_redlines),
         ("reconcile_edge_robustness", test_reconcile_edge_robustness),
+        ("reconcile_fuzzy_title_fallback", test_reconcile_fuzzy_title_fallback),
         ("normalize_file_paths", test_normalize_file_paths),
         ("verify_single_brief_pointers", test_verify_single_brief_pointers),
         ("escalation_discipline_prompts", test_escalation_discipline_prompts),
