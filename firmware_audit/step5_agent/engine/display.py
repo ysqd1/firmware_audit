@@ -10,8 +10,9 @@ ReAct 循环的可选观察层:react_loop 在各事件点喂本模块,这里只�
   observation(step,tool,text,ok,elapsed,truncated,obs_file)
                                             工具结果(OK/Error/耗时/截断指针)
   system(step,text)                         系统事件(协议错误/同参拦截/零工具拒绝/强制收尾)
-  final(step,payload)                       Final Answer 被接受输出(findings 计数)
-  done(name,artifact,findings,steps,usage)  阶段完成(轮数/总耗时/token)
+  final(step,payload)                       Final Answer 被接受输出(findings/观察点 计数)
+  done(name,artifact,count,steps,usage,label="findings")
+                                            阶段完成(轮数/总耗时/token;标签随调用方,票03)
 
 配置(环境变量,统一走 make_display 构造):
   STEP5_DISPLAY  0|none|off = 关闭; 2|full = 完整模式(Observation 多行);
@@ -167,12 +168,14 @@ class TerminalDisplay:
     def final(self, step: int, payload: str) -> None:
         self._emit(f"{self._tag(step, _MAGENTA, '结论')}  {self._final_summary(payload)}")
 
-    def done(self, name: str, artifact: str, findings: int, steps: int,
-             usage: dict) -> None:
+    def done(self, name: str, artifact: str, count: int, steps: int,
+             usage: dict, label: str = "findings") -> None:
+        """阶段完成行;计数标签随调用方传入(票03:recon 传"观察点"——survey
+        工件无 findings 字段,按 findings 渲染违反 CONTEXT.md 词汇纪律)。"""
         dt = time.time() - self._t0 if self._t0 else 0.0
         tokens = sum(usage.get(k, 0) for k in ("prompt_tokens", "completion_tokens"))
         self._emit(self._c(
-            _GREEN, f"── {name} 完成 · {artifact} · {findings} findings · "
+            _GREEN, f"── {name} 完成 · {artifact} · {count} {label} · "
                     f"{steps} 轮 · {dt:.1f}s · {tokens} tokens"))
 
     def phase_done(self, name: str, artifact: str, instances: int,
@@ -195,15 +198,21 @@ class TerminalDisplay:
     # ---- 内部 ----
 
     def _final_summary(self, payload: str) -> str:
-        """Final Answer 摘要:能解析出 findings 就报数,否则截断原文。"""
+        """Final Answer 摘要:能解析出 findings/观察点 就报数,否则截断原文。
+
+        findings 优先(analysis/verification 容器);recon 的 survey 载荷无
+        findings 字段,报 high_risk_areas 观察点数(票03,词汇纪律)。"""
         s = payload.strip()
         m = _FENCE_RE.search(s)
         if m:
             s = m.group(1)
         try:
             obj = json.loads(s)
-            if isinstance(obj, dict) and isinstance(obj.get("findings"), list):
-                return f"{len(obj['findings'])} findings(详见工件)"
+            if isinstance(obj, dict):
+                if isinstance(obj.get("findings"), list):
+                    return f"{len(obj['findings'])} findings(详见工件)"
+                if isinstance(obj.get("high_risk_areas"), list):
+                    return f"{len(obj['high_risk_areas'])} 观察点(详见工件)"
         except (json.JSONDecodeError, ValueError):
             pass
         return self._clip(payload, 100)

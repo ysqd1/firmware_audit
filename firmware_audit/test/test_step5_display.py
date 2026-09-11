@@ -131,6 +131,45 @@ def test_final_summary_fallback() -> list[str]:
     return fails
 
 
+def test_recon_observe_label() -> list[str]:
+    """票03(target5-e2e-fixes):recon 显示标签改"观察点"——recon v3 明令禁止
+    findings 字段(CONTEXT.md 词汇纪律),完成行/结论行按 findings 渲染曾把
+    survey 观察点误报成 "11 findings",e2e 时被误读为守护被绕过。
+
+    验收:
+    1. recon done 行:调用方传 label="观察点" → "N 观察点",不含 findings
+    2. recon 结论行:载荷为 survey JSON(high_risk_areas,无 findings 键)
+       → 报 "N 观察点(详见工件)"
+    3. analysis/verification 不变:默认 label 仍 findings;findings 载荷优先于
+       观察点分支(容器可同时带两键)
+    """
+    fails: list[str] = []
+    # recon:done 标签随调用方传入 + 结论行观察点分支
+    d = _cap_display()
+    d.final(3, '{"schema_version": 3, "high_risk_areas": [{}, {}, {}]}')
+    d.done("recon", "survey.json", 3, 5, {}, label="观察点")
+    out = d.out.getvalue()
+    if "recon 完成 · survey.json · 3 观察点" not in out:
+        fails.append(f"recon 完成行应显示 观察点 计数: {out}")
+    if "3 观察点(详见工件)" not in out:
+        fails.append(f"recon 结论行(survey 载荷)应报观察点数: {out}")
+    if "findings" in out:
+        fails.append(f"recon 输出不得含 findings 标签: {out}")
+    # analysis/verification:默认 label 与 findings 载荷分支不变
+    d2 = _cap_display()
+    d2.final(1, '{"summary": "s", "findings": [{"title": "a"}]}')
+    d2.done("analysis", "findings.json", 1, 4, {})
+    out2 = d2.out.getvalue()
+    if "1 findings" not in out2 or "观察点" in out2:
+        fails.append(f"analysis/verification 输出应保持 findings 标签: {out2}")
+    # 载荷同时含两键时 findings 优先(不破坏既有容器判读)
+    d3 = _cap_display()
+    d3.final(1, '{"findings": [{"title": "a"}], "high_risk_areas": [{}, {}]}')
+    if "1 findings" not in d3.out.getvalue():
+        fails.append("findings 载荷应优先于观察点分支")
+    return fails
+
+
 # ---- NullDisplay / make_display 配置矩阵 ----
 
 def test_make_display_env() -> list[str]:
@@ -335,7 +374,9 @@ def test_runner_banner_end_to_end(capsys) -> list[str]:
         for want in ("── recon · 侦察", "── analysis · 深度分析",
                      "── verification · 复核", "── orchestrator · 编排",
                      "调用  read_file", "调用  dispatch_agent",
-                     "recon 完成 · survey.json"):
+                     # 票03:recon 完成行标签锚定(RECON_FINAL 顶层 findings 被拒,
+                     # survey 无 high_risk_areas → 0 观察点);analysis 仍 findings
+                     "recon 完成 · survey.json · 0 观察点"):
             if want not in out:
                 fails.append(f"runner 端到端缺: {want!r}")
     finally:
@@ -353,6 +394,7 @@ def test_main() -> int:
         ("error_observation_and_clip", test_error_observation_and_clip),
         ("full_mode_multiline", test_full_mode_multiline),
         ("final_summary_fallback", test_final_summary_fallback),
+        ("recon_observe_label", test_recon_observe_label),
         ("make_display_env", test_make_display_env),
         ("react_loop_emits_events", test_react_loop_emits_events),
         ("react_loop_guard_events_shown", test_react_loop_guard_events_shown),

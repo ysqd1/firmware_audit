@@ -38,7 +38,7 @@ STEP5_DISPLAY=0 python -m firmware_audit.main target/1
 | `调用` | LLM 回复含 Action | 工具名 + 完整调用参数(JSON) |
 | `结果` | 工具执行返回 | `OK 耗时 · 首行内容` 或 `Error · 错误`;超长结果截断并附 `…全文 <obs路径>` 指针 |
 | `系统` | 协议错误 / 同参拦截(>3 次) / 零工具拒绝 / 迭代上限强制收尾 | 守卫干预说明 |
-| `结论` / `完成` | Final Answer 被接受 / 阶段结束 | findings 计数 / 工件名 / 轮数 / 总耗时 / token |
+| `结论` / `完成` | Final Answer 被接受 / 阶段结束 | findings/观察点 计数(recon 为观察点,词汇纪律)/ 工件名 / 轮数 / 总耗时 / token |
 
 ## 运行效果(真实捕获,STEP5_COLOR=0)
 
@@ -48,8 +48,8 @@ STEP5_DISPLAY=0 python -m firmware_audit.main target/1
 [01] 思考  先看工件
 [01] 调用  read_file({"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5})
 [01] 结果  OK 0.02s · [analysis/unitree/bin/idlc.imports.json 第 1-1 行,共 1 行]
-[02] 结论  1 findings(详见工件)
-── recon 完成 · survey.json · 1 findings · 2 轮 · 0.0s · 0 tokens
+[02] 结论  1 观察点(详见工件)
+── recon 完成 · survey.json · 1 观察点 · 2 轮 · 0.0s · 0 tokens
 
 ── analysis · 深度分析 ──────────────────────────
 [01] 思考  取证

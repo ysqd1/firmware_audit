@@ -80,7 +80,7 @@ def _tools():
 
 
 def run_scene(title: str, replies: list[str], findings: int = 0,
-              max_iters: int = 8) -> None:
+              max_iters: int = 8, label: str = "findings") -> None:
     disp = make_display()
     disp.stage("demo-" + title.lower(), title, 3, "scripted", max_iters)
     with tempfile.TemporaryDirectory() as td:
@@ -88,18 +88,19 @@ def run_scene(title: str, replies: list[str], findings: int = 0,
         r = run_react_agent(ScriptedLLM(replies), _tools(), "sys", "init",
                             max_iters=max_iters, transcript=tr, display=disp)
     disp.done("demo-" + title.lower(), "artifact.json", findings, r.steps,
-              {"prompt_tokens": 1200, "completion_tokens": 300})
+              {"prompt_tokens": 1200, "completion_tokens": 300}, label=label)
 
 
 def main() -> int:
-    # 场景1: 正常 + 超长截断
+    # 场景1: 正常 + 超长截断(recon 视角:v3 survey 载荷,标签"观察点",票03)
     run_scene("正常流程", [
         "Thought: 先确认这个自研二进制的保护属性,弱保护优先深挖。\n"
         'Action: checksec\nAction Input: {"file_ref": "unitree/bin/idlc"}',
         "Thought: 导入表太大,直接拉全文。\n"
         'Action: big\nAction Input: {}',
-        'Final Answer: {"summary": "攻击面:1 个弱保护自研二进制", "findings": [{"title": "idlc 无 Canary", "severity": "medium"}]}',
-    ], findings=1)
+        'Final Answer: {"summary": "攻击面:1 个弱保护自研二进制", '
+        '"high_risk_areas": [{"file": "unitree/bin/idlc", "metric": "imports"}]}',
+    ], findings=1, label="观察点")
 
     # 场景2: 工具崩溃 + 同参拦截
     run_scene("异常防御", [

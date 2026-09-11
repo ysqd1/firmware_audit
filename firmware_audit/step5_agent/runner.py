@@ -199,23 +199,28 @@ def run_agent(cfg: AgentConfig, process_dir: Path, base_llm: LLMClient,
             parsed = (parse_survey_artifact(react.final_answer) if cfg.name == "recon"
                       else parse_artifact(react.final_answer))
         out_path = out_base / cfg.output_name
-        if cfg.name == "recon":
+        is_recon = cfg.name == "recon"
+        if is_recon:
             result.artifact_path = save_survey(out_path, cfg.name, parsed,
                                                react.final_answer or "")
-            findings_n = len((parsed or {}).get("high_risk_areas", []))
+            items_n = len((parsed or {}).get("high_risk_areas", []))
         else:
             result.artifact_path = save_artifact(out_path, cfg.name, parsed,
                                                  react.final_answer or "")
-            findings_n = len((parsed or {}).get("findings", []))
+            items_n = len((parsed or {}).get("findings", []))
 
         if not react.ok:
             result.error = "" if parsed else "未产出可解析 Final Answer(工件已降级 .md)"
+        # 票03:recon 产物是 survey(无 findings 字段),标签用"观察点"
+        # (CONTEXT.md 词汇纪律);analysis/verification 仍按 findings 渲染
+        label = "观察点" if is_recon else "findings"
         if disp.enabled:
-            disp.done(cfg.name, result.artifact_path.name, findings_n,
-                      react.steps, result.usage)
+            disp.done(cfg.name, result.artifact_path.name, items_n,
+                      react.steps, result.usage, label=label)
         else:
+            unit = "个观察点" if is_recon else "条 finding"   # analysis 文案逐字不变
             print(f"[step5:{cfg.name}] 完成: {result.artifact_path.name}"
-                  f"({findings_n} 条 finding,"
+                  f"({items_n} {unit},"
                   f"{react.steps} 轮,工具 {len(react.tool_calls)} 次,usage={result.usage})", flush=True)
     except LLMError:
         raise  # API 调用失败:立即终止,不降级(向上传播中止 Step5)
