@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from .base import AgentTool, ToolResult
 from .cli_base import container_path
-from .r2_base import parse_r2_json, run_r2
+from .r2_base import fcn_name_to_addr, parse_r2_json, run_r2
 
 
 class R2XrefQueryTool(AgentTool):
@@ -34,6 +34,9 @@ class R2XrefQueryTool(AgentTool):
         # axtj 查 data/code 引用;符号名宽容补前缀
         if not (sym.startswith("sym.") or sym.startswith("fcn.") or sym.startswith("sub.")):
             sym = f"sym.imp.{sym}"
+        # fcn.<hex> 跨会话不保证可解析 → 转地址(票04);必须在补前缀之后,
+        # 否则转出的 0x* 会被上面再补 sym.imp. 前缀
+        sym = fcn_name_to_addr(sym)
         rc, out, err = run_r2(
             self.ctx, cpath,
             # -e bin.relocs.apply=true: 2026-08-22 实发 r2 对未应用重定位的

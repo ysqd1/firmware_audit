@@ -12,6 +12,7 @@ run_in_sandbox 保证。
 from __future__ import annotations
 
 import json
+import re
 
 from .base import resolve_within
 from .cli_base import container_path, extracted_root, run_in_sandbox
@@ -127,3 +128,19 @@ def parse_r2_json(out: str) -> list | None:
 def sanitize_func_or_addr(target: str) -> bool:
     """func_or_addr 是否只含安全字符(符号名/地址形态)。False = 拒绝执行。"""
     return bool(target) and all(ch in _FUNC_ADDR_SAFE for ch in target)
+
+
+# fcn.<hex> 只接纯 hex:fcn. 后带其他字符(如 fcn.zzz)不是 r2 地址命名形态,不动
+_FCN_HEX_RE = re.compile(r"^fcn\.([0-9a-fA-F]+)$")
+
+
+def fcn_name_to_addr(target: str) -> str:
+    """fcn.<hex> → 0x<hex>(票04);其余名字形态原样透传。
+
+    fcn.<hex> 是某次 r2 会话内分析的产物,而每次工具调用都是全新 r2 进程,
+    跨会话不保证可解析(e2e 实测两撞 "Relocs has not been applied" 无产出,
+    同目标裸地址恒成功);flags 本质按地址命名,转地址后恒可解析。调用方在
+    strip 后、sanitize/补前缀处使用(见 r2_disassemble_function / r2_xref_query)。
+    """
+    m = _FCN_HEX_RE.match(target)
+    return f"0x{m.group(1)}" if m else target

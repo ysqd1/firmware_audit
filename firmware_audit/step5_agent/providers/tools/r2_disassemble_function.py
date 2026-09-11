@@ -11,6 +11,7 @@ from .base import AgentTool, ToolResult
 from .r2_base import (
     container_elf_path,
     elf_guard,
+    fcn_name_to_addr,
     run_r2,
     sanitize_func_or_addr,
 )
@@ -33,7 +34,7 @@ class R2DisassembleFunctionTool(AgentTool):
         guard = elf_guard(self.ctx, file_ref)
         if guard:
             return ToolResult(ok=False, text="", error=guard)
-        target = func_or_addr.strip()
+        target = fcn_name_to_addr(func_or_addr.strip())
         if not sanitize_func_or_addr(target):
             return ToolResult(
                 ok=False, text="",

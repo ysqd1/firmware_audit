@@ -403,6 +403,32 @@ def test_xref_symbol_prefix(ctx) -> list[str]:
     return fails
 
 
+def test_xref_fcn_symbol_becomes_addr(ctx) -> list[str]:
+    """票04:symbol=fcn.<hex> 应在下发前转地址形态,且不得再补 sym.imp. 前缀
+    (fcn. 名是某次会话内产物,跨会话不保证可解析;裸地址恒成功)。"""
+    import firmware_audit.step5_agent.providers.tools.r2_base as r2_base
+    import firmware_audit.step5_agent.providers.tools.r2_xref_query as xq
+    from firmware_audit.test.replay_spy import ReplaySpy, patched
+    fails: list[str] = []
+    out = ('anal warn\n'
+           '[{"from": "0x104ea0", "fcn_name": "main", "type": "CALL"}]')
+    spy = ReplaySpy((1, out, ""))
+    restore = patched(r2_base, run_in_sandbox=spy)
+    try:
+        r = xq.R2XrefQueryTool(ctx).execute(file_ref="bin/app", symbol="fcn.004010c0")
+    finally:
+        restore()
+    if not r.ok:
+        fails.append(f"fcn.名转地址后 xref 应以 stdout 解析为准: {r.error}")
+    else:
+        cmd = " ".join(spy.last["args"][0])
+        if "axtj 0x004010c0" not in cmd:
+            fails.append(f"axtj 目标应为地址形态: {cmd}")
+        if "fcn." in cmd or "sym.imp.0x" in cmd:
+            fails.append(f"fcn.名不应原样下发、地址不应再补前缀: {cmd}")
+    return fails
+
+
 # ---------- C. 输入解析(畸形 Action Input) ----------
 
 def test_malformed_inputs(ctx) -> list[str]:
@@ -619,6 +645,7 @@ def test_main() -> int:
             ("gitleaks_scan_output_split", lambda: test_gitleaks_scan_output_split(c)),
             ("semgrep_exit_whitelist", lambda: test_semgrep_exit_whitelist(c)),
             ("xref_symbol_prefix", lambda: test_xref_symbol_prefix(c)),
+            ("xref_fcn_symbol_becomes_addr", lambda: test_xref_fcn_symbol_becomes_addr(c)),
             ("malformed_inputs", lambda: test_malformed_inputs(c)),
             ("container_path_security", lambda: test_container_path_security(c)),
             ("run_in_sandbox_absolute_mounts", test_run_in_sandbox_absolute_mounts),

@@ -169,6 +169,56 @@ def test_disassemble_ok_and_miss_hint() -> list[str]:
     return fails
 
 
+def test_fcn_name_to_addr_pure() -> list[str]:
+    """票04 纯函数:fcn.<hex> → 0x<hex>;其余名字形态(0x*/sym.*/sub.*等)原样透传。"""
+    f = r2_base.fcn_name_to_addr
+    fails: list[str] = []
+    cases = [
+        ("fcn.004010c0", "0x004010c0"),   # 验收主形态
+        ("fcn.00001040", "0x00001040"),   # 前导零保留
+        ("fcn.0040FF00", "0x0040FF00"),   # 大写 hex 容忍
+        ("fcn.0", "0x0"),                 # 最短合法
+        ("0x004010c0", "0x004010c0"),     # 地址原样透传
+        ("sym.main", "sym.main"),         # 符号名原样透传
+        ("sym.imp.system", "sym.imp.system"),
+        ("sub.monkey_401070", "sub.monkey_401070"),
+        ("fcn.zzz", "fcn.zzz"),           # fcn. 后非 hex 不动(其余形态行为不变)
+        ("fcn.", "fcn."),                 # 空 hex 不动
+        ("", ""),                         # 空串不崩
+    ]
+    for inp, want in cases:
+        got = f(inp)
+        if got != want:
+            fails.append(f"fcn_name_to_addr({inp!r}) = {got!r}, 应为 {want!r}")
+    return fails
+
+
+def test_disassemble_fcn_target_becomes_addr() -> list[str]:
+    """票04 工具级:func_or_addr=fcn.<hex> 实际下发的是地址形态(跨会话
+    fcn. 名不保证可解析,e2e 实测无产出;裸地址恒成功)。"""
+    fails: list[str] = []
+    spy = ReplaySpy((0, "0x004010c0  push rbp\n", ""))
+    restore = _install(spy)
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            ctx = _make_ctx(Path(td))
+            r = R2DisassembleFunctionTool(ctx).execute(file_ref="bin/app",
+                                                       func_or_addr="fcn.004010c0")
+    finally:
+        restore()
+    if not r.ok:
+        fails.append(f"fcn.名转地址后应命中: {r.error}")
+    else:
+        cmd = " ".join(spy.last["args"][0])
+        if "af @ 0x004010c0" not in cmd or "pdf @ 0x004010c0" not in cmd:
+            fails.append(f"下发命令应为地址形态: {cmd}")
+        if "fcn.004010c0" in cmd:
+            fails.append(f"fcn.名不应原样下发: {cmd}")
+        if (r.data or {}).get("target") != "0x004010c0":
+            fails.append(f"data.target 应为实际下发的地址: {r.data}")
+    return fails
+
+
 def test_disassemble_rejects_unsafe_target() -> list[str]:
     """危险字符目标(命令拼接面)工具层拒绝,零容器调用。"""
     fails: list[str] = []
@@ -214,6 +264,8 @@ def test_main() -> int:
         ("list_functions_failure_guides_downgrade", test_list_functions_failure_guides_downgrade),
         ("list_functions_non_elf_and_escape", test_list_functions_non_elf_and_escape),
         ("disassemble_ok_and_miss_hint", test_disassemble_ok_and_miss_hint),
+        ("fcn_name_to_addr_pure", test_fcn_name_to_addr_pure),
+        ("disassemble_fcn_target_becomes_addr", test_disassemble_fcn_target_becomes_addr),
         ("disassemble_rejects_unsafe_target", test_disassemble_rejects_unsafe_target),
         ("disassemble_non_elf_guard", test_disassemble_non_elf_guard),
     ]:
