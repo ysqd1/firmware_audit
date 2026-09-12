@@ -66,35 +66,27 @@ class ToolAuthorizationError(ValueError):
     """工具不存在或未授权给请求角色。"""
 
 
-def _contract(
-    tool_type: type[AgentTool],
-    roles: frozenset[str],
-    replay_policy: ReplayPolicy,
-) -> ToolContract:
-    return ToolContract(tool_type, roles, replay_policy)
-
-
 # 单一审计表：顺序沿用原注册表，角色集合严格来自 ADR-0012。CVE/公开查询
 # 工具保留实现供未来独立模式设计，但 Blind Discovery 三角色均不可见。
 _TOOL_CONTRACTS: tuple[ToolContract, ...] = (
-    _contract(FindDecompiledFunctionTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(ImportsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(StringsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(ReadFileTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(ListFilesTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(SearchCodeTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(R2ListFunctionsTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(R2DisassembleFunctionTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(R2XrefQueryTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(GhidraDecompileTool, _DEEP_ROLES, ReplayPolicy.CACHE_VALIDATED),
-    _contract(ChecksecTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(CveBinToolScanTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(CveLookupTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(SemgrepScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(GitleaksScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(SandboxVerifyTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(BinwalkRescanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
-    _contract(WebSearchTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(FindDecompiledFunctionTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(ImportsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(StringsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(ReadFileTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(ListFilesTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(SearchCodeTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(R2ListFunctionsTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(R2DisassembleFunctionTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(R2XrefQueryTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(GhidraDecompileTool, _DEEP_ROLES, ReplayPolicy.CACHE_VALIDATED),
+    ToolContract(ChecksecTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(CveBinToolScanTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(CveLookupTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(SemgrepScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(GitleaksScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(SandboxVerifyTool, _DEEP_ROLES, ReplayPolicy.NEVER),
+    ToolContract(BinwalkRescanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    ToolContract(WebSearchTool, _NO_ROLES, ReplayPolicy.NEVER),
 )
 
 _CONTRACT_BY_NAME = {contract.name: contract for contract in _TOOL_CONTRACTS}
@@ -118,11 +110,16 @@ def authorize_tool(role: str, tool_name: str) -> ToolContract:
     if role not in BLIND_DISCOVERY_ROLES:
         tool_names_for_role(role)  # 统一未知角色错误文案
     contract = _CONTRACT_BY_NAME.get(tool_name)
+    available = ", ".join(tool_names_for_role(role))
     if contract is None:
-        raise ToolAuthorizationError(f"工具 {tool_name!r} 未注册，角色 {role} 无法调用")
+        raise ToolAuthorizationError(
+            f"工具 {tool_name!r} 未注册，角色 {role} 无法调用；"
+            f"可用工具: {available}"
+        )
     if role not in contract.roles:
         raise ToolAuthorizationError(
-            f"Blind Discovery 角色 {role} 无权调用工具 {tool_name}"
+            f"Blind Discovery 角色 {role} 无权调用工具 {tool_name}；"
+            f"可用工具: {available}。请改用已授权工具或提交当前调查建议"
         )
     return contract
 

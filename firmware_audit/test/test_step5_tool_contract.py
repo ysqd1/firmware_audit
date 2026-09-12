@@ -271,6 +271,8 @@ def test_tools_declare_replay_policy() -> list[str]:
         name: policies.READ_ONLY_IDEMPOTENT for name in _CONTRACT_TOOLS
     }
     expected["ghidra_decompile"] = policies.CACHE_VALIDATED
+    expected["sandbox_verify"] = policies.NEVER
+    expected["web_search"] = policies.NEVER
     actual = {name: contract.replay_policy for name, contract in contracts.items()}
     if actual != expected:
         fails.append(f"现有工具 replay policy 审计结果漂移: {actual}")
@@ -336,6 +338,8 @@ def test_role_contract_rejects_unauthorized_action() -> list[str]:
             detail = str(exc)
             if "recon" not in detail or tool_name not in detail:
                 fails.append(f"拒绝文案应含角色与工具名: {detail}")
+            if "可用工具" not in detail:
+                fails.append(f"拒绝文案应指引该角色的可用工具: {detail}")
         else:
             fails.append(f"recon 越权动作应被契约拒绝: {tool_name}")
 
