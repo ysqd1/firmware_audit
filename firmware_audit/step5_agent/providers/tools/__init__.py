@@ -1,14 +1,18 @@
-"""Agent 工具注册表。
+"""Agent 工具注册与 Blind Discovery 授权契约。
 
 每工具一个子类文件;make_tools() 按上下文实例化,ReAct 循环按 name 分发。
 工具分三类:
   CLI 类(checksec/cve_bin_tool_scan/r2_* 族/semgrep_scan/gitleaks_scan/binwalk_rescan)
   API 类(cve_lookup/web_search)
   读盘类(rest)
-make_tools(exclude=...) 支持按 name 排除可选工具(如 cve_bin_tool_scan 对嵌入式
-交叉库误报偏多,可运行时关闭),骨架不变。
+每条注册记录同时声明角色权限与中断重放策略，未来 Host 只查本契约，不根据
+工具名或提示词猜测。make_tools(exclude=...) 保留完整 legacy 工具实例化能力；
+Blind Discovery 调用方必须先经 tool_names_for_role/authorize_tool 授权。
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
 
 from .base import AgentTool, ToolContext, ToolResult
 from .binwalk_rescan import BinwalkRescanTool
@@ -30,50 +34,135 @@ from .semgrep_scan import SemgrepScanTool
 from .strings_query import StringsQueryTool
 from .web_search import WebSearchTool
 
-# 默认开启的完整工具集(新增工具在此登记)
-_DEFAULT_TOOLS: tuple[type[AgentTool], ...] = (
-    FindDecompiledFunctionTool,
-    ImportsQueryTool,
-    StringsQueryTool,
-    ReadFileTool,
-    ListFilesTool,
-    SearchCodeTool,
-    R2ListFunctionsTool,
-    R2DisassembleFunctionTool,
-    R2XrefQueryTool,
-    GhidraDecompileTool,
-    ChecksecTool,
-    CveBinToolScanTool,
-    CveLookupTool,
-    SemgrepScanTool,
-    GitleaksScanTool,
-    SandboxVerifyTool,
-    BinwalkRescanTool,
-    WebSearchTool,
+
+BLIND_DISCOVERY_ROLES = ("recon", "analysis", "verification")
+_DEEP_ROLES = frozenset(("analysis", "verification"))
+_ALL_ROLES = frozenset(BLIND_DISCOVERY_ROLES)
+_NO_ROLES: frozenset[str] = frozenset()
+
+
+class ReplayPolicy(str, Enum):
+    """Host 遇到只有 ``tool_started`` 的调用时可采取的恢复策略。"""
+
+    READ_ONLY_IDEMPOTENT = "read_only_idempotent"
+    CACHE_VALIDATED = "cache_validated"
+    NEVER = "never"
+
+
+@dataclass(frozen=True)
+class ToolContract:
+    """单个工具的工厂、Blind Discovery 权限与中断重放元数据。"""
+
+    tool_type: type[AgentTool]
+    roles: frozenset[str]
+    replay_policy: ReplayPolicy
+
+    @property
+    def name(self) -> str:
+        return self.tool_type.name
+
+
+class ToolAuthorizationError(ValueError):
+    """工具不存在或未授权给请求角色。"""
+
+
+def _contract(
+    tool_type: type[AgentTool],
+    roles: frozenset[str],
+    replay_policy: ReplayPolicy,
+) -> ToolContract:
+    return ToolContract(tool_type, roles, replay_policy)
+
+
+# 单一审计表：顺序沿用原注册表，角色集合严格来自 ADR-0012。CVE/公开查询
+# 工具保留实现供未来独立模式设计，但 Blind Discovery 三角色均不可见。
+_TOOL_CONTRACTS: tuple[ToolContract, ...] = (
+    _contract(FindDecompiledFunctionTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(ImportsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(StringsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(ReadFileTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(ListFilesTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(SearchCodeTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(R2ListFunctionsTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(R2DisassembleFunctionTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(R2XrefQueryTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(GhidraDecompileTool, _DEEP_ROLES, ReplayPolicy.CACHE_VALIDATED),
+    _contract(ChecksecTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(CveBinToolScanTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(CveLookupTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(SemgrepScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(GitleaksScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(SandboxVerifyTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(BinwalkRescanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    _contract(WebSearchTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
 )
 
+_CONTRACT_BY_NAME = {contract.name: contract for contract in _TOOL_CONTRACTS}
 
-def make_tools(ctx: ToolContext, exclude: set[str] | None = None) -> dict[str, AgentTool]:
-    """实例化工具注册表。exclude:按 name 排除的可选工具集合(如 {"cve_bin_tool_scan"})。
+
+def tool_contracts() -> dict[str, ToolContract]:
+    """返回按工具名索引的注册契约副本，供 Host 审计和恢复决策。"""
+    return dict(_CONTRACT_BY_NAME)
+
+
+def tool_names_for_role(role: str) -> tuple[str, ...]:
+    """返回角色在 Blind Discovery 中可见的工具名，保持注册顺序。"""
+    if role not in BLIND_DISCOVERY_ROLES:
+        allowed = ", ".join(BLIND_DISCOVERY_ROLES)
+        raise ToolAuthorizationError(f"未知 Agent 角色 {role!r}；允许值: {allowed}")
+    return tuple(contract.name for contract in _TOOL_CONTRACTS if role in contract.roles)
+
+
+def authorize_tool(role: str, tool_name: str) -> ToolContract:
+    """校验角色的单次工具 Action，并返回其重放契约。"""
+    if role not in BLIND_DISCOVERY_ROLES:
+        tool_names_for_role(role)  # 统一未知角色错误文案
+    contract = _CONTRACT_BY_NAME.get(tool_name)
+    if contract is None:
+        raise ToolAuthorizationError(f"工具 {tool_name!r} 未注册，角色 {role} 无法调用")
+    if role not in contract.roles:
+        raise ToolAuthorizationError(
+            f"Blind Discovery 角色 {role} 无权调用工具 {tool_name}"
+        )
+    return contract
+
+
+def make_tools(
+    ctx: ToolContext,
+    exclude: set[str] | None = None,
+    *,
+    role: str | None = None,
+) -> dict[str, AgentTool]:
+    """实例化工具注册表；role 非空时只构造该角色获授权的工具。
+
+    exclude 按 name 排除可选工具集合(如 {"cve_bin_tool_scan"})。
 
     未显式传 exclude 时读环境变量 STEP5_EXCLUDE_TOOLS(逗号分隔)作为默认排除集,
     便于运行时关闭误报偏多的工具而不改代码(骨架不变)。
 
-    exclude 里的名字若不在 _DEFAULT_TOOLS 中会静默忽略(注册表幂等)。
+    exclude 里的名字若不在 _TOOL_CONTRACTS 中会静默忽略(注册表幂等)。
     """
+    allowed = set(tool_names_for_role(role)) if role is not None else None
     if exclude is None:  # 支持环境变量运行时排除(显式传 exclude 优先,否则用 env)
         import os
         raw = os.environ.get("STEP5_EXCLUDE_TOOLS", "")
         exclude = {n.strip() for n in raw.split(",") if n.strip()}
-    tools = {t.name: t(ctx) for t in _DEFAULT_TOOLS if t.name not in exclude}
+    tools = {
+        contract.name: contract.tool_type(ctx)
+        for contract in _TOOL_CONTRACTS
+        if contract.name not in exclude
+        and (allowed is None or contract.name in allowed)
+    }
     if exclude:
-        skipped = [n for n in exclude if n in {t.name for t in _DEFAULT_TOOLS}]
+        skipped = [n for n in exclude if n in _CONTRACT_BY_NAME]
         if skipped:
             print(f"[tools] 可选工具已排除: {', '.join(sorted(skipped))}")
     return tools
 
 
 __all__ = ["AgentTool", "ToolContext", "ToolResult", "make_tools",
+           "ReplayPolicy", "ToolContract", "ToolAuthorizationError",
+           "tool_contracts", "tool_names_for_role", "authorize_tool",
            "FindDecompiledFunctionTool", "ImportsQueryTool", "StringsQueryTool",
            "ReadFileTool", "ListFilesTool", "SearchCodeTool", "ChecksecTool",
            "R2ListFunctionsTool", "R2DisassembleFunctionTool", "R2XrefQueryTool",

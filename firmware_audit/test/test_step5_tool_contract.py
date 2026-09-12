@@ -244,6 +244,107 @@ def test_read_file_valid_params_pass_through() -> list[str]:
     return fails
 
 
+def test_tools_declare_replay_policy() -> list[str]:
+    """注册契约审计每个工具的中断重放策略，不从工具名推断。"""
+    fails: list[str] = []
+    from firmware_audit.step5_agent.providers import tools as tools_module
+
+    required_api = ("ReplayPolicy", "tool_contracts")
+    missing_api = [name for name in required_api if not hasattr(tools_module, name)]
+    if missing_api:
+        return [f"工具注册表缺重放契约 API: {missing_api}"]
+
+    policies = tools_module.ReplayPolicy
+    contracts = tools_module.tool_contracts()
+    if len(contracts) != len(_CONTRACT_TOOLS) or set(contracts) != set(_CONTRACT_TOOLS):
+        fails.append(
+            f"重放契约必须覆盖全部注册工具: contracts={sorted(contracts)}"
+        )
+        return fails
+
+    legal = set(policies)
+    for name, contract in contracts.items():
+        if contract.replay_policy not in legal:
+            fails.append(f"{name} replay_policy 非法: {contract.replay_policy!r}")
+
+    expected = {
+        name: policies.READ_ONLY_IDEMPOTENT for name in _CONTRACT_TOOLS
+    }
+    expected["ghidra_decompile"] = policies.CACHE_VALIDATED
+    actual = {name: contract.replay_policy for name, contract in contracts.items()}
+    if actual != expected:
+        fails.append(f"现有工具 replay policy 审计结果漂移: {actual}")
+    return fails
+
+
+def test_blind_discovery_role_contract() -> list[str]:
+    """Blind Discovery 三角色只从注册契约取得固定工具权限。"""
+    fails: list[str] = []
+    from firmware_audit.step5_agent.providers import tools as tools_module
+
+    if not hasattr(tools_module, "tool_names_for_role"):
+        return ["工具注册表缺 tool_names_for_role 角色权限 API"]
+
+    shallow = {
+        "list_files", "read_file", "search_code", "strings_query",
+        "imports_query", "checksec", "semgrep_scan", "gitleaks_scan",
+        "binwalk_rescan",
+    }
+    deep = shallow | {
+        "r2_list_functions", "r2_disassemble_function", "r2_xref_query",
+        "ghidra_decompile", "sandbox_verify",
+    }
+    expected = {"recon": shallow, "analysis": deep, "verification": deep}
+    with tempfile.TemporaryDirectory() as td:
+        ctx = ToolContext(process_dir=Path(td))
+        for role, wanted in expected.items():
+            actual = set(tools_module.tool_names_for_role(role))
+            if actual != wanted:
+                fails.append(f"{role} Blind Discovery 工具集漂移: {sorted(actual)}")
+            try:
+                provisioned = tools_module.make_tools(ctx, role=role)
+            except TypeError as exc:
+                fails.append(f"make_tools 应支持按角色直接构造授权实例集: {exc}")
+            else:
+                if set(provisioned) != wanted:
+                    fails.append(
+                        f"{role} 实例化工具集绕过角色契约: {sorted(provisioned)}"
+                    )
+
+    forbidden = {"cve_bin_tool_scan", "cve_lookup", "web_search"}
+    for role in expected:
+        leaked = forbidden & set(tools_module.tool_names_for_role(role))
+        if leaked:
+            fails.append(f"{role} 不得获得公开问题知识工具: {sorted(leaked)}")
+    return fails
+
+
+def test_role_contract_rejects_unauthorized_action() -> list[str]:
+    """模型提出越权动作时由契约拒绝；调用方不靠过滤后的 dict 猜原因。"""
+    fails: list[str] = []
+    from firmware_audit.step5_agent.providers import tools as tools_module
+
+    required_api = ("ToolAuthorizationError", "authorize_tool")
+    missing_api = [name for name in required_api if not hasattr(tools_module, name)]
+    if missing_api:
+        return [f"工具注册表缺授权判定 API: {missing_api}"]
+
+    for tool_name in ("r2_list_functions", "ghidra_decompile", "web_search"):
+        try:
+            tools_module.authorize_tool("recon", tool_name)
+        except tools_module.ToolAuthorizationError as exc:
+            detail = str(exc)
+            if "recon" not in detail or tool_name not in detail:
+                fails.append(f"拒绝文案应含角色与工具名: {detail}")
+        else:
+            fails.append(f"recon 越权动作应被契约拒绝: {tool_name}")
+
+    allowed = tools_module.authorize_tool("analysis", "ghidra_decompile")
+    if allowed.name != "ghidra_decompile":
+        fails.append(f"合法授权应返回对应注册契约: {allowed}")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -258,6 +359,9 @@ def test_main() -> int:
         ("every_tool_rejects_invalid_params", test_every_tool_rejects_invalid_params),
         ("read_file_recursive_graceful", test_read_file_recursive_graceful),
         ("read_file_valid_params_pass_through", test_read_file_valid_params_pass_through),
+        ("tools_declare_replay_policy", test_tools_declare_replay_policy),
+        ("blind_discovery_role_contract", test_blind_discovery_role_contract),
+        ("role_contract_rejects_unauthorized_action", test_role_contract_rejects_unauthorized_action),
     ]:
         fl = fn()
         if fl:

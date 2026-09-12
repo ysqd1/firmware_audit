@@ -30,7 +30,6 @@ from pathlib import Path
 
 from .orchestration.orchestrator import Orchestrator
 from .providers.llm_client import LLMClient, LLMError
-from .providers.tools.cve_bin_tool_scan import cve_cache_preflight_warning
 
 
 def resolve_workspace(path: Path) -> Path:
@@ -87,12 +86,6 @@ def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
     if not (process_dir / "extracted").is_dir():
         raise FileNotFoundError(f"工作区无 extracted/ 解包产物: {process_dir}(先跑 Step1 解包)")
 
-    # 启动预检(2026-09-11 票01):CVE 缓存库缺失只告警不阻断;不告警时 recon
-    # 会在码 40 三连败后静默放弃,全审计无 CVE 数据且结束也无人知晓
-    cache_warn = cve_cache_preflight_warning(process_dir)
-    if cache_warn:
-        print(f"[step5] {cache_warn}", file=sys.stderr)
-
     base = llm or LLMClient()
     if not base.available:
         raise _no_key_error()
@@ -133,7 +126,6 @@ def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
         "usage": usage_total,
         "tool_calls": tool_total,
         "report": str(report) if report else None,
-        "cve_cache_warning": cache_warn,
     }
 
 

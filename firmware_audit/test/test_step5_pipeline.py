@@ -1010,9 +1010,8 @@ def test_unreviewed_section_through_step5_run() -> list[str]:
     return fails
 
 
-def test_preflight_warning_printed_at_startup() -> list[str]:
-    """票01:step5_run 启动路径消费预检——缓存无库打印告警行(先于无 key 终止),
-    缓存就绪零输出。"""
+def test_blind_discovery_startup_skips_cve_preflight() -> list[str]:
+    """ADR-0012:Blind Discovery 禁用 CVE 工具，启动不得探测相关缓存。"""
     import contextlib
     import io
 
@@ -1031,7 +1030,7 @@ def test_preflight_warning_printed_at_startup() -> list[str]:
             class _NoKeyLLM:
                 available = False
 
-            # 默认 per-target 空库 → 启动输出含告警行(带修法提示)
+            # 默认 per-target 空库也不得告警；禁用知识源不参与启动前置步骤。
             os.environ.pop(cbt.CVE_CACHE_ENV, None)
             buf = io.StringIO()
             with contextlib.redirect_stderr(buf):
@@ -1041,10 +1040,10 @@ def test_preflight_warning_printed_at_startup() -> list[str]:
                 except LLMError:
                     pass
             out = buf.getvalue()
-            if "预检告警" not in out or "FIRMWARE_AUDIT_CVE_CACHE_DIR" not in out:
-                fails.append(f"启动输出应含预检告警行, got: {out[:300]}")
+            if "预检告警" in out or "FIRMWARE_AUDIT_CVE_CACHE_DIR" in out:
+                fails.append(f"Blind Discovery 启动不得做 CVE 缓存预检, got: {out[:300]}")
 
-            # 缓存就绪 → 零告警
+            # 缓存就绪同样不应改变 Blind Discovery 启动行为。
             ready = root / "shared"
             (ready / "cve-bin-tool").mkdir(parents=True)
             (ready / "cve-bin-tool" / "cve.db").write_text("", encoding="utf-8")
