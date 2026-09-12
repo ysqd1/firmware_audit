@@ -37,6 +37,7 @@ TIER: dict[str, int] = {
     "": 0,               # step5_agent/__init__(对外只暴露 step5_run)
     "run_step5": 0,      # CLI 入口
     "demos": 0,          # 演示脚本子包(入口同层;T6 自顶层 demo_display 迁入)
+    "host": 1,           # ADR-0012 Host 控制层(迁移期与 legacy 编排并列)
     "orchestration": 1,  # 编排层包(ADR-0009)
     "runner": 2,         # 单 Agent 执行
     "aggregator": 2,     # findings 聚合纯逻辑
