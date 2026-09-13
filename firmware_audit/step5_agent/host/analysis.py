@@ -18,15 +18,25 @@ from pathlib import Path
 from typing import Any
 
 from ..providers.tools import ToolAuthorizationError, authorize_tool
-from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, truncate_text
-from .session import ActionProposal, FinalProposal, ProposalError
+from ..providers.tools.base import (
+    MAX_TEXT_CHARS,
+    ToolResult,
+    truncate_text,
+    validate_params,
+)
+from .session import ActionProposal, FinalProposal, ProposalError, parse_proposal
 
 EVIDENCE_SCHEMA_VERSION = 1
 SUMMARY_LIMIT = 500
+DEFAULT_TOOL_RESULT_LIMIT_BYTES = 16 * 1024 * 1024
 
 
 class ProposalRejectedError(ValueError):
     """Proposal 未通过完整守卫；本轮不得产生 Host 或工具副作用。"""
+
+
+class ToolResultLimitError(ValueError):
+    """工具违反有界结果契约；Host 不得截断后冒充完整 Evidence。"""
 
 
 @dataclass(frozen=True)
@@ -61,6 +71,8 @@ class Investigation:
     lifecycle_status: str = "queued"
     disposition: str | None = None
     stop_reason: str | None = None
+    closure_reason: str | None = None
+    closure_evidence: tuple[str, ...] = ()
     state: dict[str, Any] = field(default_factory=dict)
     evidence: list[EvidenceReference] = field(default_factory=list)
 
@@ -82,8 +94,12 @@ def _json_clone(value: Any, label: str) -> Any:
 
 def _observation_text(result: ToolResult) -> str:
     """取得 Evidence digest 与 Observation View 共用的原始字面文本。"""
+    if result.raw != "":
+        return result.raw
+    if result.text != "":
+        return result.text
     if result.ok:
-        return result.raw if result.raw != "" else result.text
+        return ""
     return f"Error: {result.error or '工具执行失败且未提供错误详情'}"
 
 
@@ -104,16 +120,21 @@ class HostAnalysisTracer:
         tools: dict[str, object],
         *,
         observation_view_limit: int = MAX_TEXT_CHARS,
+        tool_result_limit_bytes: int = DEFAULT_TOOL_RESULT_LIMIT_BYTES,
     ):
         if observation_view_limit < 1:
             raise ValueError("observation_view_limit 必须大于 0")
+        if tool_result_limit_bytes < 1:
+            raise ValueError("tool_result_limit_bytes 必须大于 0")
         self.run_dir = Path(run_dir)
         self.tools = dict(tools)
         self.observation_view_limit = observation_view_limit
+        self.tool_result_limit_bytes = tool_result_limit_bytes
         self._candidate_seq = 0
         self._evidence_seq = 0
         self._candidates: dict[str, Candidate] = {}
         self._investigations: dict[str, Investigation] = {}
+        self._claimed_sessions: list[object] = []
 
     def add_candidate(self, proposal: dict[str, Any]) -> Candidate:
         """分配 Candidate ID，并一一创建隔离的 queued Investigation。"""
@@ -140,13 +161,13 @@ class HostAnalysisTracer:
         investigation = self._current_investigation(candidate_id)
         if getattr(session, "role", None) != "analysis":
             raise ValueError("HostAnalysisTracer 只接受 role='analysis' 的 Agent Session")
+        if any(claimed is session for claimed in self._claimed_sessions):
+            raise ValueError("每个 Candidate 必须使用独立 Agent Session，不得跨调查复用")
+        self._claimed_sessions.append(session)
 
-        input_message: str | None = None
+        input_message: str | None = self._candidate_context(candidate_id)
         while True:
-            proposal = session.step(input_message)
-            if isinstance(proposal, ProposalError):
-                detail = proposal.feedback_message()
-                raise ProposalRejectedError(f"Agent Proposal 校验失败: {detail}")
+            proposal = self._validated_proposal(session.step(input_message))
             if isinstance(proposal, ActionProposal):
                 state_delta, arguments, tool = self._validate_action(proposal)
                 result = tool.execute(**arguments)
@@ -167,15 +188,63 @@ class HostAnalysisTracer:
                     raise ProposalRejectedError(
                         "单 Candidate Analysis tracer 当前只接受 close_investigation"
                     )
-                state_delta = self._validate_state_delta(proposal.state_delta)
+                state_delta, closure_reason, closure_evidence = self._validate_close(
+                    proposal.state_delta,
+                    investigation,
+                )
                 investigation.state.update(state_delta)
                 investigation.lifecycle_status = "finished"
                 investigation.disposition = "closed"
-                investigation.stop_reason = "completed"
+                investigation.stop_reason = "decisive_refutation"
+                investigation.closure_reason = closure_reason
+                investigation.closure_evidence = closure_evidence
                 return deepcopy(investigation)
+
+    def _candidate_context(self, candidate_id: str) -> str:
+        candidate = self._candidates[candidate_id]
+        payload = {
+            "candidate_id": candidate.candidate_id,
+            "investigation_id": self._investigations[candidate_id].investigation_id,
+            "proposal": candidate.proposal,
+        }
+        return (
+            "Analysis Candidate（本 Session 只调查此 Candidate）：\n"
+            + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        )
+
+    @staticmethod
+    def _validated_proposal(proposal: object) -> ActionProposal | FinalProposal:
+        """不信任 Session adapter：按纯 JSON 协议重新校验整份 Proposal。"""
+        if isinstance(proposal, ProposalError):
+            raise ProposalRejectedError(
+                f"Agent Proposal 校验失败: {proposal.feedback_message()}"
+            )
+        if isinstance(proposal, ActionProposal):
+            next_value = {
+                "kind": proposal.kind,
+                "tool": proposal.tool,
+                "arguments": proposal.arguments,
+            }
+        elif isinstance(proposal, FinalProposal):
+            next_value = {"kind": proposal.kind}
+        else:
             raise ProposalRejectedError(
                 f"Agent Session 返回了未知 Proposal 类型: {type(proposal).__name__}"
             )
+        try:
+            raw = json.dumps({
+                "decision_summary": proposal.decision_summary,
+                "state_delta": proposal.state_delta,
+                "next": next_value,
+            }, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ProposalRejectedError(f"Agent Proposal 必须是标准 JSON: {exc}") from exc
+        checked = parse_proposal(raw, "analysis")
+        if isinstance(checked, ProposalError):
+            raise ProposalRejectedError(
+                f"Agent Proposal 校验失败: {checked.feedback_message()}"
+            )
+        return checked
 
     def _current_investigation(self, candidate_id: str) -> Investigation:
         try:
@@ -197,9 +266,19 @@ class HostAnalysisTracer:
         state_delta = self._validate_state_delta(proposal.state_delta)
         arguments = _json_clone(proposal.arguments, "tool arguments")
         try:
-            authorize_tool("analysis", proposal.tool)
+            contract = authorize_tool("analysis", proposal.tool)
         except ToolAuthorizationError as exc:
             raise ProposalRejectedError(str(exc)) from exc
+        checked_arguments, argument_error = validate_params(
+            contract.tool_type.params,
+            arguments,
+        )
+        if argument_error is not None:
+            raise ProposalRejectedError(
+                f"工具 {proposal.tool} 参数未通过接口契约: {argument_error}"
+            )
+        assert checked_arguments is not None
+        arguments = _json_clone(checked_arguments, "normalized tool arguments")
         tool = self.tools.get(proposal.tool)
         if tool is None:
             raise ProposalRejectedError(
@@ -215,6 +294,37 @@ class HostAnalysisTracer:
             raise ProposalRejectedError("state_delta 必须是 JSON object")
         return _json_clone(state_delta, "state_delta")
 
+    @classmethod
+    def _validate_close(
+        cls,
+        state_delta: dict[str, Any],
+        investigation: Investigation,
+    ) -> tuple[dict[str, Any], str, tuple[str, ...]]:
+        """关闭必须说明决定性反证，并只引用本 Investigation 的 Evidence。"""
+        remaining = cls._validate_state_delta(state_delta)
+        reason = remaining.pop("closure_reason", None)
+        refs = remaining.pop("evidence_refs", None)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ProposalRejectedError(
+                "close_investigation 要求 state_delta.closure_reason 为非空字符串"
+            )
+        if (
+            not isinstance(refs, list)
+            or not refs
+            or any(not isinstance(item, str) or not item for item in refs)
+        ):
+            raise ProposalRejectedError(
+                "close_investigation 要求 state_delta.evidence_refs 为非空 Evidence ID 数组"
+            )
+        owned = {reference.evidence_id for reference in investigation.evidence}
+        unknown = [evidence_id for evidence_id in refs if evidence_id not in owned]
+        if unknown:
+            raise ProposalRejectedError(
+                "close_investigation 引用了不属于当前 Investigation 的 Evidence: "
+                + ", ".join(unknown)
+            )
+        return remaining, reason.strip(), tuple(refs)
+
     def _record_evidence(
         self,
         investigation: Investigation,
@@ -223,6 +333,18 @@ class HostAnalysisTracer:
         result: ToolResult,
     ) -> tuple[EvidenceReference, str]:
         """每次逻辑调用都分配新身份；digest 相同也写独立 Evidence。"""
+        tool_result = _json_clone(asdict(result), "ToolResult")
+        encoded_result = json.dumps(
+            tool_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded_result) > self.tool_result_limit_bytes:
+            raise ToolResultLimitError(
+                f"ToolResult 共 {len(encoded_result)} bytes，超过 Host 上界 "
+                f"{self.tool_result_limit_bytes} bytes；请让工具把大型产物独立落盘并返回指针"
+            )
         self._evidence_seq += 1
         sequence = self._evidence_seq
         evidence_id = f"ev-{sequence:06d}"
@@ -248,21 +370,31 @@ class HostAnalysisTracer:
         payload = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,
             **asdict(reference),
-            "tool_result": _json_clone(asdict(result), "ToolResult"),
+            "observation": observation,
+            "tool_result": tool_result,
         }
         evidence_path = self.run_dir / location
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        evidence_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        view = self._observation_view(reference, observation)
+        # Evidence 原文写入后不可修改；恢复编号由后续 Store 工单负责，当前
+        # tracer 遇到碰撞必须显式失败，绝不能用 write_text 静默覆盖。
+        with evidence_path.open("x", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            )
+        error = result.error if not result.ok else None
+        view = self._observation_view(reference, observation, error)
         return reference, view
 
-    def _observation_view(self, reference: EvidenceReference, observation: str) -> str:
+    def _observation_view(
+        self,
+        reference: EvidenceReference,
+        observation: str,
+        error: str | None,
+    ) -> str:
         body = truncate_text(observation, self.observation_view_limit)
+        status = f"Tool status: error; {error}\n" if error else "Tool status: ok\n"
         return (
-            f"Observation View [{reference.evidence_id}]\n{body}\n"
+            f"Observation View [{reference.evidence_id}]\n{status}{body}\n"
             f"Evidence Reference: {reference.evidence_id}; "
             f"original={reference.location}; sha256={reference.digest}"
         )

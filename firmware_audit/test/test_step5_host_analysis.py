@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from firmware_audit.step5_agent.host import (
     HostAnalysisTracer,
     ProposalError,
     ProposalRejectedError,
+    ToolResultLimitError,
     ValidationIssue,
 )
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
@@ -49,10 +51,18 @@ def _action(state_delta: dict, arguments: dict | None = None) -> ActionProposal:
     )
 
 
-def _close(state_delta: dict | None = None) -> FinalProposal:
+def _close(
+    evidence_refs: tuple[str, ...] = ("ev-000001",),
+    state_delta: dict | None = None,
+) -> FinalProposal:
+    delta = {
+        "closure_reason": "工具 Evidence 构成决定性反证",
+        "evidence_refs": list(evidence_refs),
+        **(state_delta or {}),
+    }
     return FinalProposal(
         decision_summary="现有材料足以结束本次调查",
-        state_delta=state_delta or {},
+        state_delta=delta,
         kind="close_investigation",
     )
 
@@ -74,7 +84,7 @@ def test_host_runs_one_candidate_and_preserves_distinct_evidence(tmp_path: Path)
     session = FakeSession([
         _action({"working_hypothesis": "配置可能暴露固定令牌"}, {"path": "extracted/etc/device.conf", "limit": 40}),
         _action({"checked_paths": ["extracted/etc/device.conf"]}, {"limit": 40, "path": "extracted/etc/device.conf"}),
-        _close({"closure_note": "重复读取结果一致"}),
+        _close(("ev-000001", "ev-000002"), {"closure_note": "重复读取结果一致"}),
     ])
 
     investigation = host.run_analysis(candidate.candidate_id, session)
@@ -83,7 +93,9 @@ def test_host_runs_one_candidate_and_preserves_distinct_evidence(tmp_path: Path)
     assert investigation.investigation_id == "inv-0001"
     assert investigation.lifecycle_status == "finished"
     assert investigation.disposition == "closed"
-    assert investigation.stop_reason == "completed"
+    assert investigation.stop_reason == "decisive_refutation"
+    assert investigation.closure_reason == "工具 Evidence 构成决定性反证"
+    assert investigation.closure_evidence == ("ev-000001", "ev-000002")
     assert investigation.state == {
         "working_hypothesis": "配置可能暴露固定令牌",
         "checked_paths": ["extracted/etc/device.conf"],
@@ -133,14 +145,16 @@ def test_candidate_ids_and_investigation_state_are_isolated(tmp_path: Path) -> N
     first = host.add_candidate({"target": "extracted/bin/one"})
     second = host.add_candidate({"target": "extracted/bin/two"})
 
-    first_result = host.run_analysis(first.candidate_id, FakeSession([
+    first_session = FakeSession([
         _action({"working_hypothesis": "first-only"}),
         _close(),
-    ]))
-    second_result = host.run_analysis(second.candidate_id, FakeSession([
+    ])
+    second_session = FakeSession([
         _action({"working_hypothesis": "second-only"}),
-        _close(),
-    ]))
+        _close(("ev-000002",)),
+    ])
+    first_result = host.run_analysis(first.candidate_id, first_session)
+    second_result = host.run_analysis(second.candidate_id, second_session)
 
     assert (first.candidate_id, second.candidate_id) == ("cand-0001", "cand-0002")
     assert (first_result.investigation_id, second_result.investigation_id) == (
@@ -152,6 +166,95 @@ def test_candidate_ids_and_investigation_state_are_isolated(tmp_path: Path) -> N
     assert [item.evidence_id for item in second_result.evidence] == ["ev-000002"]
     assert first_result.evidence[0].candidate_id == first.candidate_id
     assert second_result.evidence[0].candidate_id == second.candidate_id
+    assert first.candidate_id in first_session.inputs[0]
+    assert "extracted/bin/one" in first_session.inputs[0]
+    assert second.candidate_id in second_session.inputs[0]
+    assert "extracted/bin/two" in second_session.inputs[0]
+
+
+def test_one_session_cannot_be_reused_across_candidates(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    first = host.add_candidate({"target": "extracted/bin/one"})
+    second = host.add_candidate({"target": "extracted/bin/two"})
+    shared_session = FakeSession([
+        _action({}),
+        _close(),
+        _action({}),
+        _close(),
+    ])
+
+    host.run_analysis(first.candidate_id, shared_session)
+    with pytest.raises(ValueError, match="独立 Agent Session"):
+        host.run_analysis(second.candidate_id, shared_session)
+
+    assert host.investigation_for(second.candidate_id).lifecycle_status == "queued"
+
+
+def test_failed_tool_evidence_keeps_raw_literal_and_matching_digest(tmp_path: Path) -> None:
+    raw = "stderr-token=literal-failure-value"
+    tool = FakeTool(ToolResult(
+        ok=False,
+        text="short failure view",
+        raw=raw,
+        error="process exited 2",
+        elapsed=0.5,
+    ))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([_action({}), _close()])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    reference = investigation.evidence[0]
+    saved = json.loads((tmp_path / reference.location).read_text(encoding="utf-8"))
+    assert saved["observation"] == raw
+    assert reference.digest == hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    assert raw in session.inputs[1]
+    assert "process exited 2" in session.inputs[1]
+
+
+def test_oversized_tool_result_is_rejected_instead_of_truncated(tmp_path: Path) -> None:
+    raw = "literal-must-remain-whole"
+    tool = FakeTool(ToolResult(ok=True, text=raw, raw=raw, data={"extra": "X" * 80}))
+    host = HostAnalysisTracer(
+        tmp_path,
+        {"read_file": tool},
+        tool_result_limit_bytes=64,
+    )
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+
+    with pytest.raises(ToolResultLimitError, match="大型产物"):
+        host.run_analysis(candidate.candidate_id, FakeSession([_action({})]))
+
+    investigation = host.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "queued"
+    assert investigation.state == {}
+    assert investigation.evidence == []
+    assert not (tmp_path / "investigations" / candidate.candidate_id / "evidence").exists()
+
+
+def test_existing_evidence_file_is_never_overwritten(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="new", raw="new"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    existing = (
+        tmp_path
+        / "investigations"
+        / candidate.candidate_id
+        / "evidence"
+        / "ev-000001.json"
+    )
+    existing.parent.mkdir(parents=True)
+    existing.write_text("original immutable evidence", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        host.run_analysis(candidate.candidate_id, FakeSession([_action({})]))
+
+    assert existing.read_text(encoding="utf-8") == "original immutable evidence"
+    investigation = host.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "queued"
+    assert investigation.evidence == []
 
 
 def test_invalid_proposal_has_no_host_or_tool_side_effect(tmp_path: Path) -> None:
@@ -193,3 +296,68 @@ def test_unauthorized_action_rejects_whole_proposal_before_state_delta(tmp_path:
     assert investigation.state == {}
     assert investigation.evidence == []
     assert tool.calls == []
+
+
+@pytest.mark.parametrize(
+    "proposal",
+    [
+        ActionProposal(
+            decision_summary="非法动作类型",
+            state_delta={"working_hypothesis": "must-not-apply"},
+            tool="read_file",
+            arguments={"path": "extracted/bin/router"},
+            kind="invented",
+        ),
+        ActionProposal(
+            decision_summary="非法工具参数",
+            state_delta={"working_hypothesis": "must-not-apply"},
+            tool="read_file",
+            arguments={"path": 7},
+        ),
+    ],
+)
+def test_host_revalidates_directly_constructed_action_proposal(
+    tmp_path: Path,
+    proposal: ActionProposal,
+) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="must not run", raw="must not run"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+
+    with pytest.raises(ProposalRejectedError):
+        host.run_analysis(candidate.candidate_id, FakeSession([proposal, _close()]))
+
+    investigation = host.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "queued"
+    assert investigation.state == {}
+    assert investigation.evidence == []
+    assert tool.calls == []
+
+
+@pytest.mark.parametrize(
+    "state_delta",
+    [
+        {"closure_reason": "", "evidence_refs": ["ev-000001"]},
+        {"closure_reason": "决定性反证", "evidence_refs": []},
+        {"closure_reason": "决定性反证", "evidence_refs": ["ev-999999"]},
+    ],
+)
+def test_close_requires_reason_and_owned_evidence_reference(
+    tmp_path: Path,
+    state_delta: dict,
+) -> None:
+    host = HostAnalysisTracer(tmp_path, {})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    close = FinalProposal(
+        decision_summary="主动关闭",
+        state_delta=state_delta,
+        kind="close_investigation",
+    )
+
+    with pytest.raises(ProposalRejectedError):
+        host.run_analysis(candidate.candidate_id, FakeSession([close]))
+
+    investigation = host.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "queued"
+    assert investigation.disposition is None
+    assert investigation.stop_reason is None

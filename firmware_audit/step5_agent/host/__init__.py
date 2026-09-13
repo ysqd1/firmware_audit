@@ -10,6 +10,7 @@ from .analysis import (
     HostAnalysisTracer,
     Investigation,
     ProposalRejectedError,
+    ToolResultLimitError,
 )
 from .session import (
     ActionProposal,
@@ -31,6 +32,7 @@ __all__ = [
     "Investigation",
     "ProposalError",
     "ProposalRejectedError",
+    "ToolResultLimitError",
     "ValidationIssue",
     "parse_proposal",
     "protocol_instruction",
