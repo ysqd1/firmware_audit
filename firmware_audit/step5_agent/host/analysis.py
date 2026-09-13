@@ -35,10 +35,6 @@ class ProposalRejectedError(ValueError):
     """Proposal 未通过完整守卫；本轮不得产生 Host 或工具副作用。"""
 
 
-class ToolResultLimitError(ValueError):
-    """工具违反有界结果契约；Host 不得截断后冒充完整 Evidence。"""
-
-
 @dataclass(frozen=True)
 class Candidate:
     """已分配运行内稳定身份的合法 Candidate。"""
@@ -59,6 +55,15 @@ class EvidenceReference:
     digest: str
     candidate_id: str
     investigation_id: str
+    sequence: int
+
+
+@dataclass(frozen=True)
+class _EvidenceSlot:
+    """执行工具前预留的运行内 Evidence 身份与不可变位置。"""
+
+    evidence_id: str
+    location: Path
     sequence: int
 
 
@@ -170,14 +175,14 @@ class HostAnalysisTracer:
             proposal = self._validated_proposal(session.step(input_message))
             if isinstance(proposal, ActionProposal):
                 state_delta, arguments, tool = self._validate_action(proposal)
-                result = tool.execute(**arguments)
-                if not isinstance(result, ToolResult):
-                    raise TypeError("工具 adapter 必须返回 ToolResult")
+                slot = self._reserve_evidence(investigation)
+                result = self._execute_tool(tool, arguments)
                 evidence, input_message = self._record_evidence(
                     investigation,
                     proposal.tool,
                     arguments,
                     result,
+                    slot,
                 )
                 investigation.lifecycle_status = "investigating"
                 investigation.state.update(state_delta)
@@ -325,47 +330,100 @@ class HostAnalysisTracer:
             )
         return remaining, reason.strip(), tuple(refs)
 
-    def _record_evidence(
-        self,
-        investigation: Investigation,
-        tool_name: str,
-        arguments: dict[str, Any],
-        result: ToolResult,
-    ) -> tuple[EvidenceReference, str]:
-        """每次逻辑调用都分配新身份；digest 相同也写独立 Evidence。"""
-        tool_result = _json_clone(asdict(result), "ToolResult")
-        encoded_result = json.dumps(
-            tool_result,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(encoded_result) > self.tool_result_limit_bytes:
-            raise ToolResultLimitError(
-                f"ToolResult 共 {len(encoded_result)} bytes，超过 Host 上界 "
-                f"{self.tool_result_limit_bytes} bytes；请让工具把大型产物独立落盘并返回指针"
-            )
-        self._evidence_seq += 1
-        sequence = self._evidence_seq
+    def _reserve_evidence(self, investigation: Investigation) -> _EvidenceSlot:
+        """在真实工具调用前分配身份，并提前拒绝既有不可变位置。"""
+        sequence = self._evidence_seq + 1
         evidence_id = f"ev-{sequence:06d}"
-        observation = _observation_text(result)
-        digest = hashlib.sha256(observation.encode("utf-8")).hexdigest()
         location = (
             Path("investigations")
             / investigation.candidate_id
             / "evidence"
             / f"{evidence_id}.json"
         )
+        evidence_path = self.run_dir / location
+        if evidence_path.exists():
+            raise FileExistsError(f"Evidence 已存在且不可覆盖: {evidence_path}")
+        self._evidence_seq = sequence
+        return _EvidenceSlot(evidence_id, location, sequence)
+
+    @staticmethod
+    def _execute_tool(tool: object, arguments: dict[str, Any]) -> ToolResult:
+        """工具 adapter 失约也转为失败 ToolResult，保留本次逻辑调用身份。"""
+        try:
+            result = tool.execute(**arguments)
+        except Exception as exc:
+            return ToolResult(
+                ok=False,
+                text="",
+                error=f"工具 adapter 抛出 {type(exc).__name__}: {exc}",
+            )
+        if isinstance(result, ToolResult):
+            return result
+        return ToolResult(
+            ok=False,
+            text="",
+            error=f"工具 adapter 必须返回 ToolResult，实际为 {type(result).__name__}",
+        )
+
+    def _bounded_tool_result(self, result: ToolResult) -> tuple[ToolResult, dict[str, Any]]:
+        """完整接纳合约内结果；失约结果转为小型、可追溯的失败结果。"""
+        try:
+            tool_result = _json_clone(asdict(result), "ToolResult")
+            encoded_result = json.dumps(
+                tool_result,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except ProposalRejectedError as exc:
+            failure = ToolResult(
+                ok=False,
+                text="",
+                error=f"ToolResult 不符合 JSON 合约: {exc}",
+                elapsed=result.elapsed,
+            )
+            return failure, _json_clone(asdict(failure), "bounded ToolResult failure")
+        if len(encoded_result) <= self.tool_result_limit_bytes:
+            return result, tool_result
+
+        failure = ToolResult(
+            ok=False,
+            text="",
+            data={
+                "returned_bytes": len(encoded_result),
+                "returned_sha256": hashlib.sha256(encoded_result).hexdigest(),
+            },
+            error=(
+                f"ToolResult 共 {len(encoded_result)} bytes，超过 Host 上界 "
+                f"{self.tool_result_limit_bytes} bytes；"
+                "请让工具把大型产物独立落盘并返回指针"
+            ),
+            elapsed=result.elapsed,
+        )
+        return failure, _json_clone(asdict(failure), "bounded ToolResult failure")
+
+    def _record_evidence(
+        self,
+        investigation: Investigation,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ToolResult,
+        slot: _EvidenceSlot,
+    ) -> tuple[EvidenceReference, str]:
+        """每次逻辑调用都分配新身份；digest 相同也写独立 Evidence。"""
+        result, tool_result = self._bounded_tool_result(result)
+        observation = _observation_text(result)
+        digest = hashlib.sha256(observation.encode("utf-8")).hexdigest()
         reference = EvidenceReference(
-            evidence_id=evidence_id,
+            evidence_id=slot.evidence_id,
             tool=tool_name,
             arguments=deepcopy(arguments),
             summary=_summary(observation),
-            location=location.as_posix(),
+            location=slot.location.as_posix(),
             digest=digest,
             candidate_id=investigation.candidate_id,
             investigation_id=investigation.investigation_id,
-            sequence=sequence,
+            sequence=slot.sequence,
         )
         payload = {
             "schema_version": EVIDENCE_SCHEMA_VERSION,
@@ -373,7 +431,7 @@ class HostAnalysisTracer:
             "observation": observation,
             "tool_result": tool_result,
         }
-        evidence_path = self.run_dir / location
+        evidence_path = self.run_dir / slot.location
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         # Evidence 原文写入后不可修改；恢复编号由后续 Store 工单负责，当前
         # tracer 遇到碰撞必须显式失败，绝不能用 write_text 静默覆盖。

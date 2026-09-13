@@ -14,7 +14,6 @@ from firmware_audit.step5_agent.host import (
     HostAnalysisTracer,
     ProposalError,
     ProposalRejectedError,
-    ToolResultLimitError,
     ValidationIssue,
 )
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
@@ -214,7 +213,7 @@ def test_failed_tool_evidence_keeps_raw_literal_and_matching_digest(tmp_path: Pa
     assert "process exited 2" in session.inputs[1]
 
 
-def test_oversized_tool_result_is_rejected_instead_of_truncated(tmp_path: Path) -> None:
+def test_oversized_tool_result_leaves_bounded_failure_evidence(tmp_path: Path) -> None:
     raw = "literal-must-remain-whole"
     tool = FakeTool(ToolResult(ok=True, text=raw, raw=raw, data={"extra": "X" * 80}))
     host = HostAnalysisTracer(
@@ -223,15 +222,19 @@ def test_oversized_tool_result_is_rejected_instead_of_truncated(tmp_path: Path) 
         tool_result_limit_bytes=64,
     )
     candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([_action({}), _close()])
 
-    with pytest.raises(ToolResultLimitError, match="大型产物"):
-        host.run_analysis(candidate.candidate_id, FakeSession([_action({})]))
+    investigation = host.run_analysis(candidate.candidate_id, session)
 
-    investigation = host.investigation_for(candidate.candidate_id)
-    assert investigation.lifecycle_status == "queued"
-    assert investigation.state == {}
-    assert investigation.evidence == []
-    assert not (tmp_path / "investigations" / candidate.candidate_id / "evidence").exists()
+    reference = investigation.evidence[0]
+    saved = json.loads((tmp_path / reference.location).read_text(encoding="utf-8"))
+    assert reference.evidence_id == "ev-000001"
+    assert saved["tool_result"]["ok"] is False
+    assert "大型产物" in saved["tool_result"]["error"]
+    assert saved["tool_result"]["data"]["returned_bytes"] > 64
+    assert len(json.dumps(saved["tool_result"], ensure_ascii=False).encode("utf-8")) < 600
+    assert "大型产物" in session.inputs[1]
+    assert tool.calls == [{"path": "extracted/etc/device.conf"}]
 
 
 def test_existing_evidence_file_is_never_overwritten(tmp_path: Path) -> None:
@@ -255,6 +258,7 @@ def test_existing_evidence_file_is_never_overwritten(tmp_path: Path) -> None:
     investigation = host.investigation_for(candidate.candidate_id)
     assert investigation.lifecycle_status == "queued"
     assert investigation.evidence == []
+    assert tool.calls == []
 
 
 def test_invalid_proposal_has_no_host_or_tool_side_effect(tmp_path: Path) -> None:
