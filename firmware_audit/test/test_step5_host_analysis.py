@@ -107,13 +107,17 @@ def test_host_runs_one_candidate_and_preserves_distinct_evidence(tmp_path: Path)
     assert investigation.evidence[0].digest == investigation.evidence[1].digest
     assert investigation.evidence[0].location != investigation.evidence[1].location
     assert tool.calls == [
-        {"limit": 40, "path": "extracted/etc/device.conf"},
-        {"limit": 40, "path": "extracted/etc/device.conf"},
+        {"limit": 40, "offset": 0, "path": "extracted/etc/device.conf"},
+        {"limit": 40, "offset": 0, "path": "extracted/etc/device.conf"},
     ]
 
     first_file = tmp_path / investigation.evidence[0].location
     saved = json.loads(first_file.read_text(encoding="utf-8"))
-    assert saved["arguments"] == {"limit": 40, "path": "extracted/etc/device.conf"}
+    assert saved["arguments"] == {
+        "limit": 40,
+        "offset": 0,
+        "path": "extracted/etc/device.conf",
+    }
     assert saved["tool_result"] == {
         "data": {"matches": [3, 1], "value": "literal-value"},
         "elapsed": 0.125,
@@ -213,6 +217,41 @@ def test_failed_tool_evidence_keeps_raw_literal_and_matching_digest(tmp_path: Pa
     assert "process exited 2" in session.inputs[1]
 
 
+def test_malformed_tool_result_fields_become_failure_evidence(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text=7, raw=7))  # type: ignore[arg-type]
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([_action({}), _close()])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    reference = investigation.evidence[0]
+    saved = json.loads((tmp_path / reference.location).read_text(encoding="utf-8"))
+    assert saved["tool_result"]["ok"] is False
+    assert "字段类型" in saved["tool_result"]["error"]
+    assert "字段类型" in session.inputs[1]
+
+
+def test_evidence_records_effective_normalized_tool_arguments(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([
+        _action({}, {"path": "  extracted\\etc\\device.conf  "}),
+        _close(),
+    ])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    expected = {"path": "extracted/etc/device.conf", "offset": 0, "limit": 200}
+    assert investigation.evidence[0].arguments == expected
+    assert tool.calls == [expected]
+    saved = json.loads(
+        (tmp_path / investigation.evidence[0].location).read_text(encoding="utf-8")
+    )
+    assert saved["arguments"] == expected
+
+
 def test_oversized_tool_result_leaves_bounded_failure_evidence(tmp_path: Path) -> None:
     raw = "literal-must-remain-whole"
     tool = FakeTool(ToolResult(ok=True, text=raw, raw=raw, data={"extra": "X" * 80}))
@@ -234,7 +273,11 @@ def test_oversized_tool_result_leaves_bounded_failure_evidence(tmp_path: Path) -
     assert saved["tool_result"]["data"]["returned_bytes"] > 64
     assert len(json.dumps(saved["tool_result"], ensure_ascii=False).encode("utf-8")) < 600
     assert "大型产物" in session.inputs[1]
-    assert tool.calls == [{"path": "extracted/etc/device.conf"}]
+    assert tool.calls == [{
+        "limit": 200,
+        "offset": 0,
+        "path": "extracted/etc/device.conf",
+    }]
 
 
 def test_existing_evidence_file_is_never_overwritten(tmp_path: Path) -> None:
@@ -273,12 +316,17 @@ def test_invalid_proposal_has_no_host_or_tool_side_effect(tmp_path: Path) -> Non
         allowed_values=("tool_action", "submit_case", "close_investigation"),
     ),), raw_reply='{"next":{"kind":"invented"}}')
 
+    session = FakeSession([invalid, _action({}), _close()])
     with pytest.raises(ProposalRejectedError, match=r"\$\.next\.kind"):
-        host.run_analysis(candidate.candidate_id, FakeSession([invalid]))
+        host.run_analysis(candidate.candidate_id, session)
 
     assert host.investigation_for(candidate.candidate_id) == before
     assert tool.calls == []
     assert not (tmp_path / "investigations" / candidate.candidate_id / "evidence").exists()
+
+    completed = host.run_analysis(candidate.candidate_id, session)
+    assert completed.lifecycle_status == "finished"
+    assert completed.evidence[0].evidence_id == "ev-000001"
 
 
 def test_unauthorized_action_rejects_whole_proposal_before_state_delta(tmp_path: Path) -> None:

@@ -6,11 +6,11 @@
 
 from .analysis import (
     Candidate,
-    EvidenceReference,
     HostAnalysisTracer,
     Investigation,
     ProposalRejectedError,
 )
+from .evidence import EvidenceReference
 from .session import (
     ActionProposal,
     AgentSession,
