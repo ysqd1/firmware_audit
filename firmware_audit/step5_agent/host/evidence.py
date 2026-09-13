@@ -10,10 +10,12 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, truncate_text
+from .json_values import JsonValueError, clone_json_value
 
 EVIDENCE_SCHEMA_VERSION = 1
 # Evidence Index 摘要与协议 decision summary 共用 500 字可审阅粒度；原文不受此限。
@@ -45,20 +47,6 @@ class _EvidenceSlot:
     evidence_id: str
     location: Path
     sequence: int
-
-
-def _json_clone(value: Any, label: str) -> Any:
-    try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        return json.loads(encoded)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} 必须是标准 JSON 值: {exc}") from exc
 
 
 def _observation_text(result: ToolResult) -> str:
@@ -154,7 +142,7 @@ class EvidenceRecorder:
                 json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
             )
         error = result.error if not result.ok else None
-        return reference, self._observation_view(reference, observation, error)
+        return reference, self._observation_view(reference, observation, result.ok, error)
 
     def _bounded_tool_result(self, result: ToolResult) -> tuple[ToolResult, dict[str, Any]]:
         """完整接纳合约内结果；失约结果转为小型、可追溯的失败结果。"""
@@ -167,7 +155,11 @@ class EvidenceRecorder:
             invalid_fields.append("raw:str")
         if result.error is not None and not isinstance(result.error, str):
             invalid_fields.append("error:str|null")
-        if not isinstance(result.elapsed, (int, float)) or isinstance(result.elapsed, bool):
+        if (
+            not isinstance(result.elapsed, (int, float))
+            or isinstance(result.elapsed, bool)
+            or (isinstance(result.elapsed, float) and not math.isfinite(result.elapsed))
+        ):
             invalid_fields.append("elapsed:number")
         if result.data is not None and not isinstance(result.data, (dict, list)):
             invalid_fields.append("data:object|array|null")
@@ -177,17 +169,25 @@ class EvidenceRecorder:
             )
 
         try:
-            tool_result = _json_clone(asdict(result), "ToolResult")
+            # Do not recursively copy unvalidated adapter data with asdict:
+            # strict JSON validation must see cycles and unsupported values first.
+            tool_result = clone_json_value({
+                "ok": result.ok,
+                "text": result.text,
+                "raw": result.raw,
+                "data": result.data,
+                "error": result.error,
+                "elapsed": result.elapsed,
+            }, "ToolResult")
             encoded_result = json.dumps(
                 tool_result,
                 ensure_ascii=False,
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
-        except ValueError as exc:
+        except JsonValueError as exc:
             return self._failure_result(
                 f"ToolResult 不符合 JSON 合约: {exc}",
-                elapsed=result.elapsed,
             )
         if len(encoded_result) <= self.tool_result_limit_bytes:
             return result, tool_result
@@ -219,16 +219,19 @@ class EvidenceRecorder:
             error=error,
             elapsed=elapsed,
         )
-        return failure, _json_clone(asdict(failure), "bounded ToolResult failure")
+        return failure, clone_json_value(asdict(failure), "bounded ToolResult failure")
 
     def _observation_view(
         self,
         reference: EvidenceReference,
         observation: str,
+        ok: bool,
         error: str | None,
     ) -> str:
         body = truncate_text(observation, self.observation_view_limit)
-        status = f"Tool status: error; {error}\n" if error else "Tool status: ok\n"
+        status = "Tool status: ok\n" if ok else (
+            f"Tool status: error; {error or '工具执行失败且未提供错误详情'}\n"
+        )
         return (
             f"Observation View [{reference.evidence_id}]\n{status}{body}\n"
             f"Evidence Reference: {reference.evidence_id}; "

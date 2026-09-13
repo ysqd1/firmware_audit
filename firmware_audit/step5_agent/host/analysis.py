@@ -23,6 +23,7 @@ from .evidence import (
     EvidenceRecorder,
     EvidenceReference,
 )
+from .json_values import JsonValueError, clone_json_value
 from .session import ActionProposal, FinalProposal, ProposalError, parse_proposal
 
 _PATH_ARGUMENTS = frozenset(("path", "file_ref", "directory", "target_dir"))
@@ -56,18 +57,11 @@ class Investigation:
 
 
 def _json_clone(value: Any, label: str) -> Any:
-    """校验并复制纯 JSON 值，同时让 object key 顺序规范化。"""
+    """校验并复制纯 JSON 值，把共享边界错误转换为 Proposal 拒绝。"""
     try:
-        encoded = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-        return json.loads(encoded)
-    except (TypeError, ValueError) as exc:
-        raise ProposalRejectedError(f"{label} 必须是标准 JSON 值: {exc}") from exc
+        return clone_json_value(value, label)
+    except JsonValueError as exc:
+        raise ProposalRejectedError(str(exc)) from exc
 
 
 class HostAnalysisTracer:
@@ -193,20 +187,32 @@ class HostAnalysisTracer:
             raise ProposalRejectedError(
                 f"Agent Session 返回了未知 Proposal 类型: {type(proposal).__name__}"
             )
-        try:
-            raw = json.dumps({
-                "decision_summary": proposal.decision_summary,
-                "state_delta": proposal.state_delta,
-                "next": next_value,
-            }, ensure_ascii=False, allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            raise ProposalRejectedError(f"Agent Proposal 必须是标准 JSON: {exc}") from exc
+        payload = _json_clone({
+            "decision_summary": proposal.decision_summary,
+            "state_delta": proposal.state_delta,
+            "next": next_value,
+        }, "Agent Proposal")
+        raw = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         checked = parse_proposal(raw, "analysis")
         if isinstance(checked, ProposalError):
             raise ProposalRejectedError(
                 f"Agent Proposal 校验失败: {checked.feedback_message()}"
             )
-        return checked
+        # parse_proposal 为重复键检测保留了内部 dict 子类；Host 边界已经在上面
+        # 严格校验并复制 payload，这里用该纯 dict/list 副本承载已通过的 Proposal。
+        if isinstance(checked, ActionProposal):
+            return ActionProposal(
+                decision_summary=checked.decision_summary,
+                state_delta=payload["state_delta"],
+                tool=checked.tool,
+                arguments=payload["next"]["arguments"],
+                kind=checked.kind,
+            )
+        return FinalProposal(
+            decision_summary=checked.decision_summary,
+            state_delta=payload["state_delta"],
+            kind=checked.kind,
+        )
 
     def _current_investigation(self, candidate_id: str) -> Investigation:
         try:

@@ -15,6 +15,7 @@ from firmware_audit.step5_agent.host import (
     ProposalError,
     ProposalRejectedError,
     ValidationIssue,
+    parse_proposal,
 )
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
 
@@ -39,6 +40,29 @@ class FakeTool:
     def execute(self, **arguments):
         self.calls.append(arguments)
         return deepcopy(self.result)
+
+
+def test_host_accepts_proposals_from_session_parser(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="observed"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    replies = [
+        {"decision_summary": "读取", "state_delta": {"nested": {"value": 1}},
+         "next": {"kind": "tool_action", "tool": "read_file",
+                  "arguments": {"path": "extracted/etc/device.conf"}}},
+        {"decision_summary": "关闭", "state_delta": {
+            "closure_reason": "决定性反证", "evidence_refs": ["ev-000001"]},
+         "next": {"kind": "close_investigation"}},
+    ]
+    session = FakeSession([
+        parse_proposal(json.dumps(reply), "analysis") for reply in replies
+    ])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert investigation.lifecycle_status == "finished"
+    assert investigation.state == {"nested": {"value": 1}}
+    assert len(tool.calls) == 1
 
 
 def _action(state_delta: dict, arguments: dict | None = None) -> ActionProposal:
@@ -217,6 +241,21 @@ def test_failed_tool_evidence_keeps_raw_literal_and_matching_digest(tmp_path: Pa
     assert "process exited 2" in session.inputs[1]
 
 
+@pytest.mark.parametrize("error", [None, ""])
+def test_failed_tool_without_error_message_is_not_shown_as_success(
+    tmp_path: Path, error: str | None,
+) -> None:
+    tool = FakeTool(ToolResult(ok=False, text="could not open file", error=error))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    session = FakeSession([_action({}), _close()])
+
+    host.run_analysis(candidate.candidate_id, session)
+
+    assert "Tool status: error" in session.inputs[1]
+    assert "could not open file" in session.inputs[1]
+
+
 def test_malformed_tool_result_fields_become_failure_evidence(tmp_path: Path) -> None:
     tool = FakeTool(ToolResult(ok=True, text=7, raw=7))  # type: ignore[arg-type]
     host = HostAnalysisTracer(tmp_path, {"read_file": tool})
@@ -230,6 +269,56 @@ def test_malformed_tool_result_fields_become_failure_evidence(tmp_path: Path) ->
     assert saved["tool_result"]["ok"] is False
     assert "字段类型" in saved["tool_result"]["error"]
     assert "字段类型" in session.inputs[1]
+
+
+@pytest.mark.parametrize("elapsed", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_tool_elapsed_becomes_failure_evidence(
+    tmp_path: Path,
+    elapsed: float,
+) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="literal", raw="literal", elapsed=elapsed))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+
+    investigation = host.run_analysis(
+        candidate.candidate_id,
+        FakeSession([_action({}), _close()]),
+    )
+
+    saved = json.loads(
+        (tmp_path / investigation.evidence[0].location).read_text(encoding="utf-8")
+    )
+    assert saved["tool_result"]["ok"] is False
+    assert saved["tool_result"]["elapsed"] == 0.0
+    assert "elapsed" in saved["tool_result"]["error"]
+
+
+@pytest.mark.parametrize("cyclic", [False, True])
+def test_non_json_native_tool_data_becomes_failure_evidence(
+    tmp_path: Path, cyclic: bool,
+) -> None:
+    data: dict = {"items": ("silently", "coerced")}
+    if cyclic:
+        data["items"] = data
+    tool = FakeTool(ToolResult(
+        ok=True,
+        text="literal",
+        raw="literal",
+        data=data,
+    ))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+
+    investigation = host.run_analysis(
+        candidate.candidate_id,
+        FakeSession([_action({}), _close()]),
+    )
+
+    saved = json.loads(
+        (tmp_path / investigation.evidence[0].location).read_text(encoding="utf-8")
+    )
+    assert saved["tool_result"]["ok"] is False
+    assert "标准 JSON" in saved["tool_result"]["error"]
 
 
 def test_evidence_records_effective_normalized_tool_arguments(tmp_path: Path) -> None:
@@ -378,6 +467,32 @@ def test_host_revalidates_directly_constructed_action_proposal(
 
     with pytest.raises(ProposalRejectedError):
         host.run_analysis(candidate.candidate_id, FakeSession([proposal, _close()]))
+
+    investigation = host.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "queued"
+    assert investigation.state == {}
+    assert investigation.evidence == []
+    assert tool.calls == []
+
+
+@pytest.mark.parametrize(
+    "state_delta",
+    [
+        {"working_hypothesis": ("silently", "coerced")},
+        {1: "silently-stringified-key"},
+    ],
+)
+def test_host_rejects_non_json_native_proposal_before_side_effects(
+    tmp_path: Path,
+    state_delta: dict,
+) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="must not run", raw="must not run"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    proposal = _action(state_delta)
+
+    with pytest.raises(ProposalRejectedError, match="标准 JSON"):
+        host.run_analysis(candidate.candidate_id, FakeSession([proposal]))
 
     investigation = host.investigation_for(candidate.candidate_id)
     assert investigation.lifecycle_status == "queued"
