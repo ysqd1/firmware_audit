@@ -2,8 +2,8 @@
 
 这是 ADR-0012 新控制层的第一条最小纵向路径：调用方注册 Candidate 后，只需
 提供逐步 Agent Session，Host 便负责完整 Proposal 守卫、工具执行、Evidence
-留存、Observation View 回传与主动关闭。当前只保存本进程内的 Investigation
-状态；追加事件、原子快照和崩溃恢复属于后续持久化工单。
+留存、Observation View 回传与主动关闭。追加事件保存权威状态，原子快照为
+可重建投影；恢复只使用当前状态和证据，不重放对话历史。
 
 模块的公开 interface 刻意只有 ``add_candidate``、``investigation_for`` 和
 ``run_analysis``。Session 与工具都是注入的 adapter，测试和生产调用走同一 seam。
@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,7 @@ from .evidence import (
 )
 from .json_values import JsonValueError, clone_json_value
 from .session import ActionProposal, FinalProposal, ProposalError, parse_proposal
+from .store import InvestigationStore, StoreError
 
 _PATH_ARGUMENTS = frozenset(("path", "file_ref", "directory", "target_dir"))
 
@@ -74,6 +75,7 @@ class HostAnalysisTracer:
         *,
         observation_view_limit: int = MAX_TEXT_CHARS,
         tool_result_limit_bytes: int = DEFAULT_TOOL_RESULT_LIMIT_BYTES,
+        remaining_budget: dict[str, Any] | None = None,
     ):
         self.tools = dict(tools)
         self._evidence_store = EvidenceRecorder(
@@ -85,6 +87,66 @@ class HostAnalysisTracer:
         self._candidates: dict[str, Candidate] = {}
         self._investigations: dict[str, Investigation] = {}
         self._claimed_sessions: list[tuple[object, str]] = []
+        self._stores: dict[str, InvestigationStore] = {}
+        self._runtime: dict[str, dict] = {}
+        self._resumed: set[str] = set()
+        self._initial_budget = _json_clone(remaining_budget or {}, "remaining_budget")
+        for directory in sorted((Path(run_dir) / "investigations").glob("cand-*")):
+            store = InvestigationStore(run_dir, directory.name)
+            try:
+                self._restore_investigation(store, directory.name)
+            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                raise StoreError(
+                    f"Investigation 恢复失败；请检查原运行目录或创建新运行世代: {exc}"
+                ) from exc
+
+    def _restore_investigation(self, store: InvestigationStore, candidate_id: str) -> None:
+        """Hydrate only identity-consistent domain projections and referenced Evidence."""
+        saved = store.load()
+        if saved is None:
+            raise StoreError("Investigation 缺少权威历史")
+        candidate = Candidate(**saved["candidate"])
+        data = saved["investigation"]
+        runtime = saved["runtime"]
+        if (candidate.candidate_id != candidate_id
+                or not isinstance(candidate.proposal, dict)
+                or data["candidate_id"] != candidate_id
+                or data["investigation_id"] != "inv-" + candidate_id.removeprefix("cand-")
+                or not isinstance(data["state"], dict)
+                or not isinstance(data["evidence"], list)
+                or not isinstance(data["closure_evidence"], list)
+                or not isinstance(runtime, dict)
+                or not isinstance(runtime["remaining_budget"], dict)
+                or not isinstance(runtime["last_action"], (dict, type(None)))
+                or not isinstance(runtime["observation_view"], (str, type(None)))):
+            raise StoreError("Investigation 状态结构或身份损坏")
+        pending = runtime["pending"]
+        if pending is not None:
+            if not isinstance(pending, dict) or not isinstance(pending["proposal"], dict):
+                raise StoreError("待执行 Proposal 结构损坏")
+            proposal_type = ActionProposal if pending["proposal"]["kind"] == "tool_action" else FinalProposal
+            self._validated_proposal(proposal_type(**pending["proposal"]))
+            if proposal_type is ActionProposal:
+                if (type(pending["sequence"]) is not int or pending["sequence"] < 1
+                        or type(pending["executing"]) is not bool):
+                    raise StoreError("待执行工具身份损坏")
+                self._evidence_store.restore_sequence(pending["sequence"])
+        data["evidence"] = [EvidenceReference(**item) for item in data["evidence"]]
+        data["closure_evidence"] = tuple(data["closure_evidence"])
+        investigation = Investigation(**data)
+        for reference in investigation.evidence:
+            if type(reference.sequence) is not int or reference.sequence < 1:
+                raise StoreError("Evidence sequence 非法")
+            slot = self._evidence_store.restore_slot(candidate_id, reference.sequence)
+            recovered = self._evidence_store.recover(slot)
+            if recovered is None or recovered[0] != reference:
+                raise StoreError("已引用 Evidence 缺失或与事件不一致")
+        self._candidates[candidate_id] = candidate
+        self._investigations[candidate_id] = investigation
+        self._stores[candidate_id] = store
+        self._runtime[candidate_id] = runtime
+        self._resumed.add(candidate_id)
+        self._candidate_seq = max(self._candidate_seq, int(candidate_id.split("-")[1]))
 
     def add_candidate(self, proposal: dict[str, Any]) -> Candidate:
         """分配 Candidate ID，并一一创建隔离的 queued Investigation。"""
@@ -97,7 +159,23 @@ class HostAnalysisTracer:
         investigation = Investigation(f"inv-{sequence:04d}", candidate.candidate_id)
         self._candidates[candidate.candidate_id] = candidate
         self._investigations[candidate.candidate_id] = investigation
+        self._stores[candidate.candidate_id] = InvestigationStore(
+            self._evidence_store.run_dir, candidate.candidate_id,
+        )
+        self._runtime[candidate.candidate_id] = {
+            "pending": None, "last_action": None, "observation_view": None,
+            "remaining_budget": deepcopy(self._initial_budget),
+        }
+        self._checkpoint(candidate.candidate_id, "candidate_created")
         return deepcopy(candidate)
+
+    def _checkpoint(self, candidate_id: str, kind: str) -> None:
+        data = asdict(self._investigations[candidate_id])
+        data["closure_evidence"] = list(data["closure_evidence"])
+        self._stores[candidate_id].save(kind, {
+            "candidate": asdict(self._candidates[candidate_id]),
+            "investigation": data, "runtime": self._runtime[candidate_id],
+        })
 
     def investigation_for(self, candidate_id: str) -> Investigation:
         """返回只供调用方检查的快照，避免外部改写 Host 当前状态。"""
@@ -120,24 +198,54 @@ class HostAnalysisTracer:
         if bound_candidate is None:
             self._claimed_sessions.append((session, candidate_id))
 
+        runtime = self._runtime[candidate_id]
         input_message: str | None = self._candidate_context(candidate_id)
+        needs_recovery_context = candidate_id in self._resumed
+        if candidate_id in self._resumed:
+            reset = getattr(session, "reset_for_resume", None)
+            if callable(reset):
+                reset()
+            self._resumed.remove(candidate_id)
         while True:
-            proposal = self._validated_proposal(session.step(input_message))
+            pending = runtime["pending"]
+            if pending:
+                cls = ActionProposal if pending["proposal"]["kind"] == "tool_action" else FinalProposal
+                proposal = self._validated_proposal(cls(**pending["proposal"]))
+            else:
+                if needs_recovery_context:
+                    input_message = self._candidate_context(candidate_id)
+                    needs_recovery_context = False
+                proposal = self._validated_proposal(session.step(input_message))
             if isinstance(proposal, ActionProposal):
                 state_delta, arguments, tool = self._validate_action(proposal)
-                slot = self._evidence_store.reserve(investigation.candidate_id)
-                result = self._execute_tool(tool, arguments)
-                evidence, input_message = self._evidence_store.record(
-                    slot,
-                    candidate_id=investigation.candidate_id,
-                    investigation_id=investigation.investigation_id,
-                    tool_name=proposal.tool,
-                    arguments=arguments,
-                    result=result,
-                )
+                if not pending:
+                    slot = self._evidence_store.reserve(candidate_id)
+                    pending = {"proposal": asdict(proposal), "sequence": slot.sequence, "executing": False}
+                    runtime["pending"] = pending
+                    self._checkpoint(candidate_id, "proposal_accepted")
+                else:
+                    slot = self._evidence_store.restore_slot(candidate_id, pending["sequence"])
+                recovered = self._evidence_store.recover(slot)
+                if recovered is None:
+                    if pending["executing"]:
+                        raise StoreError("工具调用已中断；需按 replay policy 恢复（工单 05）")
+                    pending["executing"] = True
+                    self._checkpoint(candidate_id, "tool_in_flight")
+                    result = self._execute_tool(tool, arguments)
+                    recovered = self._evidence_store.record(
+                        slot, candidate_id=candidate_id,
+                        investigation_id=investigation.investigation_id,
+                        tool_name=proposal.tool, arguments=arguments, result=result,
+                    )
+                evidence, input_message = recovered
+                if (evidence.tool != proposal.tool or evidence.arguments != arguments
+                        or evidence.investigation_id != investigation.investigation_id):
+                    raise StoreError("Evidence 与待执行动作不匹配；请检查工件")
                 investigation.lifecycle_status = "investigating"
                 investigation.state.update(state_delta)
                 investigation.evidence.append(evidence)
+                runtime.update(pending=None, last_action=asdict(proposal), observation_view=input_message)
+                self._checkpoint(candidate_id, "action_completed")
                 continue
             if isinstance(proposal, FinalProposal):
                 if proposal.kind != "close_investigation":
@@ -148,12 +256,17 @@ class HostAnalysisTracer:
                     proposal.state_delta,
                     investigation,
                 )
+                if not pending:
+                    runtime["pending"] = {"proposal": asdict(proposal)}
+                    self._checkpoint(candidate_id, "proposal_accepted")
                 investigation.state.update(state_delta)
                 investigation.lifecycle_status = "finished"
                 investigation.disposition = "closed"
                 investigation.stop_reason = "decisive_refutation"
                 investigation.closure_reason = closure_reason
                 investigation.closure_evidence = closure_evidence
+                runtime.update(pending=None, last_action=asdict(proposal))
+                self._checkpoint(candidate_id, "analysis_closed")
                 return deepcopy(investigation)
 
     def _candidate_context(self, candidate_id: str) -> str:
@@ -162,6 +275,10 @@ class HostAnalysisTracer:
             "candidate_id": candidate.candidate_id,
             "investigation_id": self._investigations[candidate_id].investigation_id,
             "proposal": candidate.proposal,
+            "current_state": asdict(self._investigations[candidate_id]),
+            "last_action": self._runtime[candidate_id]["last_action"],
+            "observation_view": self._runtime[candidate_id]["observation_view"],
+            "remaining_budget": self._runtime[candidate_id]["remaining_budget"],
         }
         return (
             "Analysis Candidate（本 Session 只调查此 Candidate）：\n"
@@ -219,7 +336,7 @@ class HostAnalysisTracer:
             investigation = self._investigations[candidate_id]
         except KeyError as exc:
             raise KeyError(f"未知 Candidate ID: {candidate_id}") from exc
-        if investigation.lifecycle_status != "queued":
+        if investigation.lifecycle_status not in ("queued", "investigating"):
             raise ValueError(
                 f"Investigation {investigation.investigation_id} 已处于 "
                 f"{investigation.lifecycle_status}，不可重新运行"

@@ -368,6 +368,15 @@ class AgentSession:
             system["content"] = f"{system['content']}\n\n{instruction}"
         return [system, *messages[1:]]
 
+    def reset_for_resume(self) -> None:
+        """Retain fixed system instructions only; Host supplies rebuilt state next."""
+        previous = self.context
+        self.context = ContextManager(
+            previous.system["content"], "",
+            max_est_tokens=previous.max_est_tokens,
+            trigger_ratio=previous.trigger_ratio,
+        )
+
     def step(self, input_message: str | None = None) -> ProposalResult:
         """可选回填上一 Observation View/协议错误，再请求一个 Proposal 后暂停。"""
         if input_message is not None:

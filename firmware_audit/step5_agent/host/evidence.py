@@ -2,7 +2,7 @@
 
 Host 循环只需在工具执行前 ``reserve``，并在得到 ToolResult 后 ``record``。
 本模块保证每个逻辑调用身份独立、原文 digest 可复算、Evidence 文件不可覆盖，
-以及送入 Session 的视图有界；崩溃恢复和事件事务仍由后续 Store 工单负责。
+以及送入 Session 的视图有界；恢复时按 Store 的权威引用校验身份与 digest。
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from typing import Any
 
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, truncate_text
 from .json_values import JsonValueError, clone_json_value
+from .store import StoreError, atomic_json
 
 EVIDENCE_SCHEMA_VERSION = 1
 # Evidence Index 摘要与协议 decision summary 共用 500 字可审阅粒度；原文不受此限。
@@ -102,6 +103,38 @@ class EvidenceRecorder:
         self._sequence = sequence
         return _EvidenceSlot(evidence_id, location, sequence)
 
+    def restore_sequence(self, sequence: int) -> None:
+        """Restore the high-water mark from authoritative Investigation events."""
+        self._sequence = max(self._sequence, sequence)
+
+    def restore_slot(self, candidate_id: str, sequence: int) -> _EvidenceSlot:
+        self.restore_sequence(sequence)
+        evidence_id = f"ev-{sequence:06d}"
+        return _EvidenceSlot(evidence_id, Path("investigations") / candidate_id /
+                             "evidence" / f"{evidence_id}.json", sequence)
+
+    def recover(self, slot: _EvidenceSlot) -> tuple[EvidenceReference, str] | None:
+        """Accept only a complete, schema-compatible Observation with a valid digest."""
+        path = self.run_dir / slot.location
+        if not path.exists():
+            return None
+        try:
+            payload = clone_json_value(json.loads(path.read_text(encoding="utf-8")), "Evidence")
+            if type(payload.get("schema_version")) is not int or payload["schema_version"] != EVIDENCE_SCHEMA_VERSION:
+                raise StoreError("Evidence schema 不兼容；请创建新运行世代")
+            reference = EvidenceReference(**{key: payload[key] for key in EvidenceReference.__dataclass_fields__})
+            result = ToolResult(**payload["tool_result"])
+            observation = payload["observation"]
+            if (reference.evidence_id != slot.evidence_id or reference.sequence != slot.sequence
+                    or reference.location != slot.location.as_posix()
+                    or reference.candidate_id != slot.location.parts[1]
+                    or observation != _observation_text(result)
+                    or reference.digest != hashlib.sha256(observation.encode("utf-8")).hexdigest()):
+                raise ValueError("Evidence 身份或 digest 不匹配")
+            return reference, self._observation_view(reference, observation, result.ok, result.error)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise StoreError(f"Evidence 无法恢复；请检查原工件或创建新运行世代: {exc}") from exc
+
     def record(
         self,
         slot: _EvidenceSlot,
@@ -134,13 +167,9 @@ class EvidenceRecorder:
             "tool_result": tool_result,
         }
         evidence_path = self.run_dir / slot.location
-        evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        # Evidence 原文写入后不可修改；恢复编号由后续 Store 工单负责，当前
-        # tracer 遇到碰撞必须显式失败，绝不能静默覆盖。
-        with evidence_path.open("x", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-            )
+        # Evidence 原文写入后不可修改；恢复编号来自权威事件，碰撞须通过
+        # recover 校验接纳，绝不能静默覆盖。
+        atomic_json(evidence_path, payload, exclusive=True)
         error = result.error if not result.ok else None
         return reference, self._observation_view(reference, observation, result.ok, error)
 
