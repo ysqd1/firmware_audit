@@ -1,8 +1,8 @@
 """ADR-0012 Host 控制层。
 
-当前 expand 阶段暴露逐步 Agent Session 协议、单 Candidate Analysis tracer、
-Recon→Candidate Store 入口与 Candidate 去重/评分/双队列;Claim/复核与公开
-入口切换由后续工单继续内聚在本包。
+当前 expand 阶段暴露逐步 Agent Session 协议、单 Candidate Analysis tracer
+(Claim/假设门槛与案卷冻结)、Recon→Candidate Store 入口与 Candidate 去重/
+评分/双队列;独立复核与公开入口切换由后续工单继续内聚在本包。
 """
 
 from .analysis import (
@@ -27,6 +27,24 @@ from .candidates import (
     select_for_processing,
     signal_fingerprint,
 )
+from .claims import (
+    ADMISSION_REASONS,
+    CASE_SCHEMA_VERSION,
+    CLAIM_STATUSES,
+    DISPOSITIONS,
+    LIFECYCLE_STATUSES,
+    STOP_REASONS,
+    GateResult,
+    PolicyError,
+    action_progressed,
+    assert_lifecycle_transition,
+    assert_terminal,
+    build_case_payload,
+    evaluate_ready_gate,
+    is_decisive,
+    profile_claim_document,
+    required_claims,
+)
 from .evidence import EvidenceReference
 from .recon import (
     CandidateProposal,
@@ -47,36 +65,52 @@ from .session import (
 )
 
 __all__ = [
+    "ADMISSION_REASONS",
     "ActionProposal",
     "AgentSession",
     "CANDIDATE_STORE_SCHEMA_VERSION",
+    "CASE_SCHEMA_VERSION",
     "CLAIM_PROFILES",
+    "CLAIM_STATUSES",
     "Candidate",
     "CandidateIntakeError",
     "CandidateProposal",
     "CandidateStore",
     "ComparisonOutcome",
+    "DISPOSITIONS",
     "EvidenceReference",
     "FinalProposal",
+    "GateResult",
     "HostAnalysisTracer",
     "HostReconRunner",
     "IntakeCandidate",
     "Investigation",
+    "LIFECYCLE_STATUSES",
+    "PolicyError",
     "PriorityScorer",
     "ProposalError",
     "ProposalRejectedError",
     "ReconRunResult",
+    "STOP_REASONS",
     "Selection",
     "SemanticComparator",
     "ValidationIssue",
+    "action_progressed",
+    "assert_lifecycle_transition",
+    "assert_terminal",
+    "build_case_payload",
     "build_site_overview",
     "coverage_fingerprint",
+    "evaluate_ready_gate",
     "input_failure_reason",
+    "is_decisive",
     "normalize_intake",
     "normalize_target_path",
     "parse_proposal",
+    "profile_claim_document",
     "protocol_instruction",
     "revalidate_proposal",
+    "required_claims",
     "select_for_processing",
     "signal_fingerprint",
 ]

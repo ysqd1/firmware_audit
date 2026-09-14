@@ -5,8 +5,12 @@
 留存、Observation View 回传与主动关闭。追加事件保存权威状态，原子快照为
 可重建投影；恢复只使用当前状态和证据，不重放对话历史。
 
-模块的公开 interface 刻意只有 ``add_candidate``、``investigation_for`` 和
-``run_analysis``。Session 与工具都是注入的 adapter，测试和生产调用走同一 seam。
+Claim/假设/缺口等语义状态的门槛与案卷冻结策略见 ``claims`` 模块；本模块
+在唯一循环里接线：动作增量先整份校验后应用，close 派生 rejected/closed，
+submit_case 以 trial 状态过 ready gate 再冻结 Verification Case，连续五个
+无进展的已完成动作以 no_progress 收束。模块的公开 interface 刻意只有
+``add_candidate``、``investigation_for`` 和 ``run_analysis``。Session 与工具
+都是注入的 adapter，测试和生产调用走同一 seam。
 """
 from __future__ import annotations
 
@@ -18,6 +22,19 @@ from typing import Any
 
 from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
+from .candidates import CLAIM_PROFILES
+from .claims import (
+    ADMISSION_REASONS,
+    NO_PROGRESS_LIMIT,
+    action_progressed,
+    apply_delta_plan,
+    assert_lifecycle_transition,
+    assert_terminal,
+    build_case_payload,
+    evaluate_ready_gate,
+    profile_claim_document,
+    validate_analysis_delta,
+)
 from .evidence import (
     DEFAULT_TOOL_RESULT_LIMIT_BYTES,
     EvidenceRecorder,
@@ -31,7 +48,7 @@ from .session import (
     ProposalRejectedError,
     revalidate_proposal,
 )
-from .store import InvestigationStore, StoreError
+from .store import InvestigationStore, StoreError, atomic_json
 from .tooling import execute_tool, normalize_tool_arguments
 
 
@@ -54,6 +71,8 @@ class Investigation:
     stop_reason: str | None = None
     closure_reason: str | None = None
     closure_evidence: tuple[str, ...] = ()
+    claim_profile: str = "generic"
+    no_progress_count: int = 0
     state: dict[str, Any] = field(default_factory=dict)
     evidence: list[EvidenceReference] = field(default_factory=list)
     tool_attempts: int = 0
@@ -111,10 +130,16 @@ class HostAnalysisTracer:
         candidate = Candidate(**saved["candidate"])
         data = saved["investigation"]
         runtime = saved["runtime"]
+        if "claim_profile" not in data and isinstance(candidate.proposal, dict):
+            # 票 08 之前的快照没有该字段;从 Candidate proposal 回填保真。
+            data["claim_profile"] = candidate.proposal.get("claim_profile", "generic")
         if (candidate.candidate_id != candidate_id
                 or not isinstance(candidate.proposal, dict)
                 or data["candidate_id"] != candidate_id
                 or data["investigation_id"] != "inv-" + candidate_id.removeprefix("cand-")
+                or data.get("claim_profile") not in CLAIM_PROFILES
+                or type(data.get("no_progress_count", 0)) is not int
+                or data["no_progress_count"] < 0
                 or not isinstance(data["state"], dict)
                 or not isinstance(data["evidence"], list)
                 or not isinstance(data["closure_evidence"], list)
@@ -206,10 +231,18 @@ class HostAnalysisTracer:
         if not isinstance(proposal, dict):
             raise ValueError("Candidate proposal 必须是 JSON object")
         normalized = _json_clone(proposal, "Candidate proposal")
+        claim_profile = normalized.get("claim_profile", "generic")
+        if claim_profile not in CLAIM_PROFILES:
+            raise ValueError(
+                f"Candidate proposal 含未知 Claim Profile {claim_profile!r};"
+                f"允许值: {', '.join(CLAIM_PROFILES)}")
         self._candidate_seq += 1
         sequence = self._candidate_seq
         candidate = Candidate(f"cand-{sequence:04d}", normalized)
-        investigation = Investigation(f"inv-{sequence:04d}", candidate.candidate_id)
+        investigation = Investigation(
+            f"inv-{sequence:04d}", candidate.candidate_id,
+            claim_profile=claim_profile,
+        )
         self._candidates[candidate.candidate_id] = candidate
         self._investigations[candidate.candidate_id] = investigation
         self._stores[candidate.candidate_id] = InvestigationStore(
@@ -271,7 +304,12 @@ class HostAnalysisTracer:
                     needs_recovery_context = False
                 proposal = self._validated_proposal(session.step(input_message))
             if isinstance(proposal, ActionProposal):
-                state_delta, arguments, tool = self._validate_action(proposal)
+                upcoming_evidence_id = (
+                    f"ev-{pending['sequence']:06d}" if pending
+                    else self._evidence_store.peek_next_evidence_id()
+                )
+                plan, arguments, tool = self._validate_action(
+                    proposal, candidate_id, upcoming_evidence_id)
                 if not pending:
                     slot = self._evidence_store.reserve(candidate_id)
                     pending = {"proposal": asdict(proposal), "sequence": slot.sequence, "executing": False}
@@ -325,41 +363,104 @@ class HostAnalysisTracer:
                         call["status"] = "finished"
                     call["finished"] = True
                     self._checkpoint(candidate_id, "tool_finished")
-                investigation.lifecycle_status = "investigating"
-                investigation.state.update(state_delta)
+                prior_digests = {reference.digest for reference in investigation.evidence}
+                self._advance_lifecycle(investigation, "investigating")
                 investigation.evidence.append(evidence)
+                effects = apply_delta_plan(investigation.state, plan)
+                if action_progressed(effects, evidence.digest, prior_digests):
+                    investigation.no_progress_count = 0
+                else:
+                    investigation.no_progress_count += 1
                 runtime.update(pending=None, last_action=asdict(proposal), observation_view=input_message)
+                if investigation.no_progress_count >= NO_PROGRESS_LIMIT:
+                    self._finish_investigation(
+                        investigation, disposition="unresolved", stop_reason="no_progress")
+                    self._checkpoint(candidate_id, "no_progress_stop")
+                    return deepcopy(investigation)
                 self._checkpoint(candidate_id, "action_completed")
                 continue
             if isinstance(proposal, FinalProposal):
-                if proposal.kind != "close_investigation":
-                    raise ProposalRejectedError(
-                        "单 Candidate Analysis tracer 当前只接受 close_investigation"
+                if proposal.kind == "close_investigation":
+                    plan, closure_reason, closure_evidence = self._validate_close(
+                        proposal.state_delta,
+                        investigation,
                     )
-                state_delta, closure_reason, closure_evidence = self._validate_close(
-                    proposal.state_delta,
-                    investigation,
+                    if not pending:
+                        runtime["pending"] = {"proposal": asdict(proposal)}
+                        self._checkpoint(candidate_id, "proposal_accepted")
+                    apply_delta_plan(investigation.state, plan)
+                    gate = evaluate_ready_gate(
+                        investigation.state,
+                        profile=investigation.claim_profile,
+                        evidence_ids=self._evidence_ids(investigation),
+                    )
+                    if gate.decisive_refuted:
+                        disposition, stop_reason = "rejected", "decisive_refutation"
+                    else:
+                        disposition, stop_reason = "closed", "agent_closed"
+                    self._finish_investigation(
+                        investigation, disposition=disposition, stop_reason=stop_reason)
+                    investigation.closure_reason = closure_reason
+                    investigation.closure_evidence = closure_evidence
+                    runtime.update(pending=None, last_action=asdict(proposal))
+                    self._checkpoint(candidate_id, "analysis_closed")
+                    return deepcopy(investigation)
+                if proposal.kind == "submit_case":
+                    plan, admission_reason = self._validate_submission(proposal, investigation)
+                    trial = deepcopy(investigation.state)
+                    apply_delta_plan(trial, plan)
+                    gate = evaluate_ready_gate(
+                        trial,
+                        profile=investigation.claim_profile,
+                        evidence_ids=self._evidence_ids(investigation),
+                    )
+                    self._assert_admission_consistent(admission_reason, gate)
+                    if not pending:
+                        runtime["pending"] = {"proposal": asdict(proposal)}
+                        self._checkpoint(candidate_id, "proposal_accepted")
+                    apply_delta_plan(investigation.state, plan)
+                    payload = build_case_payload(
+                        candidate_id=candidate_id,
+                        investigation_id=investigation.investigation_id,
+                        profile=investigation.claim_profile,
+                        state=investigation.state,
+                        evidence_references=[
+                            asdict(reference) for reference in investigation.evidence
+                        ],
+                        gate=gate,
+                        admission_reason=admission_reason,
+                    )
+                    atomic_json(
+                        Path(self._evidence_store.run_dir)
+                        / "verifications" / candidate_id / "case.json",
+                        payload,
+                    )
+                    # evidence_gap 与 ready 都停在"案卷已冻结待复核"的进度位;
+                    # ADR-0012"不伪装成 ready"落在案卷内容上(admission_reason、
+                    # pending_claims、blocking_gaps),生命周期不新增第六个值。
+                    self._advance_lifecycle(investigation, "ready_for_verification")
+                    assert_terminal(
+                        investigation.lifecycle_status,
+                        investigation.disposition,
+                        investigation.stop_reason,
+                    )
+                    runtime.update(pending=None, last_action=asdict(proposal))
+                    self._checkpoint(candidate_id, "case_submitted")
+                    return deepcopy(investigation)
+                raise ProposalRejectedError(
+                    "单 Candidate Analysis tracer 只接受 close_investigation/submit_case"
                 )
-                if not pending:
-                    runtime["pending"] = {"proposal": asdict(proposal)}
-                    self._checkpoint(candidate_id, "proposal_accepted")
-                investigation.state.update(state_delta)
-                investigation.lifecycle_status = "finished"
-                investigation.disposition = "closed"
-                investigation.stop_reason = "decisive_refutation"
-                investigation.closure_reason = closure_reason
-                investigation.closure_evidence = closure_evidence
-                runtime.update(pending=None, last_action=asdict(proposal))
-                self._checkpoint(candidate_id, "analysis_closed")
-                return deepcopy(investigation)
 
     def _candidate_context(self, candidate_id: str) -> str:
         candidate = self._candidates[candidate_id]
+        investigation = self._investigations[candidate_id]
         payload = {
             "candidate_id": candidate.candidate_id,
-            "investigation_id": self._investigations[candidate_id].investigation_id,
+            "investigation_id": investigation.investigation_id,
             "proposal": candidate.proposal,
-            "current_state": asdict(self._investigations[candidate_id]),
+            "claim_profile": investigation.claim_profile,
+            "claim_schema": profile_claim_document(investigation.claim_profile),
+            "current_state": asdict(investigation),
             "last_action": self._runtime[candidate_id]["last_action"],
             "observation_view": self._runtime[candidate_id]["observation_view"],
             "remaining_budget": self._runtime[candidate_id]["remaining_budget"],
@@ -389,9 +490,17 @@ class HostAnalysisTracer:
     def _validate_action(
         self,
         proposal: ActionProposal,
-    ) -> tuple[dict[str, Any], dict[str, Any], object]:
+        candidate_id: str,
+        upcoming_evidence_id: str,
+    ) -> tuple[object, dict[str, Any], object]:
         """整份 action 通过 Host 守卫后才把任何 delta 交给循环应用。"""
-        state_delta = self._validate_state_delta(proposal.state_delta)
+        investigation = self._investigations[candidate_id]
+        plan = validate_analysis_delta(
+            investigation.state,
+            proposal.state_delta,
+            evidence_ids=self._evidence_ids(investigation) | {upcoming_evidence_id},
+            profile=investigation.claim_profile,
+        )
         arguments = _json_clone(proposal.arguments, "tool arguments")
         try:
             contract = authorize_tool("analysis", proposal.tool)
@@ -417,7 +526,7 @@ class HostAnalysisTracer:
             )
         if not callable(getattr(tool, "execute", None)):
             raise TypeError(f"工具 adapter {proposal.tool!r} 缺少 execute")
-        return state_delta, arguments, tool
+        return plan, arguments, tool
 
     _normalize_arguments = staticmethod(normalize_tool_arguments)
 
@@ -432,8 +541,8 @@ class HostAnalysisTracer:
         cls,
         state_delta: dict[str, Any],
         investigation: Investigation,
-    ) -> tuple[dict[str, Any], str, tuple[str, ...]]:
-        """关闭必须说明决定性反证，并只引用本 Investigation 的 Evidence。"""
+    ) -> tuple[object, str, tuple[str, ...]]:
+        """关闭必须说明决定性反证,并只引用本 Investigation 的 Evidence。"""
         remaining = cls._validate_state_delta(state_delta)
         reason = remaining.pop("closure_reason", None)
         refs = remaining.pop("evidence_refs", None)
@@ -456,7 +565,74 @@ class HostAnalysisTracer:
                 "close_investigation 引用了不属于当前 Investigation 的 Evidence: "
                 + ", ".join(unknown)
             )
-        return remaining, reason.strip(), tuple(refs)
+        plan = validate_analysis_delta(
+            investigation.state, remaining,
+            evidence_ids=frozenset(owned), profile=investigation.claim_profile,
+        )
+        return plan, reason.strip(), tuple(refs)
+
+    @classmethod
+    def _validate_submission(
+        cls,
+        proposal: FinalProposal,
+        investigation: Investigation,
+    ) -> tuple[object, str]:
+        """submit_case 只声明 admission reason;案卷内容由 Host 从状态冻结。"""
+        delta = cls._validate_state_delta(proposal.state_delta)
+        admission_reason = delta.pop("admission_reason", None)
+        if admission_reason not in ADMISSION_REASONS:
+            raise ProposalRejectedError(
+                "submit_case 要求 state_delta.admission_reason 为 "
+                + " 或 ".join(ADMISSION_REASONS)
+            )
+        plan = validate_analysis_delta(
+            investigation.state, delta,
+            evidence_ids=cls._evidence_ids(investigation),
+            profile=investigation.claim_profile,
+        )
+        return plan, admission_reason
+
+    @staticmethod
+    def _assert_admission_consistent(admission_reason: str, gate) -> None:
+        """拒绝路径零副作用:伪装 ready 或伪装降级都在落 pending 之前拦截。"""
+        if gate.decisive_refuted:
+            raise ProposalRejectedError("; ".join(gate.failures()))
+        if admission_reason == "ready":
+            if not gate.ok:
+                raise ProposalRejectedError(
+                    "ready 案卷提交被拒:ready gate 未满足: " + "; ".join(gate.failures()))
+            return
+        if gate.ok:
+            raise ProposalRejectedError(
+                "ready gate 已满足;请提交 admission_reason=ready 案卷,"
+                "不要降级为 evidence_gap")
+        if not (gate.unassessed or gate.invalid or gate.open_blocking_gaps):
+            raise ProposalRejectedError(
+                "evidence_gap 案卷提交被拒:没有可冻结的缺失项"
+                "(unassessed 必填 Claim 或 blocking gap)")
+
+    @staticmethod
+    def _evidence_ids(investigation: Investigation) -> frozenset[str]:
+        return frozenset(reference.evidence_id for reference in investigation.evidence)
+
+    @staticmethod
+    def _advance_lifecycle(investigation: Investigation, target: str) -> None:
+        assert_lifecycle_transition(investigation.lifecycle_status, target)
+        investigation.lifecycle_status = target
+
+    @staticmethod
+    def _finish_investigation(
+        investigation: Investigation, *, disposition: str, stop_reason: str,
+    ) -> None:
+        assert_lifecycle_transition(investigation.lifecycle_status, "finished")
+        investigation.lifecycle_status = "finished"
+        investigation.disposition = disposition
+        investigation.stop_reason = stop_reason
+        assert_terminal(
+            investigation.lifecycle_status,
+            investigation.disposition,
+            investigation.stop_reason,
+        )
 
     @staticmethod
     def _recover_cached_tool(tool: object, arguments: dict[str, Any]) -> ToolResult | None:

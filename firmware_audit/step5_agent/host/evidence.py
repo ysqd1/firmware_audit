@@ -87,6 +87,10 @@ class EvidenceRecorder:
         self.tool_result_limit_bytes = tool_result_limit_bytes
         self._sequence = 0
 
+    def peek_next_evidence_id(self) -> str:
+        """预测下一个逻辑调用的 Evidence ID;不消耗序列,供副作用前校验引用。"""
+        return f"ev-{self._sequence + 1:06d}"
+
     def reserve(self, candidate_id: str) -> _EvidenceSlot:
         """在真实工具调用前分配身份，并提前拒绝既有不可变位置。"""
         sequence = self._sequence + 1

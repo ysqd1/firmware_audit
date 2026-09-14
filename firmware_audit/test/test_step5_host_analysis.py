@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,8 @@ from firmware_audit.step5_agent.host import (
     ValidationIssue,
     parse_proposal,
 )
+from firmware_audit.step5_agent.host.claims import CLAIM_STATUSES
+from firmware_audit.step5_agent.host.store import InvestigationStore
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
 
 
@@ -105,7 +108,7 @@ def test_host_runs_one_candidate_and_preserves_distinct_evidence(tmp_path: Path)
         "signal": "管理配置包含凭据样式文本",
     })
     session = FakeSession([
-        _action({"working_hypothesis": "配置可能暴露固定令牌"}, {"path": "extracted/etc/device.conf", "limit": 40}),
+        _action({"hypothesis": {"statement": "配置可能暴露固定令牌"}}, {"path": "extracted/etc/device.conf", "limit": 40}),
         _action({"checked_paths": ["extracted/etc/device.conf"]}, {"limit": 40, "path": "extracted/etc/device.conf"}),
         _close(("ev-000001", "ev-000002"), {"closure_note": "重复读取结果一致"}),
     ])
@@ -116,11 +119,11 @@ def test_host_runs_one_candidate_and_preserves_distinct_evidence(tmp_path: Path)
     assert investigation.investigation_id == "inv-0001"
     assert investigation.lifecycle_status == "finished"
     assert investigation.disposition == "closed"
-    assert investigation.stop_reason == "decisive_refutation"
+    assert investigation.stop_reason == "agent_closed"
     assert investigation.closure_reason == "工具 Evidence 构成决定性反证"
     assert investigation.closure_evidence == ("ev-000001", "ev-000002")
     assert investigation.state == {
-        "working_hypothesis": "配置可能暴露固定令牌",
+        "hypothesis": {"working": {"statement": "配置可能暴露固定令牌"}, "history": []},
         "checked_paths": ["extracted/etc/device.conf"],
         "closure_note": "重复读取结果一致",
     }
@@ -173,11 +176,11 @@ def test_candidate_ids_and_investigation_state_are_isolated(tmp_path: Path) -> N
     second = host.add_candidate({"target": "extracted/bin/two"})
 
     first_session = FakeSession([
-        _action({"working_hypothesis": "first-only"}),
+        _action({"note": "first-only"}),
         _close(),
     ])
     second_session = FakeSession([
-        _action({"working_hypothesis": "second-only"}),
+        _action({"note": "second-only"}),
         _close(("ev-000002",)),
     ])
     first_result = host.run_analysis(first.candidate_id, first_session)
@@ -187,8 +190,8 @@ def test_candidate_ids_and_investigation_state_are_isolated(tmp_path: Path) -> N
     assert (first_result.investigation_id, second_result.investigation_id) == (
         "inv-0001", "inv-0002",
     )
-    assert first_result.state == {"working_hypothesis": "first-only"}
-    assert second_result.state == {"working_hypothesis": "second-only"}
+    assert first_result.state == {"note": "first-only"}
+    assert second_result.state == {"note": "second-only"}
     assert [item.evidence_id for item in first_result.evidence] == ["ev-000001"]
     assert [item.evidence_id for item in second_result.evidence] == ["ev-000002"]
     assert first_result.evidence[0].candidate_id == first.candidate_id
@@ -424,7 +427,7 @@ def test_unauthorized_action_rejects_whole_proposal_before_state_delta(tmp_path:
     candidate = host.add_candidate({"target": "extracted/bin/router"})
     proposal = ActionProposal(
         decision_summary="尝试越权外部查询",
-        state_delta={"working_hypothesis": "must-not-apply"},
+        state_delta={"note": "must-not-apply"},
         tool="web_search",
         arguments={"query": "known issue"},
     )
@@ -444,14 +447,14 @@ def test_unauthorized_action_rejects_whole_proposal_before_state_delta(tmp_path:
     [
         ActionProposal(
             decision_summary="非法动作类型",
-            state_delta={"working_hypothesis": "must-not-apply"},
+            state_delta={"note": "must-not-apply"},
             tool="read_file",
             arguments={"path": "extracted/bin/router"},
             kind="invented",
         ),
         ActionProposal(
             decision_summary="非法工具参数",
-            state_delta={"working_hypothesis": "must-not-apply"},
+            state_delta={"note": "must-not-apply"},
             tool="read_file",
             arguments={"path": 7},
         ),
@@ -478,7 +481,7 @@ def test_host_revalidates_directly_constructed_action_proposal(
 @pytest.mark.parametrize(
     "state_delta",
     [
-        {"working_hypothesis": ("silently", "coerced")},
+        {"note": ("silently", "coerced")},
         {1: "silently-stringified-key"},
     ],
 )
@@ -528,3 +531,380 @@ def test_close_requires_reason_and_owned_evidence_reference(
     assert investigation.lifecycle_status == "queued"
     assert investigation.disposition is None
     assert investigation.stop_reason is None
+
+
+# ---- Ticket 08:Claim/假设状态、submit_case 与 no-progress ----
+
+GENERIC_REQUIRED = (
+    "target_exists", "root_cause", "trigger_or_exposure", "actual_impact",
+    "preconditions", "mitigations",
+)
+
+
+def _claims_delta(statuses: dict[str, dict]) -> dict:
+    return {"claims": statuses}
+
+
+def _supported(evidence_id: str = "ev-000001") -> dict:
+    return {"status": "supported", "evidence_ids": [evidence_id]}
+
+
+def _submit(admission: str, state_delta: dict | None = None) -> FinalProposal:
+    return FinalProposal(
+        decision_summary="案卷成熟,提交复核",
+        state_delta={"admission_reason": admission, **(state_delta or {})},
+        kind="submit_case",
+    )
+
+
+def test_candidate_context_carries_claim_profile_and_schema(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({
+        "target": "extracted/bin/router", "claim_profile": "memory"})
+    captured: list[str | None] = []
+
+    class CapturingSession(FakeSession):
+        def step(self, input_message=None):
+            captured.append(input_message)
+            return super().step(input_message)
+
+    session = CapturingSession([_action({}), _close()])
+    host.run_analysis(candidate.candidate_id, session)
+
+    assert host.investigation_for(candidate.candidate_id).claim_profile == "memory"
+    assert '"claim_profile": "memory"' in captured[0]
+    assert "input_or_index_controlled" in captured[0]
+    assert "决定性" not in captured[0]  # schema 是中性名单,不带判定
+
+
+def test_add_candidate_rejects_unknown_claim_profile(tmp_path: Path) -> None:
+    host = HostAnalysisTracer(tmp_path, {})
+    with pytest.raises(ValueError, match="未知 Claim Profile"):
+        host.add_candidate({"target": "x", "claim_profile": "invented"})
+
+
+def test_claim_updates_are_validated_before_tool_execution(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="must not run", raw="must not run"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    proposal = _action(_claims_delta(
+        {"root_cause": {"status": "supported", "evidence_ids": ["ev-999999"]}}))
+
+    with pytest.raises(ProposalRejectedError, match="不存在"):
+        host.run_analysis(candidate.candidate_id, FakeSession([proposal]))
+
+    investigation = host.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "queued"
+    assert investigation.state == {}
+    assert tool.calls == []
+
+
+def test_submit_case_ready_freezes_case_and_advances_lifecycle(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    replies = [
+        {"decision_summary": "一次性判定全部必填 Claim",
+         "state_delta": _claims_delta({name: _supported() for name in GENERIC_REQUIRED}),
+         "next": {"kind": "tool_action", "tool": "read_file",
+                  "arguments": {"path": "extracted/etc/device.conf"}}},
+        {"decision_summary": "提交 ready 案卷",
+         "state_delta": {"admission_reason": "ready"},
+         "next": {"kind": "submit_case"}},
+    ]
+    session = FakeSession([
+        parse_proposal(json.dumps(reply), "analysis") for reply in replies])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert investigation.lifecycle_status == "ready_for_verification"
+    assert investigation.disposition is None
+    assert investigation.stop_reason is None
+    case_path = tmp_path / "verifications" / candidate.candidate_id / "case.json"
+    case = json.loads(case_path.read_text(encoding="utf-8"))
+    assert case["schema_version"] == 1
+    assert case["admission_reason"] == "ready"
+    assert case["claim_profile"] == "generic"
+    assert list(case["claims"]) == list(GENERIC_REQUIRED)
+    assert case["claims"]["root_cause"] == _supported()
+    assert case["pending_claims"] == []
+    assert case["blocking_gaps"] == []
+    assert case["evidence_references"][0]["evidence_id"] == "ev-000001"
+    events = [
+        json.loads(line)["kind"]
+        for line in (tmp_path / "investigations" / candidate.candidate_id
+                     / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-2:] == ["proposal_accepted", "case_submitted"]
+
+
+def test_submit_case_ready_rejected_until_gate_is_met(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([
+        _action(_claims_delta({"target_exists": _supported()})),
+        _submit("ready"),
+    ])
+
+    with pytest.raises(ProposalRejectedError, match="尚未评估"):
+        host.run_analysis(candidate.candidate_id, session)
+
+    investigation = host.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "investigating"
+    assert investigation.state["claims"] == {"target_exists": _supported()}
+    assert not (tmp_path / "verifications").exists()
+
+    # 拒绝不留下 pending 残留:同一 Session 可继续补判并成功提交。
+    finished = host.run_analysis(candidate.candidate_id, FakeSession([
+        _action(_claims_delta({
+            name: _supported("ev-000002")
+            for name in GENERIC_REQUIRED if name != "target_exists"})),
+        _submit("ready"),
+    ]))
+    assert finished.lifecycle_status == "ready_for_verification"
+
+
+def test_submit_case_directs_decisive_refutation_to_rejected_closure(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([
+        _action(_claims_delta({name: _supported() for name in GENERIC_REQUIRED})),
+        _action(_claims_delta({"root_cause": {"status": "refuted"}})),
+        _submit("ready"),
+    ])
+
+    with pytest.raises(ProposalRejectedError, match="close_investigation"):
+        host.run_analysis(candidate.candidate_id, session)
+    assert not (tmp_path / "verifications").exists()
+
+    investigation = host.run_analysis(candidate.candidate_id, FakeSession([
+        _close(("ev-000001",), {"claims": {"root_cause": {"status": "refuted"}}}),
+    ]))
+    assert investigation.lifecycle_status == "finished"
+    assert investigation.disposition == "rejected"
+    assert investigation.stop_reason == "decisive_refutation"
+
+
+def test_close_without_decisive_refutation_stays_closed(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([
+        _action(_claims_delta({"preconditions": {"status": "refuted"}})),
+        _close(),
+    ])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert investigation.disposition == "closed"
+    assert investigation.stop_reason == "agent_closed"
+
+
+def test_submit_case_evidence_gap_freezes_pending_and_gaps(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({
+        "target": "extracted/bin/upgrader", "claim_profile": "credentials"})
+    session = FakeSession([
+        _action({
+            "claims": {"target_exists": _supported()},
+            "gaps_opened": [{"id": "gap-1", "description": "缺材料有效性证据",
+                             "blocking": True}],
+        }),
+        _submit("evidence_gap"),
+    ])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert investigation.lifecycle_status == "ready_for_verification"
+    case = json.loads((tmp_path / "verifications" / candidate.candidate_id
+                       / "case.json").read_text(encoding="utf-8"))
+    assert case["admission_reason"] == "evidence_gap"
+    assert case["claims"]["target_exists"] == _supported()
+    assert case["claims"]["material_valid"] == {
+        "status": "unassessed", "evidence_ids": []}
+    assert "material_valid" in case["pending_claims"]
+    assert case["blocking_gaps"] == [
+        {"id": "gap-1", "description": "缺材料有效性证据"}]
+
+
+def test_evidence_gap_submission_rejected_when_gate_passes(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([
+        _action(_claims_delta({name: _supported() for name in GENERIC_REQUIRED})),
+        _submit("evidence_gap"),
+    ])
+
+    with pytest.raises(ProposalRejectedError, match="不要降级"):
+        host.run_analysis(candidate.candidate_id, session)
+    assert not (tmp_path / "verifications").exists()
+
+
+def test_submit_case_requires_admission_reason(tmp_path: Path) -> None:
+    host = HostAnalysisTracer(tmp_path, {})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    with pytest.raises(ProposalRejectedError, match="admission_reason"):
+        host.run_analysis(candidate.candidate_id, FakeSession([
+            FinalProposal(decision_summary="缺声明", state_delta={}, kind="submit_case"),
+        ]))
+
+
+def test_five_stagnant_completed_actions_stop_investigation(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="identical", raw="identical"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    session = FakeSession([_action({}) for _ in range(8)])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    # 首次出现的 Observation 即新非重复证据,本身算进展;之后连续 5 个
+    # 重复 digest 的空动作触发 no-progress,第七轮不再发起。
+    assert investigation.lifecycle_status == "finished"
+    assert investigation.disposition == "unresolved"
+    assert investigation.stop_reason == "no_progress"
+    assert investigation.no_progress_count == 5
+    assert len(investigation.evidence) == 6
+    assert len(tool.calls) == 6
+    assert len(session.inputs) == 6
+    events = [
+        json.loads(line)["kind"]
+        for line in (tmp_path / "investigations" / candidate.candidate_id
+                     / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1] == "no_progress_stop"
+    with pytest.raises(ValueError, match="不可重新运行"):
+        host.run_analysis(candidate.candidate_id, FakeSession([]))
+
+
+def test_progress_resets_stagnant_streak(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="identical", raw="identical"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    # 首动(新 digest)进展 → 3 停滞 → 假设变化进展 → 4 停滞:连续计数
+    # 被进展清零,远未到 5,调查以主动关闭收束。
+    session = FakeSession(
+        [_action({}) for _ in range(4)]
+        + [_action({"hypothesis": {"statement": "新解释"}})]
+        + [_action({}) for _ in range(4)]
+        + [_close()])
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert investigation.lifecycle_status == "finished"
+    assert investigation.disposition == "closed"
+    assert investigation.stop_reason == "agent_closed"
+    assert investigation.no_progress_count == 4
+    assert len(tool.calls) == 9
+
+
+def test_claim_status_change_counts_as_progress(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    # 6 个动作逐步翻转全部必填 Claim:digest 重复但每个动作都有语义进展。
+    assessed: dict[str, dict] = {}
+    proposals = []
+    for name in GENERIC_REQUIRED:
+        assessed[name] = _supported()
+        proposals.append(_action(_claims_delta(dict(assessed))))
+    session = FakeSession(proposals + [_submit("ready")])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert investigation.lifecycle_status == "ready_for_verification"
+    assert investigation.no_progress_count == 0
+
+
+def test_no_progress_counter_survives_resume(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    with pytest.raises(StopIteration):
+        host.run_analysis(candidate.candidate_id,
+                          FakeSession([_action({}) for _ in range(4)]))
+    assert host.investigation_for(candidate.candidate_id).no_progress_count == 3
+
+    resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    assert resumed.investigation_for(candidate.candidate_id).no_progress_count == 3
+    investigation = resumed.run_analysis(
+        candidate.candidate_id, FakeSession([_action({}) for _ in range(2)]))
+    assert investigation.stop_reason == "no_progress"
+    assert investigation.no_progress_count == 5
+
+
+def test_submit_case_resume_from_persisted_proposal_is_idempotent(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    replace = os.replace
+
+    def crash_after_submit_proposal(source, target):
+        events = target.parent / "events.jsonl"
+        last = json.loads(events.read_text().splitlines()[-1])
+        if last["kind"] == "proposal_accepted" and "submit_case" in last["state"]["runtime"]["pending"]["proposal"]["kind"]:
+            raise OSError("power lost")
+        replace(source, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", crash_after_submit_proposal)
+        with pytest.raises(OSError, match="power lost"):
+            host.run_analysis(candidate.candidate_id, FakeSession([
+                _action(_claims_delta({name: _supported() for name in GENERIC_REQUIRED})),
+                _submit("ready"),
+            ]))
+
+    resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    result = resumed.run_analysis(candidate.candidate_id, FakeSession([]))
+    assert result.lifecycle_status == "ready_for_verification"
+    case = json.loads((tmp_path / "verifications" / candidate.candidate_id
+                       / "case.json").read_text(encoding="utf-8"))
+    assert case["admission_reason"] == "ready"
+
+
+def test_restore_backfills_claim_profile_from_candidate_proposal(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({
+        "target": "extracted/bin/router", "claim_profile": "config"})
+    with pytest.raises(StopIteration):
+        host.run_analysis(candidate.candidate_id, FakeSession([_action({})]))
+
+    store = InvestigationStore(tmp_path, candidate.candidate_id)
+    saved = store.load()
+    del saved["investigation"]["claim_profile"]  # 票 08 之前的快照形态
+    store.save("legacy_projection", saved)
+
+    resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    assert resumed.investigation_for(candidate.candidate_id).claim_profile == "config"
+
+
+def test_protocol_failure_never_enters_no_progress_count(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    invalid = ProposalError((ValidationIssue(
+        path="$.next.kind", expected="role-allowed next kind",
+        actual='"invented"',
+        allowed_values=("tool_action", "submit_case", "close_investigation"),
+    ),), raw_reply='{"next":{"kind":"invented"}}')
+
+    with pytest.raises(ProposalRejectedError):
+        host.run_analysis(candidate.candidate_id, FakeSession([invalid]))
+    # 协议重生成不是已完成的语义动作:计数保持 0。
+    assert host.investigation_for(candidate.candidate_id).no_progress_count == 0
+
+    investigation = host.run_analysis(candidate.candidate_id, FakeSession([
+        _action({}) for _ in range(5)] + [_close()]))
+    assert investigation.stop_reason == "agent_closed"
+    assert investigation.no_progress_count == 4
+
+
+def test_claim_statuses_vocabulary_is_the_adr_set() -> None:
+    assert CLAIM_STATUSES == (
+        "unassessed", "supported", "refuted", "not_applicable")

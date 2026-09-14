@@ -68,13 +68,13 @@ def test_persisted_proposal_does_not_request_model_again(tmp_path, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(os, "replace", crash_after_proposal)
         with pytest.raises(OSError, match="power lost"):
-            host.run_analysis(candidate.candidate_id, FakeSession([_action({"hypothesis": "saved"})]))
+            host.run_analysis(candidate.candidate_id, FakeSession([_action({"hypothesis": {"statement": "saved"}})]))
     assert tool.calls == []
     resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
     session = FakeSession([_close()])
     result = resumed.run_analysis(candidate.candidate_id, session)
     assert result.lifecycle_status == "finished"
-    assert result.state == {"hypothesis": "saved"}
+    assert result.state == {"hypothesis": {"working": {"statement": "saved"}, "history": []}}
     assert len(tool.calls) == 1
     assert len(session.inputs) == 1
     assert "current_state" in session.inputs[0]
@@ -87,11 +87,11 @@ def test_unpersisted_reply_is_requested_again_from_current_state(tmp_path):
     host = HostAnalysisTracer(tmp_path, {"read_file": tool})
     candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
     with pytest.raises(StopIteration):
-        host.run_analysis(candidate.candidate_id, FakeSession([_action({"hypothesis": "saved"})]))
+        host.run_analysis(candidate.candidate_id, FakeSession([_action({"hypothesis": {"statement": "saved"}})]))
     resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
     session = FakeSession([_close()])
     result = resumed.run_analysis(candidate.candidate_id, session)
-    assert result.state == {"hypothesis": "saved"}
+    assert result.state == {"hypothesis": {"working": {"statement": "saved"}, "history": []}}
     assert "saved" in session.inputs[0]
     assert "Observation View" in session.inputs[0]
     assert "remaining_budget" in session.inputs[0]
