@@ -107,6 +107,20 @@ class EvidenceRecorder:
         """Restore the high-water mark from authoritative Investigation events."""
         self._sequence = max(self._sequence, sequence)
 
+    def seed_sequence_from_files(self) -> None:
+        """抬升运行内 Evidence 序列至盘上既有不可变文件的最高水位。
+
+        Recon 阶段没有事件投影,唯一持久的序列消耗痕迹是 Evidence 文件本身;
+        新 Recorder 实例据此播种,保证跨实例/跨进程的 Evidence ID 唯一,
+        绝不重号覆盖既有不可变文件。
+        """
+        for path in self.run_dir.glob("investigations/*/evidence/ev-*.json"):
+            try:
+                sequence = int(path.name[len("ev-"):-len(".json")])
+            except ValueError:
+                continue
+            self.restore_sequence(sequence)
+
     def restore_slot(self, candidate_id: str, sequence: int) -> _EvidenceSlot:
         self.restore_sequence(sequence)
         evidence_id = f"ev-{sequence:06d}"

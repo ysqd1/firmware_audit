@@ -24,14 +24,15 @@ from .evidence import (
     EvidenceReference,
 )
 from .json_values import JsonValueError, clone_json_value
-from .session import ActionProposal, FinalProposal, ProposalError, parse_proposal
+from .session import (
+    ActionProposal,
+    FinalProposal,
+    ProposalError,
+    ProposalRejectedError,
+    revalidate_proposal,
+)
 from .store import InvestigationStore, StoreError
-
-_PATH_ARGUMENTS = frozenset(("path", "file_ref", "directory", "target_dir"))
-
-
-class ProposalRejectedError(ValueError):
-    """Proposal 未通过完整守卫；本轮不得产生 Host 或工具副作用。"""
+from .tooling import execute_tool, normalize_tool_arguments
 
 
 @dataclass(frozen=True)
@@ -371,48 +372,7 @@ class HostAnalysisTracer:
     @staticmethod
     def _validated_proposal(proposal: object) -> ActionProposal | FinalProposal:
         """不信任 Session adapter：按纯 JSON 协议重新校验整份 Proposal。"""
-        if isinstance(proposal, ProposalError):
-            raise ProposalRejectedError(
-                f"Agent Proposal 校验失败: {proposal.feedback_message()}"
-            )
-        if isinstance(proposal, ActionProposal):
-            next_value = {
-                "kind": proposal.kind,
-                "tool": proposal.tool,
-                "arguments": proposal.arguments,
-            }
-        elif isinstance(proposal, FinalProposal):
-            next_value = {"kind": proposal.kind}
-        else:
-            raise ProposalRejectedError(
-                f"Agent Session 返回了未知 Proposal 类型: {type(proposal).__name__}"
-            )
-        payload = _json_clone({
-            "decision_summary": proposal.decision_summary,
-            "state_delta": proposal.state_delta,
-            "next": next_value,
-        }, "Agent Proposal")
-        raw = json.dumps(payload, ensure_ascii=False, allow_nan=False)
-        checked = parse_proposal(raw, "analysis")
-        if isinstance(checked, ProposalError):
-            raise ProposalRejectedError(
-                f"Agent Proposal 校验失败: {checked.feedback_message()}"
-            )
-        # parse_proposal 为重复键检测保留了内部 dict 子类；Host 边界已经在上面
-        # 严格校验并复制 payload，这里用该纯 dict/list 副本承载已通过的 Proposal。
-        if isinstance(checked, ActionProposal):
-            return ActionProposal(
-                decision_summary=checked.decision_summary,
-                state_delta=payload["state_delta"],
-                tool=checked.tool,
-                arguments=payload["next"]["arguments"],
-                kind=checked.kind,
-            )
-        return FinalProposal(
-            decision_summary=checked.decision_summary,
-            state_delta=payload["state_delta"],
-            kind=checked.kind,
-        )
+        return revalidate_proposal(proposal, "analysis")
 
     def _current_investigation(self, candidate_id: str) -> Investigation:
         try:
@@ -459,33 +419,7 @@ class HostAnalysisTracer:
             raise TypeError(f"工具 adapter {proposal.tool!r} 缺少 execute")
         return state_delta, arguments, tool
 
-    @staticmethod
-    def _normalize_arguments(
-        params: dict[str, dict],
-        checked: dict[str, Any],
-    ) -> dict[str, Any]:
-        """固化默认值及声明枚举，并按工具实际规则规范化路径参数。"""
-        normalized: dict[str, Any] = {}
-        for name, declaration in params.items():
-            if name in checked:
-                value = checked[name]
-            elif "default" in declaration:
-                value = deepcopy(declaration["default"])
-            else:
-                continue
-            if isinstance(value, str):
-                value = value.strip()
-                enum = declaration.get("enum") or ()
-                canonical = next(
-                    (item for item in enum if str(item).lower() == value.lower()),
-                    None,
-                )
-                if canonical is not None:
-                    value = canonical
-                if name in _PATH_ARGUMENTS:
-                    value = value.replace("\\", "/")
-            normalized[name] = value
-        return _json_clone(normalized, "normalized tool arguments")
+    _normalize_arguments = staticmethod(normalize_tool_arguments)
 
     @staticmethod
     def _validate_state_delta(state_delta: dict[str, Any]) -> dict[str, Any]:
@@ -539,21 +473,4 @@ class HostAnalysisTracer:
                 f"缓存恢复失败: {type(exc).__name__}: {exc}；未自动重放，请选择替代取证动作"
             ))
 
-    @staticmethod
-    def _execute_tool(tool: object, arguments: dict[str, Any], *, method: str = "execute") -> ToolResult:
-        """工具 adapter 失约也转为失败 ToolResult，保留本次逻辑调用身份。"""
-        try:
-            result = getattr(tool, method)(**arguments)
-        except Exception as exc:
-            return ToolResult(
-                ok=False,
-                text="",
-                error=f"工具 adapter 抛出 {type(exc).__name__}: {exc}",
-            )
-        if isinstance(result, ToolResult):
-            return result
-        return ToolResult(
-            ok=False,
-            text="",
-            error=f"工具 adapter 必须返回 ToolResult，实际为 {type(result).__name__}",
-        )
+    _execute_tool = staticmethod(execute_tool)

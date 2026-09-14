@@ -1,12 +1,14 @@
-"""逐步 Agent Session：一次模型请求只返回一个经校验的 Proposal。
+"""逐步 Agent Session:一次模型请求只返回一个经校验的 Proposal。
 
-本模块是模型文本与未来 Host 控制循环之间的 seam。它负责纯 JSON 解析、
-角色动作限制、精确错误反馈，以及复用 ContextManager/Transcript 发起单次请求；
-它没有工具注册表、循环或阶段状态，因此不能执行动作或推进调查生命周期。
+本模块是模型文本与 Host 控制循环之间的 seam。它负责纯 JSON 解析、
+角色动作限制、精确错误反馈,以及复用 ContextManager/Transcript 发起单次请求;
+它没有工具注册表、循环或阶段状态,因此不能执行动作或推进调查生命周期。
+``revalidate_proposal`` 是各角色 Host 循环共用的整份守卫:不信任 Session
+adapter,重新按协议校验并返回承载纯 JSON 副本的 Proposal。
 
-协议刻意只固定本票已经确认的形状。``state_delta`` 的领域字段会由后续 Host
-Policy 工单定义；这里仅保证它是 JSON object，并保证 Related Candidate 只能
-位于其中。终止动作的内容同样全部放在 state delta，``next`` 只表达唯一动作。
+``state_delta`` 的领域字段由各角色 Host 模块定义;这里仅保证它是 JSON
+object,并保证 Related Candidate 只能位于其中。终止动作的内容同样全部
+放在 state delta,``next`` 只表达唯一动作。
 """
 from __future__ import annotations
 
@@ -18,8 +20,13 @@ from typing import Any
 
 from ..engine.context import ContextManager
 from ..engine.transcript import Transcript
+from .json_values import JsonValueError, clone_json_value
 
 MAX_DECISION_SUMMARY_CHARS = 500
+
+
+class ProposalRejectedError(ValueError):
+    """Proposal 未通过 Host 完整守卫;本轮不得产生 Host 或工具副作用。"""
 
 ROLE_NEXT_KINDS: dict[str, tuple[str, ...]] = {
     "recon": ("tool_action", "complete_survey"),
@@ -87,6 +94,59 @@ class FinalProposal:
 
 
 ProposalResult = ActionProposal | FinalProposal | ProposalError
+
+
+def revalidate_proposal(proposal: object, role: str) -> ActionProposal | FinalProposal:
+    """Host 边界统一守卫:不信任 Session adapter,按纯 JSON 协议重新整份校验。
+
+    供各角色 Host 循环共用;通过后返回承载已校验纯 JSON 副本的 Proposal,
+    失败抛 ProposalRejectedError(整份拒绝,无局部应用)。
+    """
+    if isinstance(proposal, ProposalError):
+        raise ProposalRejectedError(
+            f"Agent Proposal 校验失败: {proposal.feedback_message()}"
+        )
+    if isinstance(proposal, ActionProposal):
+        next_value = {
+            "kind": proposal.kind,
+            "tool": proposal.tool,
+            "arguments": proposal.arguments,
+        }
+    elif isinstance(proposal, FinalProposal):
+        next_value = {"kind": proposal.kind}
+    else:
+        raise ProposalRejectedError(
+            f"Agent Session 返回了未知 Proposal 类型: {type(proposal).__name__}"
+        )
+    try:
+        payload = clone_json_value({
+            "decision_summary": proposal.decision_summary,
+            "state_delta": proposal.state_delta,
+            "next": next_value,
+        }, "Agent Proposal")
+    except JsonValueError as exc:
+        raise ProposalRejectedError(str(exc)) from exc
+    raw = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    checked = parse_proposal(raw, role)
+    if isinstance(checked, ProposalError):
+        raise ProposalRejectedError(
+            f"Agent Proposal 校验失败: {checked.feedback_message()}"
+        )
+    # parse_proposal 为重复键检测保留了内部 dict 子类;Host 边界已经在上面
+    # 严格校验并复制 payload,这里用该纯 dict/list 副本承载已通过的 Proposal。
+    if isinstance(checked, ActionProposal):
+        return ActionProposal(
+            decision_summary=checked.decision_summary,
+            state_delta=payload["state_delta"],
+            tool=checked.tool,
+            arguments=payload["next"]["arguments"],
+            kind=checked.kind,
+        )
+    return FinalProposal(
+        decision_summary=checked.decision_summary,
+        state_delta=payload["state_delta"],
+        kind=checked.kind,
+    )
 
 
 class _DecodedObject(dict):
