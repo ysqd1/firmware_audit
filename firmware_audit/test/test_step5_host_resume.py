@@ -49,9 +49,10 @@ def test_partial_observation_write_is_not_published(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("investigations/*/evidence/ev-*.json"))
     resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
     assert resumed.investigation_for(candidate.candidate_id).evidence == []
-    # Automatic replay of the pending in-flight action is Ticket 05.
-    with pytest.raises(StoreError, match="中断"):
-        resumed.run_analysis(candidate.candidate_id, FakeSession([]))
+    result = resumed.run_analysis(candidate.candidate_id, FakeSession([_close()]))
+    assert [ref.evidence_id for ref in result.evidence] == ["ev-000001"]
+    assert result.tool_attempts == 2
+    assert result.logical_tool_calls == 1
 
 
 def test_persisted_proposal_does_not_request_model_again(tmp_path, monkeypatch):

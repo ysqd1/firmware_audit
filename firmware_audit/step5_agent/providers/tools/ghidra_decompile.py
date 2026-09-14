@@ -19,16 +19,17 @@ analysis/ 之下。
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
-from .base import AgentTool, ToolResult, resolve_within
+from .base import AgentTool, ToolResult, resolve_within, validate_params
 from .cli_base import analysis_root
+from .ghidra_cache import publish_receipt, sha256_of, validated_manifest
 from .r2_base import elf_guard, extracted_host_path
 from ....docker.docker_utils import run_docker  # 模块属性:测试假件补丁点
 
@@ -79,14 +80,6 @@ def _cache_valid(c_path: Path) -> bool:
     return _header_field(c_path, r"decompile_success:\s*(\d+)") > 0
 
 
-def _sha256_of(p: Path) -> str:
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _load_dedup(analysis_dir: Path) -> dict:
     p = analysis_dir / _DEDUP_INDEX
     try:
@@ -111,6 +104,18 @@ def _materialize(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+def _replace_artifact(src: Path, dst: Path) -> None:
+    """Replace a directory entry, never truncate another cache's shared inode."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".ghidra-", dir=dst.parent)
+    os.close(descriptor)
+    try:
+        shutil.copy2(src, temporary)
+        os.replace(temporary, dst)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 class GhidraDecompileTool(AgentTool):
     name = "ghidra_decompile"
     description = ("反编译单个 ELF 为 C 代码并落盘边车(分钟级容器,按需升级调用:先 r2 层,"
@@ -120,7 +125,48 @@ class GhidraDecompileTool(AgentTool):
         "file_ref": {"type": "str", "required": True, "desc": "相对 extracted 根的 ELF 路径"},
     }
 
+    def recover_cached_result(self, *, file_ref: str) -> ToolResult | None:
+        """Host recovery probe: accept only complete cache bound to this input."""
+        if elf_guard(self.ctx, file_ref):
+            return None
+        host = extracted_host_path(self.ctx, file_ref)
+        rel = file_ref.strip().replace("\\", "/").removeprefix("extracted/")
+        analysis_dir = analysis_root(self.ctx)
+        c_path = resolve_within(analysis_dir, f"{rel}.c")
+        if c_path is None or not _cache_valid(c_path):
+            return None
+        manifest = validated_manifest(analysis_dir, rel, sha256_of(host))
+        if manifest is None:
+            return None
+        n = _header_field(c_path, r"decompile_success:\s*(\d+)")
+        text = (f"已反编译(完整缓存与 digest 校验通过): analysis/{rel}.c({n} 个函数);"
+                "读函数用 find_decompiled_function。")
+        return ToolResult(ok=True, text=text, raw=text, data={
+            "file": f"analysis/{rel}.c", "functions": n, "cache": "validated",
+            "artifacts": manifest["artifacts"],
+        })
+
     def _run(self, file_ref: str) -> ToolResult:
+        return self._decompile(file_ref, allow_legacy_cache=True)
+
+    def execute_after_interruption(self, **arguments) -> ToolResult:
+        """Host-only retry after a failed cache probe; never re-enter weak caches.
+
+        This control is not an LLM parameter. Keep normal execute semantics for
+        validation, failure Observation, timing and raw text preservation.
+        """
+        start = time.time()
+        try:
+            checked, error = validate_params(self.params, arguments)
+            if error:
+                result = ToolResult(ok=False, text="", error=error)
+            else:
+                result = self._decompile(**checked, allow_legacy_cache=False)
+        except Exception as exc:
+            result = ToolResult(ok=False, text="", error=f"{type(exc).__name__}: {exc}；请改用 r2 层取证")
+        return self._finalize(result, start)
+
+    def _decompile(self, file_ref: str, *, allow_legacy_cache: bool) -> ToolResult:
         guard = elf_guard(self.ctx, file_ref)
         if guard:
             return ToolResult(ok=False, text="", error=guard)
@@ -133,7 +179,7 @@ class GhidraDecompileTool(AgentTool):
             return ToolResult(ok=False, text="", error=f"非法路径: {file_ref}")
 
         # 1) 幂等缓存:版本匹配且非空壳 → 零容器
-        if _cache_valid(c_path):
+        if allow_legacy_cache and _cache_valid(c_path):
             n = _header_field(c_path, r"decompile_success:\s*(\d+)")
             return ToolResult(
                 ok=True,
@@ -144,10 +190,10 @@ class GhidraDecompileTool(AgentTool):
             )
 
         # 2) 内容去重:sha256 查索引,命中复用已有边车(硬链接,降级拷贝)
-        sha = _sha256_of(host)
+        sha = sha256_of(host)
         dedup = _load_dedup(analysis_dir)
         first_rel = dedup.get(sha)
-        if first_rel and first_rel != rel:
+        if allow_legacy_cache and first_rel and first_rel != rel:
             # 反查值与自写 key 同样收口:索引损坏/被手改时不把 analysis/ 之外
             # 的宿主文件物化进边车位
             first_c = resolve_within(analysis_dir, f"{first_rel}.c")
@@ -167,6 +213,11 @@ class GhidraDecompileTool(AgentTool):
                 )
 
         # 3) 容器反编译(ghidra 镜像,Step4 现制)
+        receipt_path = resolve_within(analysis_dir, f"{rel}.cache.json")
+        if receipt_path is None:
+            return ToolResult(ok=False, text="", error="非法缓存路径；请检查 analysis 目录")
+        # A failed/incomplete replacement must not inherit the prior certificate.
+        receipt_path.unlink(missing_ok=True)
         ok, detail = self._run_ghidra(host, rel, analysis_dir)
         if not ok:
             return ToolResult(
@@ -177,6 +228,7 @@ class GhidraDecompileTool(AgentTool):
             )
         n = _header_field(c_path, r"decompile_success:\s*(\d+)")
         # 成功才登记 dedup 索引(sha → 首个反编译路径)
+        publish_receipt(analysis_dir, rel, sha)
         dedup[sha] = rel
         _save_dedup(analysis_dir, dedup)
         return ToolResult(
@@ -228,9 +280,20 @@ class GhidraDecompileTool(AgentTool):
             decompiled_src = ghidra_output / "decompiled.c"
             if not decompiled_src.is_file() or decompiled_src.stat().st_size == 0:
                 return False, "容器无 decompiled.c 产出"
+            # Validate this generation before copying; old sidecars at the target
+            # must never fill holes in an interrupted or incomplete generation.
+            for jname in _SIDECAR_JSONS:
+                src = ghidra_output / jname
+                try:
+                    value = json.loads(src.read_text(encoding="utf-8"))
+                    expected = list if jname == "imports.json" else dict
+                    if not isinstance(value, expected):
+                        raise ValueError("JSON 结构不匹配")
+                except (OSError, ValueError) as exc:
+                    return False, f"容器边车 {jname} 缺失或损坏: {exc}"
             dest = analysis_dir / f"{rel}.c"
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(decompiled_src, dest)
+            _replace_artifact(decompiled_src, dest)
             if not _cache_valid(dest):
                 return False, "反编译无有效产出(全部函数失败或旧版本空壳)"
 
@@ -239,5 +302,5 @@ class GhidraDecompileTool(AgentTool):
                 if src.is_file() and src.stat().st_size > 0:
                     side = analysis_dir / f"{rel}.{jname}"
                     side.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src, side)
+                    _replace_artifact(src, side)
             return True, ""

@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..providers.tools import ToolAuthorizationError, authorize_tool
+from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
 from .evidence import (
     DEFAULT_TOOL_RESULT_LIMIT_BYTES,
@@ -55,6 +55,8 @@ class Investigation:
     closure_evidence: tuple[str, ...] = ()
     state: dict[str, Any] = field(default_factory=dict)
     evidence: list[EvidenceReference] = field(default_factory=list)
+    tool_attempts: int = 0
+    logical_tool_calls: int = 0
 
 
 def _json_clone(value: Any, label: str) -> Any:
@@ -141,12 +143,62 @@ class HostAnalysisTracer:
             recovered = self._evidence_store.recover(slot)
             if recovered is None or recovered[0] != reference:
                 raise StoreError("已引用 Evidence 缺失或与事件不一致")
+        self._validate_saved_call(runtime, data, candidate_id)
         self._candidates[candidate_id] = candidate
         self._investigations[candidate_id] = investigation
         self._stores[candidate_id] = store
         self._runtime[candidate_id] = runtime
         self._resumed.add(candidate_id)
         self._candidate_seq = max(self._candidate_seq, int(candidate_id.split("-")[1]))
+
+    def _validate_saved_call(self, runtime: dict, data: dict, candidate_id: str) -> None:
+        """Never derive replay permission or cost from an unvalidated projection."""
+        call = runtime["last_tool_call"]
+        pending = runtime["pending"]
+        active = pending is not None and pending["proposal"]["kind"] == "tool_action"
+        logical, attempts = data["logical_tool_calls"], data["tool_attempts"]
+        if (type(logical) is not int or type(attempts) is not int
+                or attempts < 0 or logical != len(data["evidence"]) + int(active)):
+            raise StoreError("工具调用计数损坏")
+        if call is None:
+            if logical or attempts:
+                raise StoreError("缺少逻辑调用记录")
+            return
+        if not isinstance(call, dict):
+            raise StoreError("逻辑调用记录结构损坏")
+        if active:
+            sequence = pending["sequence"]
+            proposal = pending["proposal"]
+            tool_name, arguments = proposal["tool"], proposal["arguments"]
+        else:
+            if not data["evidence"]:
+                raise StoreError("工具调用缺少 Evidence")
+            reference = data["evidence"][-1]
+            sequence, tool_name, arguments = reference.sequence, reference.tool, reference.arguments
+        contract = authorize_tool("analysis", tool_name)
+        checked, error = validate_params(contract.tool_type.params, arguments)
+        if error:
+            raise StoreError("持久化工具参数失约")
+        arguments = self._normalize_arguments(contract.tool_type.params, checked)
+        attempt, status, finished = call["attempt"], call["status"], call["finished"]
+        if (call["call_id"] != f"call-{sequence:06d}"
+                or call["evidence_id"] != f"ev-{sequence:06d}"
+                or call["tool"] != tool_name or call["arguments"] != arguments
+                or call["replay_policy"] != contract.replay_policy.value
+                or type(attempt) is not int or not 0 <= attempt <= attempts
+                or type(finished) is not bool
+                or status not in ("prepared", "started", "finished", "interrupted")
+                or (attempt == 0) != (status == "prepared")
+                or (status == "finished" and not finished)
+                or (finished and status not in ("finished", "interrupted"))
+                or (status == "interrupted" and contract.replay_policy is not ReplayPolicy.NEVER)
+                or (active and pending["executing"] != (attempt > 0))
+                or (not active and not finished)):
+            raise StoreError("工具调用身份、状态或 replay policy 损坏")
+        if finished:
+            slot = self._evidence_store.restore_slot(candidate_id, sequence)
+            if self._evidence_store.recover(slot) is None:
+                raise StoreError("tool_finished 缺少持久化 Observation")
 
     def add_candidate(self, proposal: dict[str, Any]) -> Candidate:
         """分配 Candidate ID，并一一创建隔离的 queued Investigation。"""
@@ -164,6 +216,7 @@ class HostAnalysisTracer:
         )
         self._runtime[candidate.candidate_id] = {
             "pending": None, "last_action": None, "observation_view": None,
+            "last_tool_call": None,
             "remaining_budget": deepcopy(self._initial_budget),
         }
         self._checkpoint(candidate.candidate_id, "candidate_created")
@@ -222,16 +275,41 @@ class HostAnalysisTracer:
                     slot = self._evidence_store.reserve(candidate_id)
                     pending = {"proposal": asdict(proposal), "sequence": slot.sequence, "executing": False}
                     runtime["pending"] = pending
+                    runtime["last_tool_call"] = {
+                        "call_id": f"call-{slot.sequence:06d}",
+                        "evidence_id": slot.evidence_id,
+                        "tool": proposal.tool, "arguments": arguments,
+                        "replay_policy": authorize_tool("analysis", proposal.tool).replay_policy.value,
+                        "attempt": 0, "status": "prepared", "finished": False,
+                    }
+                    investigation.logical_tool_calls += 1
                     self._checkpoint(candidate_id, "proposal_accepted")
                 else:
                     slot = self._evidence_store.restore_slot(candidate_id, pending["sequence"])
                 recovered = self._evidence_store.recover(slot)
+                call = runtime["last_tool_call"]
                 if recovered is None:
-                    if pending["executing"]:
-                        raise StoreError("工具调用已中断；需按 replay policy 恢复（工单 05）")
-                    pending["executing"] = True
-                    self._checkpoint(candidate_id, "tool_in_flight")
-                    result = self._execute_tool(tool, arguments)
+                    result = None
+                    execute_method = "execute"
+                    if pending["executing"] and call["replay_policy"] == ReplayPolicy.NEVER.value:
+                        if call["status"] != "interrupted":
+                            call["status"] = "interrupted"
+                            self._checkpoint(candidate_id, "tool_interrupted")
+                        result = ToolResult(
+                            ok=False, text="", data={"status": "interrupted", "call_id": call["call_id"]},
+                            error="interrupted：工具执行已中断，结果未知；禁止自动重放，请选择替代取证动作。",
+                        )
+                    elif pending["executing"] and call["replay_policy"] == ReplayPolicy.CACHE_VALIDATED.value:
+                        execute_method = "execute_after_interruption"
+                        result = self._recover_cached_tool(tool, arguments)
+                    if result is None:
+                        kind = "tool_attempt" if pending["executing"] else "tool_started"
+                        pending["executing"] = True
+                        call["attempt"] += 1
+                        call["status"] = "started"
+                        investigation.tool_attempts += 1
+                        self._checkpoint(candidate_id, kind)
+                        result = self._execute_tool(tool, arguments, method=execute_method)
                     recovered = self._evidence_store.record(
                         slot, candidate_id=candidate_id,
                         investigation_id=investigation.investigation_id,
@@ -241,6 +319,11 @@ class HostAnalysisTracer:
                 if (evidence.tool != proposal.tool or evidence.arguments != arguments
                         or evidence.investigation_id != investigation.investigation_id):
                     raise StoreError("Evidence 与待执行动作不匹配；请检查工件")
+                if not call["finished"]:
+                    if call["status"] != "interrupted":
+                        call["status"] = "finished"
+                    call["finished"] = True
+                    self._checkpoint(candidate_id, "tool_finished")
                 investigation.lifecycle_status = "investigating"
                 investigation.state.update(state_delta)
                 investigation.evidence.append(evidence)
@@ -442,10 +525,25 @@ class HostAnalysisTracer:
         return remaining, reason.strip(), tuple(refs)
 
     @staticmethod
-    def _execute_tool(tool: object, arguments: dict[str, Any]) -> ToolResult:
+    def _recover_cached_tool(tool: object, arguments: dict[str, Any]) -> ToolResult | None:
+        """Cache-aware adapters must explicitly support both probe and safe retry."""
+        try:
+            if not callable(getattr(tool, "execute_after_interruption", None)):
+                raise TypeError("缓存工具缺少 execute_after_interruption")
+            result = tool.recover_cached_result(**arguments)
+            if result is not None and not isinstance(result, ToolResult):
+                raise TypeError("缓存校验必须返回 ToolResult 或 None")
+            return result
+        except Exception as exc:
+            return ToolResult(ok=False, text="", error=(
+                f"缓存恢复失败: {type(exc).__name__}: {exc}；未自动重放，请选择替代取证动作"
+            ))
+
+    @staticmethod
+    def _execute_tool(tool: object, arguments: dict[str, Any], *, method: str = "execute") -> ToolResult:
         """工具 adapter 失约也转为失败 ToolResult，保留本次逻辑调用身份。"""
         try:
-            result = tool.execute(**arguments)
+            result = getattr(tool, method)(**arguments)
         except Exception as exc:
             return ToolResult(
                 ok=False,
