@@ -577,3 +577,29 @@ def test_coverage_gaps_require_a_coverage_candidate(tmp_path: Path) -> None:
     assert "coverage" in feedback
     # 缺 coverage 候选的 survey 不落盘;补齐重提后两种 kind 均入库
     assert [candidate.kind for candidate in result.candidates] == ["signal", "coverage"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda c: c.update(claim_profile="authentication"),  # 不在枚举内
+        lambda c: c.update(anchor=["handle_msg"]),
+        lambda c: c.update(mechanism=42),
+        lambda c: c.update(component_or_entry={"a": 1}),
+        lambda c: c.update(check_goal=True),
+    ],
+)
+def test_survey_rejected_on_bad_fingerprint_input_fields(
+    tmp_path: Path, mutation,
+) -> None:
+    """claim_profile 枚举与 fingerprint 输入字段类型在 survey 门被拒,供下游去重可靠归一。"""
+    delta = _survey_delta()
+    mutation(delta["candidates"][0])
+    session = FakeReconSession([_recon_action(), _survey(delta), _survey(_survey_delta())])
+
+    result = _run(tmp_path, session)
+
+    assert result.status == "completed"
+    feedback = session.inputs[2]
+    assert "survey_rejected" in feedback
+    assert "$.state_delta.candidates[0]" in feedback

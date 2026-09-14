@@ -26,6 +26,7 @@ from typing import Any, Literal
 from ...file_rules import is_search_excluded
 from ..providers.tools import ToolAuthorizationError, authorize_tool, tool_names_for_role
 from ..providers.tools.base import MAX_TEXT_CHARS, validate_params
+from .candidates import CLAIM_PROFILES, FINGERPRINT_INPUT_FIELDS
 from .evidence import (
     DEFAULT_TOOL_RESULT_LIMIT_BYTES,
     EvidenceRecorder,
@@ -140,11 +141,15 @@ def input_failure_reason(overview: dict[str, Any]) -> str | None:
 
 # ---- Host Recon 运行结果与 Candidate Store ----
 
-CANDIDATE_STORE_SCHEMA_VERSION = 1
+# Recon 写下的原始 proposal 工件版本;去重评分后的 Candidate Store 权威版本
+# 见 candidates.CANDIDATE_STORE_SCHEMA_VERSION(工单 07 起为 2)。
+RECON_STORE_SCHEMA_VERSION = 1
 SURVEY_SECTIONS = ("attack_surface", "candidates", "checked_scope", "coverage_gaps")
 _CANDIDATE_KINDS = ("signal", "coverage")
 _CANDIDATE_REQUIRED_TEXT_FIELDS = ("target", "signal", "next_action")
 _CANDIDATE_OPTIONAL_TEXT_FIELDS = ("possible_source", "possible_sink")
+# 去重 fingerprint 的输入字段(工单 07)复用 candidates 的单一来源清单:
+# survey 门只做类型/枚举把关,内容归一由 host.candidates.normalize_intake 负责。
 
 
 @dataclass(frozen=True)
@@ -330,6 +335,21 @@ def _candidate_issues(
                 issues.append(ValidationIssue(
                     path=f"{base}.{name}", expected="string or absent",
                     actual=_json_type(entry[name])))
+        for name in FINGERPRINT_INPUT_FIELDS:
+            if name in entry and not isinstance(entry[name], str):
+                issues.append(ValidationIssue(
+                    path=f"{base}.{name}", expected="string or absent",
+                    actual=_json_type(entry[name])))
+        profile = entry.get("claim_profile")
+        if profile is not None and (
+            not isinstance(profile, str) or profile not in CLAIM_PROFILES
+        ):
+            issues.append(ValidationIssue(
+                path=f"{base}.claim_profile",
+                expected="Claim Profile 枚举值或缺失(默认 generic)",
+                actual=json.dumps(profile, ensure_ascii=False),
+                allowed_values=CLAIM_PROFILES,
+            ))
         evidence_id = entry.get("evidence_id")
         issues.extend(_string_entry_issues(f"{base}.evidence_id", evidence_id))
         if isinstance(evidence_id, str) and evidence_id.strip() \
@@ -577,7 +597,7 @@ class HostReconRunner:
         proposals: list[CandidateProposal],
     ) -> Path:
         payload = clone_json_value({
-            "schema_version": CANDIDATE_STORE_SCHEMA_VERSION,
+            "schema_version": RECON_STORE_SCHEMA_VERSION,
             "survey": survey,
             "session_state": session_state,
             "candidates": [proposal.as_dict() for proposal in proposals],
@@ -617,6 +637,12 @@ Host 会在首轮消息注入确定性现场概览(顶层目录×文件数×大�
   evidence_id(本轮工具 Observation 的 Evidence ID)、next_action(下一步
   调查动作);possible_source/possible_sink 可为空。禁止引用不存在的
   Evidence ID。
+- fingerprint 输入字段(可选但强烈建议,Host 用其去重):signal 候选带
+  anchor(函数/行号等位置锚点)与 mechanism(问题机制,如 command
+  injection/hardcoded credentials);coverage 候选带 component_or_entry
+  (组件或入口)与 check_goal(检查目标);两者都可带 claim_profile
+  (data_propagation/config/credentials/memory/generic,缺省 generic)。
+  同一问题的重复 proposal 靠这些字段精确合并,缺失会增加一次语义比较。
 - checked_scope: 非空字符串数组,记录已检查范围(目录/扫描/抽查);
   跑过工具却报空范围会被整份拒绝。
 - coverage_gaps: object 数组,每项含非空 area(未检查的高价值面)。
