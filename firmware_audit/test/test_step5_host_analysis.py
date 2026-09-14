@@ -19,6 +19,7 @@ from firmware_audit.step5_agent.host import (
     parse_proposal,
 )
 from firmware_audit.step5_agent.host.claims import CLAIM_STATUSES
+from firmware_audit.step5_agent.host.evidence import EvidenceRecorder
 from firmware_audit.step5_agent.host.store import InvestigationStore
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
 
@@ -386,14 +387,30 @@ def test_existing_evidence_file_is_never_overwritten(tmp_path: Path) -> None:
     existing.parent.mkdir(parents=True)
     existing.write_text("original immutable evidence", encoding="utf-8")
 
-    with pytest.raises(FileExistsError):
-        host.run_analysis(candidate.candidate_id, FakeSession([_action({})]))
+    investigation = host.run_analysis(candidate.candidate_id, FakeSession([
+        _action({}), _close(("ev-000002",)),
+    ]))
 
+    # 会话开始前抬水位:已占编号被跳过而非撞号,既有不可变文件原样保留。
     assert existing.read_text(encoding="utf-8") == "original immutable evidence"
-    investigation = host.investigation_for(candidate.candidate_id)
-    assert investigation.lifecycle_status == "queued"
-    assert investigation.evidence == []
-    assert tool.calls == []
+    assert investigation.lifecycle_status == "finished"
+    assert [item.evidence_id for item in investigation.evidence] == ["ev-000002"]
+    assert (tmp_path / "investigations" / candidate.candidate_id
+            / "evidence" / "ev-000002.json").exists()
+
+
+def test_reserve_refuses_concurrent_evidence_writer(tmp_path: Path) -> None:
+    recorder = EvidenceRecorder(tmp_path)
+    recorder.seed_sequence_from_files()  # 此刻两棵树为空,水位 0
+    appeared = (
+        tmp_path / "investigations" / "cand-0001" / "evidence" / "ev-000001.json"
+    )
+    appeared.parent.mkdir(parents=True)
+    # seed 之后才出现的并发写手由 reserve 的存在性检查兜底:宁可失败也不覆盖。
+    appeared.write_text("并发写手已占用", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        recorder.reserve("cand-0001")
 
 
 def test_invalid_proposal_has_no_host_or_tool_side_effect(tmp_path: Path) -> None:

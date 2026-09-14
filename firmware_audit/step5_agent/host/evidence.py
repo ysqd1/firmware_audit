@@ -77,6 +77,7 @@ class EvidenceRecorder:
         *,
         observation_view_limit: int = MAX_TEXT_CHARS,
         tool_result_limit_bytes: int = DEFAULT_TOOL_RESULT_LIMIT_BYTES,
+        namespace: str = "investigations",
     ):
         if observation_view_limit < 1:
             raise ValueError("observation_view_limit 必须大于 0")
@@ -85,6 +86,9 @@ class EvidenceRecorder:
         self.run_dir = Path(run_dir)
         self.observation_view_limit = observation_view_limit
         self.tool_result_limit_bytes = tool_result_limit_bytes
+        # Evidence 树的根目录:investigations(Analysis/Recon)或
+        # verifications(独立复核,ADR-0012 复核目录自持 Evidence)。
+        self.namespace = namespace
         self._sequence = 0
 
     def peek_next_evidence_id(self) -> str:
@@ -96,7 +100,7 @@ class EvidenceRecorder:
         sequence = self._sequence + 1
         evidence_id = f"ev-{sequence:06d}"
         location = (
-            Path("investigations")
+            Path(self.namespace)
             / candidate_id
             / "evidence"
             / f"{evidence_id}.json"
@@ -116,19 +120,22 @@ class EvidenceRecorder:
 
         Recon 阶段没有事件投影,唯一持久的序列消耗痕迹是 Evidence 文件本身;
         新 Recorder 实例据此播种,保证跨实例/跨进程的 Evidence ID 唯一,
-        绝不重号覆盖既有不可变文件。
+        绝不重号覆盖既有不可变文件。两棵 Evidence 树都计入水位:复核
+        Evidence 虽存于 verifications/,同样占用运行内递增编号。
         """
-        for path in self.run_dir.glob("investigations/*/evidence/ev-*.json"):
-            try:
-                sequence = int(path.name[len("ev-"):-len(".json")])
-            except ValueError:
-                continue
-            self.restore_sequence(sequence)
+        for pattern in ("investigations/*/evidence/ev-*.json",
+                        "verifications/*/evidence/ev-*.json"):
+            for path in self.run_dir.glob(pattern):
+                try:
+                    sequence = int(path.name[len("ev-"):-len(".json")])
+                except ValueError:
+                    continue
+                self.restore_sequence(sequence)
 
     def restore_slot(self, candidate_id: str, sequence: int) -> _EvidenceSlot:
         self.restore_sequence(sequence)
         evidence_id = f"ev-{sequence:06d}"
-        return _EvidenceSlot(evidence_id, Path("investigations") / candidate_id /
+        return _EvidenceSlot(evidence_id, Path(self.namespace) / candidate_id /
                              "evidence" / f"{evidence_id}.json", sequence)
 
     def recover(self, slot: _EvidenceSlot) -> tuple[EvidenceReference, str] | None:

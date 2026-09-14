@@ -40,7 +40,6 @@ from .evidence import (
     EvidenceRecorder,
     EvidenceReference,
 )
-from .json_values import JsonValueError, clone_json_value
 from .session import (
     ActionProposal,
     FinalProposal,
@@ -49,7 +48,13 @@ from .session import (
     revalidate_proposal,
 )
 from .store import InvestigationStore, StoreError, atomic_json
-from .tooling import execute_tool, normalize_tool_arguments
+from .tooling import (
+    execute_tool,
+    json_clone_or_reject,
+    normalize_tool_arguments,
+    recover_cached_tool,
+    validate_saved_tool_call,
+)
 
 
 @dataclass(frozen=True)
@@ -79,14 +84,6 @@ class Investigation:
     logical_tool_calls: int = 0
 
 
-def _json_clone(value: Any, label: str) -> Any:
-    """校验并复制纯 JSON 值，把共享边界错误转换为 Proposal 拒绝。"""
-    try:
-        return clone_json_value(value, label)
-    except JsonValueError as exc:
-        raise ProposalRejectedError(str(exc)) from exc
-
-
 class HostAnalysisTracer:
     """Host 唯一循环：逐 Proposal 推进相互隔离的 Analysis Investigation。"""
 
@@ -112,7 +109,7 @@ class HostAnalysisTracer:
         self._stores: dict[str, InvestigationStore] = {}
         self._runtime: dict[str, dict] = {}
         self._resumed: set[str] = set()
-        self._initial_budget = _json_clone(remaining_budget or {}, "remaining_budget")
+        self._initial_budget = json_clone_or_reject(remaining_budget or {}, "remaining_budget")
         for directory in sorted((Path(run_dir) / "investigations").glob("cand-*")):
             store = InvestigationStore(run_dir, directory.name)
             try:
@@ -179,58 +176,19 @@ class HostAnalysisTracer:
 
     def _validate_saved_call(self, runtime: dict, data: dict, candidate_id: str) -> None:
         """Never derive replay permission or cost from an unvalidated projection."""
-        call = runtime["last_tool_call"]
-        pending = runtime["pending"]
-        active = pending is not None and pending["proposal"]["kind"] == "tool_action"
-        logical, attempts = data["logical_tool_calls"], data["tool_attempts"]
-        if (type(logical) is not int or type(attempts) is not int
-                or attempts < 0 or logical != len(data["evidence"]) + int(active)):
-            raise StoreError("工具调用计数损坏")
-        if call is None:
-            if logical or attempts:
-                raise StoreError("缺少逻辑调用记录")
-            return
-        if not isinstance(call, dict):
-            raise StoreError("逻辑调用记录结构损坏")
-        if active:
-            sequence = pending["sequence"]
-            proposal = pending["proposal"]
-            tool_name, arguments = proposal["tool"], proposal["arguments"]
-        else:
-            if not data["evidence"]:
-                raise StoreError("工具调用缺少 Evidence")
-            reference = data["evidence"][-1]
-            sequence, tool_name, arguments = reference.sequence, reference.tool, reference.arguments
-        contract = authorize_tool("analysis", tool_name)
-        checked, error = validate_params(contract.tool_type.params, arguments)
-        if error:
-            raise StoreError("持久化工具参数失约")
-        arguments = self._normalize_arguments(contract.tool_type.params, checked)
-        attempt, status, finished = call["attempt"], call["status"], call["finished"]
-        if (call["call_id"] != f"call-{sequence:06d}"
-                or call["evidence_id"] != f"ev-{sequence:06d}"
-                or call["tool"] != tool_name or call["arguments"] != arguments
-                or call["replay_policy"] != contract.replay_policy.value
-                or type(attempt) is not int or not 0 <= attempt <= attempts
-                or type(finished) is not bool
-                or status not in ("prepared", "started", "finished", "interrupted")
-                or (attempt == 0) != (status == "prepared")
-                or (status == "finished" and not finished)
-                or (finished and status not in ("finished", "interrupted"))
-                or (status == "interrupted" and contract.replay_policy is not ReplayPolicy.NEVER)
-                or (active and pending["executing"] != (attempt > 0))
-                or (not active and not finished)):
-            raise StoreError("工具调用身份、状态或 replay policy 损坏")
-        if finished:
-            slot = self._evidence_store.restore_slot(candidate_id, sequence)
-            if self._evidence_store.recover(slot) is None:
-                raise StoreError("tool_finished 缺少持久化 Observation")
+        validate_saved_tool_call(
+            self._evidence_store, candidate_id,
+            call=runtime["last_tool_call"], pending=runtime["pending"],
+            logical_tool_calls=data["logical_tool_calls"],
+            tool_attempts=data["tool_attempts"],
+            evidence=data["evidence"], role="analysis",
+        )
 
     def add_candidate(self, proposal: dict[str, Any]) -> Candidate:
         """分配 Candidate ID，并一一创建隔离的 queued Investigation。"""
         if not isinstance(proposal, dict):
             raise ValueError("Candidate proposal 必须是 JSON object")
-        normalized = _json_clone(proposal, "Candidate proposal")
+        normalized = json_clone_or_reject(proposal, "Candidate proposal")
         claim_profile = normalized.get("claim_profile", "generic")
         if claim_profile not in CLAIM_PROFILES:
             raise ValueError(
@@ -271,6 +229,62 @@ class HostAnalysisTracer:
         except KeyError as exc:
             raise KeyError(f"未知 Candidate ID: {candidate_id}") from exc
 
+    def candidate_for(self, candidate_id: str) -> Candidate:
+        """返回只供检查的 Candidate 快照(复核简报的调查目标来源)。"""
+        try:
+            return deepcopy(self._candidates[candidate_id])
+        except KeyError as exc:
+            raise KeyError(f"未知 Candidate ID: {candidate_id}") from exc
+
+    def begin_verification(self, candidate_id: str) -> Investigation:
+        """ready_for_verification → verifying;恢复重入对 verifying 幂等。"""
+        investigation = self._live_investigation(candidate_id)
+        if investigation.lifecycle_status == "verifying":
+            return deepcopy(investigation)
+        if investigation.lifecycle_status != "ready_for_verification":
+            raise ValueError(
+                f"Investigation {investigation.investigation_id} 处于 "
+                f"{investigation.lifecycle_status}，只有已提交案卷的调查才能进入复核")
+        self._advance_lifecycle(investigation, "verifying")
+        self._checkpoint(candidate_id, "verification_started")
+        return deepcopy(investigation)
+
+    def finish_verification(
+        self,
+        candidate_id: str,
+        *,
+        disposition: str,
+        stop_reason: str,
+    ) -> Investigation:
+        """verifying → finished 并落账复核 verdict;同值重放幂等,异值拒绝。"""
+        investigation = self._live_investigation(candidate_id)
+        if investigation.lifecycle_status == "finished":
+            if (investigation.disposition, investigation.stop_reason) != (
+                    disposition, stop_reason):
+                raise ValueError(
+                    f"Investigation {investigation.investigation_id} 复核终态已落账为 "
+                    f"{investigation.disposition}/{investigation.stop_reason}，"
+                    f"与新结果 {disposition}/{stop_reason} 不一致；请检查原运行目录")
+            return deepcopy(investigation)
+        if investigation.lifecycle_status != "verifying":
+            raise ValueError(
+                f"Investigation {investigation.investigation_id} 处于 "
+                f"{investigation.lifecycle_status}，不能直接落账复核终态")
+        if disposition not in ("confirmed", "rejected", "inconclusive"):
+            raise ValueError(
+                "复核 disposition 只允许 confirmed/rejected/inconclusive，"
+                f"实际为 {disposition!r}")
+        self._finish_investigation(
+            investigation, disposition=disposition, stop_reason=stop_reason)
+        self._checkpoint(candidate_id, "verification_finished")
+        return deepcopy(investigation)
+
+    def _live_investigation(self, candidate_id: str) -> Investigation:
+        try:
+            return self._investigations[candidate_id]
+        except KeyError as exc:
+            raise KeyError(f"未知 Candidate ID: {candidate_id}") from exc
+
     def run_analysis(self, candidate_id: str, session) -> Investigation:
         """驱动一个 Analysis Session，直到其主动关闭 Investigation。"""
         investigation = self._current_investigation(candidate_id)
@@ -284,6 +298,9 @@ class HostAnalysisTracer:
             raise ValueError("每个 Candidate 必须使用独立 Agent Session，不得跨调查复用")
         if bound_candidate is None:
             self._claimed_sessions.append((session, candidate_id))
+        # 会话开始前从两棵 Evidence 树抬水位:独立复核可能已在 verifications/
+        # 占号,保证本 Investigation 的 Evidence ID 全运行唯一(ADR-0012)。
+        self._evidence_store.seed_sequence_from_files()
 
         runtime = self._runtime[candidate_id]
         input_message: str | None = self._candidate_context(candidate_id)
@@ -304,6 +321,8 @@ class HostAnalysisTracer:
                     needs_recovery_context = False
                 proposal = self._validated_proposal(session.step(input_message))
             if isinstance(proposal, ActionProposal):
+                # 动作执行块与 verification.py run_case 的对应块刻意逐行平行
+                # (票 05 恢复语义的安全关键路径);修改必须同步另一侧。
                 upcoming_evidence_id = (
                     f"ev-{pending['sequence']:06d}" if pending
                     else self._evidence_store.peek_next_evidence_id()
@@ -340,7 +359,7 @@ class HostAnalysisTracer:
                         )
                     elif pending["executing"] and call["replay_policy"] == ReplayPolicy.CACHE_VALIDATED.value:
                         execute_method = "execute_after_interruption"
-                        result = self._recover_cached_tool(tool, arguments)
+                        result = recover_cached_tool(tool, arguments)
                     if result is None:
                         kind = "tool_attempt" if pending["executing"] else "tool_started"
                         pending["executing"] = True
@@ -348,7 +367,7 @@ class HostAnalysisTracer:
                         call["status"] = "started"
                         investigation.tool_attempts += 1
                         self._checkpoint(candidate_id, kind)
-                        result = self._execute_tool(tool, arguments, method=execute_method)
+                        result = execute_tool(tool, arguments, method=execute_method)
                     recovered = self._evidence_store.record(
                         slot, candidate_id=candidate_id,
                         investigation_id=investigation.investigation_id,
@@ -501,7 +520,7 @@ class HostAnalysisTracer:
             evidence_ids=self._evidence_ids(investigation) | {upcoming_evidence_id},
             profile=investigation.claim_profile,
         )
-        arguments = _json_clone(proposal.arguments, "tool arguments")
+        arguments = json_clone_or_reject(proposal.arguments, "tool arguments")
         try:
             contract = authorize_tool("analysis", proposal.tool)
         except ToolAuthorizationError as exc:
@@ -534,7 +553,7 @@ class HostAnalysisTracer:
     def _validate_state_delta(state_delta: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(state_delta, dict):
             raise ProposalRejectedError("state_delta 必须是 JSON object")
-        return _json_clone(state_delta, "state_delta")
+        return json_clone_or_reject(state_delta, "state_delta")
 
     @classmethod
     def _validate_close(
@@ -634,19 +653,3 @@ class HostAnalysisTracer:
             investigation.stop_reason,
         )
 
-    @staticmethod
-    def _recover_cached_tool(tool: object, arguments: dict[str, Any]) -> ToolResult | None:
-        """Cache-aware adapters must explicitly support both probe and safe retry."""
-        try:
-            if not callable(getattr(tool, "execute_after_interruption", None)):
-                raise TypeError("缓存工具缺少 execute_after_interruption")
-            result = tool.recover_cached_result(**arguments)
-            if result is not None and not isinstance(result, ToolResult):
-                raise TypeError("缓存校验必须返回 ToolResult 或 None")
-            return result
-        except Exception as exc:
-            return ToolResult(ok=False, text="", error=(
-                f"缓存恢复失败: {type(exc).__name__}: {exc}；未自动重放，请选择替代取证动作"
-            ))
-
-    _execute_tool = staticmethod(execute_tool)

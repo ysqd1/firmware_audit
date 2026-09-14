@@ -78,10 +78,11 @@ def atomic_json(path: Path, payload: dict, *, exclusive: bool = False) -> None:
 class InvestigationStore:
     """One Candidate's durable history; callers save only fully validated states."""
 
-    def __init__(self, run_dir: Path, candidate_id: str):
+    def __init__(self, run_dir: Path, candidate_id: str, *, root: str = "investigations"):
         if not re.fullmatch(r"cand-[0-9]{4,}", candidate_id):
             raise StoreError("非法 Candidate ID；请检查运行目录")
-        self.directory = Path(run_dir) / "investigations" / candidate_id
+        # root 区分事件树归属:investigations(Analysis)或 verifications(独立复核)。
+        self.directory = Path(run_dir) / root / candidate_id
         self.events_path = self.directory / "events.jsonl"
         self.snapshot_path = self.directory / "state.json"
         self._seq = 0

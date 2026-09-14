@@ -1,8 +1,9 @@
 """ADR-0012 Host 控制层。
 
 当前 expand 阶段暴露逐步 Agent Session 协议、单 Candidate Analysis tracer
-(Claim/假设门槛与案卷冻结)、Recon→Candidate Store 入口与 Candidate 去重/
-评分/双队列;独立复核与公开入口切换由后续工单继续内聚在本包。
+(Claim/假设门槛与案卷冻结)、Recon→Candidate Store 入口、Candidate 去重/
+评分/双队列与独立 Verification(案卷队列、Claim Result、verdict 聚合与
+Finding);公开入口切换由后续工单继续内聚在本包。
 """
 
 from .analysis import (
@@ -63,6 +64,25 @@ from .session import (
     protocol_instruction,
     revalidate_proposal,
 )
+from .verification import (
+    CLAIM_RESULT_JUDGMENTS,
+    DEFAULT_VERIFICATION_MAX_ROUNDS,
+    FINDING_SCHEMA_VERSION,
+    RESULTS_SCHEMA_VERSION,
+    VERDICTS,
+    CaseOutcome,
+    HostVerificationRunner,
+    VerificationDeltaPlan,
+    VerdictResult,
+    aggregate_verdict,
+    apply_verification_delta_plan,
+    build_case_brief,
+    build_finding_payload,
+    load_cases,
+    plan_verification_queue,
+    resolve_verification_max_rounds,
+    validate_verification_delta,
+)
 
 __all__ = [
     "ADMISSION_REASONS",
@@ -71,18 +91,23 @@ __all__ = [
     "CANDIDATE_STORE_SCHEMA_VERSION",
     "CASE_SCHEMA_VERSION",
     "CLAIM_PROFILES",
+    "CLAIM_RESULT_JUDGMENTS",
     "CLAIM_STATUSES",
     "Candidate",
     "CandidateIntakeError",
     "CandidateProposal",
     "CandidateStore",
+    "CaseOutcome",
     "ComparisonOutcome",
+    "DEFAULT_VERIFICATION_MAX_ROUNDS",
     "DISPOSITIONS",
     "EvidenceReference",
+    "FINDING_SCHEMA_VERSION",
     "FinalProposal",
     "GateResult",
     "HostAnalysisTracer",
     "HostReconRunner",
+    "HostVerificationRunner",
     "IntakeCandidate",
     "Investigation",
     "LIFECYCLE_STATUSES",
@@ -90,27 +115,39 @@ __all__ = [
     "PriorityScorer",
     "ProposalError",
     "ProposalRejectedError",
+    "RESULTS_SCHEMA_VERSION",
     "ReconRunResult",
     "STOP_REASONS",
     "Selection",
     "SemanticComparator",
+    "VERDICTS",
     "ValidationIssue",
+    "VerificationDeltaPlan",
+    "VerdictResult",
     "action_progressed",
+    "aggregate_verdict",
+    "apply_verification_delta_plan",
     "assert_lifecycle_transition",
     "assert_terminal",
+    "build_case_brief",
     "build_case_payload",
+    "build_finding_payload",
     "build_site_overview",
     "coverage_fingerprint",
     "evaluate_ready_gate",
     "input_failure_reason",
     "is_decisive",
+    "load_cases",
     "normalize_intake",
     "normalize_target_path",
     "parse_proposal",
+    "plan_verification_queue",
     "profile_claim_document",
     "protocol_instruction",
-    "revalidate_proposal",
     "required_claims",
+    "resolve_verification_max_rounds",
+    "revalidate_proposal",
     "select_for_processing",
     "signal_fingerprint",
+    "validate_verification_delta",
 ]
