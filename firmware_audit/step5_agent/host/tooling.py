@@ -8,6 +8,7 @@ Verification 共用,由 ``validate_saved_tool_call`` 承载。
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from typing import Any
 
 from ..providers.tools import ReplayPolicy, authorize_tool
@@ -73,6 +74,18 @@ def json_clone_or_reject(value: Any, label: str) -> Any:
         return clone_json_value(value, label)
     except JsonValueError as exc:
         raise ProposalRejectedError(str(exc)) from exc
+
+
+def regeneration_feedback(detail: str) -> str:
+    """无效回复的整份重生成提示:回喂拒绝理由,不接受局部补丁(ADR-0012 L43)。"""
+    return json.dumps({
+        "error": "invalid_agent_proposal",
+        "detail": detail,
+        "instruction": (
+            "上一份回复被 Host 整份拒绝且未产生任何效果;请修正问题,"
+            "从头生成一份完整 JSON,不要发送局部补丁。"
+        ),
+    }, ensure_ascii=False)
 
 
 def recover_cached_tool(tool: object, arguments: dict[str, Any]) -> ToolResult | None:

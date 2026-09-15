@@ -10,7 +10,10 @@ analysis 的判定或说服性说明。
 
 ``HostVerificationRunner`` 是本模块的动作循环:独立上下文、默认 15 轮预算、
 本次会话 Evidence 留存与断点续跑,复核终态经 tracer 落回 Investigation
-lifecycle,confirmed 案卷由 Host 追加为唯一 Finding 来源。
+lifecycle,confirmed 案卷由 Host 追加为唯一 Finding 来源。无效回复整份
+重生成(票 10):连续三次按 inconclusive/protocol_error 收束且不生成
+Finding;局部轮次与运行总预算经 ``budget.RunBudget`` 守卫,运行级耗尽
+保存现场不落终态。
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from typing import Any
 
 from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
+from .budget import RunBudget
 from .candidates import CLAIM_PROFILES, normalize_intake
 from .claims import (
     ADMISSION_REASONS,
@@ -39,6 +43,7 @@ from .evidence import (
 )
 from .json_values import JsonValueError, clone_json_value
 from .session import (
+    MAX_PROTOCOL_ATTEMPTS,
     ActionProposal,
     FinalProposal,
     ProposalRejectedError,
@@ -50,6 +55,7 @@ from .tooling import (
     json_clone_or_reject,
     normalize_tool_arguments,
     recover_cached_tool,
+    regeneration_feedback,
     validate_saved_tool_call,
 )
 
@@ -561,10 +567,13 @@ class HostVerificationRunner:
         max_rounds: int | None = None,
         observation_view_limit: int = MAX_TEXT_CHARS,
         tool_result_limit_bytes: int = DEFAULT_TOOL_RESULT_LIMIT_BYTES,
+        budget: RunBudget | None = None,
     ):
         self.tools = dict(tools)
         self.tracer = tracer
         self._run_dir = Path(run_dir)
+        # 运行级预算 seam:与 Analysis tracer 共享 run_dir/budget.json 台账。
+        self._budget = budget if budget is not None else RunBudget.load(run_dir)
         self._evidence_store = EvidenceRecorder(
             run_dir,
             observation_view_limit=observation_view_limit,
@@ -707,112 +716,136 @@ class HostVerificationRunner:
             if callable(reset):
                 reset()
             self._resumed.remove(candidate_id)
-        while True:
-            pending = runtime["pending"]
-            if pending:
-                cls = ActionProposal if pending["proposal"]["kind"] == "tool_action" else FinalProposal
-                proposal = self._validated_proposal(cls(**pending["proposal"]))
-            else:
-                if runtime["rounds_used"] >= runtime["max_rounds"]:
-                    return self._finalize(candidate_id, stop_reason="budget_exhausted")
-                if needs_recovery_context:
-                    input_message = self._case_context_message(candidate_id)
-                    needs_recovery_context = False
-                proposal = self._validated_proposal(session.step(input_message))
-                runtime["rounds_used"] += 1
-
-            if isinstance(proposal, ActionProposal):
-                # 以下 pending 准备/恢复、replay 分流、attempt 推进与 Evidence
-                # 匹配校验与 analysis.py run_analysis 的动作块刻意逐行平行
-                # (票 05 恢复语义的安全关键路径);任何一侧修改必须同步另一侧,
-                # 进一步收敛属后续工单(带计数回调的 tooling 执行函数)。
-                upcoming_evidence_id = (
-                    f"ev-{pending['sequence']:06d}" if pending
-                    else self._evidence_store.peek_next_evidence_id()
-                )
-                plan, arguments, tool = self._validate_action(
-                    proposal, candidate_id, upcoming_evidence_id)
-                if not pending:
-                    slot = self._evidence_store.reserve(candidate_id)
-                    pending = {"proposal": asdict(proposal), "sequence": slot.sequence, "executing": False}
-                    runtime["pending"] = pending
-                    runtime["last_tool_call"] = {
-                        "call_id": f"call-{slot.sequence:06d}",
-                        "evidence_id": slot.evidence_id,
-                        "tool": proposal.tool, "arguments": arguments,
-                        "replay_policy": authorize_tool(
-                            "verification", proposal.tool).replay_policy.value,
-                        "attempt": 0, "status": "prepared", "finished": False,
-                    }
-                    runtime["logical_tool_calls"] += 1
-                    self._checkpoint(candidate_id, "proposal_accepted")
-                else:
-                    slot = self._evidence_store.restore_slot(candidate_id, pending["sequence"])
-                recovered = self._evidence_store.recover(slot)
-                call = runtime["last_tool_call"]
-                if recovered is None:
-                    result = None
-                    execute_method = "execute"
-                    if pending["executing"] and call["replay_policy"] == ReplayPolicy.NEVER.value:
-                        if call["status"] != "interrupted":
-                            call["status"] = "interrupted"
-                            self._checkpoint(candidate_id, "tool_interrupted")
-                        result = ToolResult(
-                            ok=False, text="", data={"status": "interrupted", "call_id": call["call_id"]},
-                            error="interrupted：工具执行已中断，结果未知；禁止自动重放，请选择替代取证动作。",
+        # 运行总预算的活动时段与无效回复重生成语义与 analysis.run_analysis
+        # 刻意同款(票 10);三连协议失败按 inconclusive/protocol_error 收束,
+        # 不生成 Finding、不阻断后续案卷。
+        self._budget.start_active()
+        strikes = 0
+        try:
+            while True:
+                try:
+                    pending = runtime["pending"]
+                    if pending:
+                        cls = ActionProposal if pending["proposal"]["kind"] == "tool_action" else FinalProposal
+                        proposal = self._validated_proposal(cls(**pending["proposal"]))
+                    else:
+                        # 局部轮次上限计本单元模型请求(含重生成);耗尽按既有
+                        # budget_exhausted 收束,聚合已有结果(缺项→inconclusive)。
+                        if runtime["rounds_used"] >= runtime["max_rounds"]:
+                            return self._finalize(candidate_id, stop_reason="budget_exhausted")
+                        self._budget.require_llm()
+                        if needs_recovery_context:
+                            input_message = self._case_context_message(candidate_id)
+                            needs_recovery_context = False
+                        runtime["rounds_used"] += 1
+                        raw = session.step(input_message)
+                        self._budget.record_llm_call(getattr(session, "last_usage", None))
+                        proposal = self._validated_proposal(raw)
+                    if isinstance(proposal, ActionProposal):
+                        # 以下 pending 准备/恢复、replay 分流、attempt 推进与 Evidence
+                        # 匹配校验与 analysis.py run_analysis 的动作块刻意逐行平行
+                        # (票 05 恢复语义的安全关键路径);任何一侧修改必须同步另一侧,
+                        # 进一步收敛属后续工单(带计数回调的 tooling 执行函数)。
+                        upcoming_evidence_id = (
+                            f"ev-{pending['sequence']:06d}" if pending
+                            else self._evidence_store.peek_next_evidence_id()
                         )
-                    elif pending["executing"] and call["replay_policy"] == ReplayPolicy.CACHE_VALIDATED.value:
-                        execute_method = "execute_after_interruption"
-                        result = recover_cached_tool(tool, arguments)
-                    if result is None:
-                        kind = "tool_attempt" if pending["executing"] else "tool_started"
-                        pending["executing"] = True
-                        call["attempt"] += 1
-                        call["status"] = "started"
-                        runtime["tool_attempts"] += 1
-                        self._checkpoint(candidate_id, kind)
-                        result = execute_tool(tool, arguments, method=execute_method)
-                    recovered = self._evidence_store.record(
-                        slot, candidate_id=candidate_id,
-                        investigation_id=verification_id,
-                        tool_name=proposal.tool, arguments=arguments, result=result,
-                    )
-                evidence, input_message = recovered
-                if (evidence.tool != proposal.tool or evidence.arguments != arguments
-                        or evidence.investigation_id != verification_id):
-                    raise StoreError("复核 Evidence 与待执行动作不匹配；请检查工件")
-                if not call["finished"]:
-                    if call["status"] != "interrupted":
-                        call["status"] = "finished"
-                    call["finished"] = True
-                    self._checkpoint(candidate_id, "tool_finished")
-                evidence_list.append(evidence)
-                apply_verification_delta_plan(session_state, plan)
-                runtime.update(pending=None, last_action=asdict(proposal), observation_view=input_message)
-                self._checkpoint(candidate_id, "action_completed")
-                continue
+                        plan, arguments, tool = self._validate_action(
+                            proposal, candidate_id, upcoming_evidence_id)
+                        if not pending:
+                            slot = self._evidence_store.reserve(candidate_id)
+                            pending = {"proposal": asdict(proposal), "sequence": slot.sequence, "executing": False}
+                            runtime["pending"] = pending
+                            runtime["last_tool_call"] = {
+                                "call_id": f"call-{slot.sequence:06d}",
+                                "evidence_id": slot.evidence_id,
+                                "tool": proposal.tool, "arguments": arguments,
+                                "replay_policy": authorize_tool(
+                                    "verification", proposal.tool).replay_policy.value,
+                                "attempt": 0, "status": "prepared", "finished": False,
+                            }
+                            runtime["logical_tool_calls"] += 1
+                            self._budget.record_logical_tool_call()
+                            self._checkpoint(candidate_id, "proposal_accepted")
+                        else:
+                            slot = self._evidence_store.restore_slot(candidate_id, pending["sequence"])
+                        recovered = self._evidence_store.recover(slot)
+                        call = runtime["last_tool_call"]
+                        if recovered is None:
+                            result = None
+                            execute_method = "execute"
+                            if pending["executing"] and call["replay_policy"] == ReplayPolicy.NEVER.value:
+                                if call["status"] != "interrupted":
+                                    call["status"] = "interrupted"
+                                    self._checkpoint(candidate_id, "tool_interrupted")
+                                result = ToolResult(
+                                    ok=False, text="", data={"status": "interrupted", "call_id": call["call_id"]},
+                                    error="interrupted：工具执行已中断，结果未知；禁止自动重放，请选择替代取证动作。",
+                                )
+                            elif pending["executing"] and call["replay_policy"] == ReplayPolicy.CACHE_VALIDATED.value:
+                                execute_method = "execute_after_interruption"
+                                result = recover_cached_tool(tool, arguments)
+                            if result is None:
+                                kind = "tool_attempt" if pending["executing"] else "tool_started"
+                                self._budget.require_tool()
+                                pending["executing"] = True
+                                call["attempt"] += 1
+                                call["status"] = "started"
+                                runtime["tool_attempts"] += 1
+                                self._budget.record_tool_execution()
+                                self._checkpoint(candidate_id, kind)
+                                result = execute_tool(tool, arguments, method=execute_method)
+                            recovered = self._evidence_store.record(
+                                slot, candidate_id=candidate_id,
+                                investigation_id=verification_id,
+                                tool_name=proposal.tool, arguments=arguments, result=result,
+                            )
+                        evidence, input_message = recovered
+                        if (evidence.tool != proposal.tool or evidence.arguments != arguments
+                                or evidence.investigation_id != verification_id):
+                            raise StoreError("复核 Evidence 与待执行动作不匹配；请检查工件")
+                        if not call["finished"]:
+                            if call["status"] != "interrupted":
+                                call["status"] = "finished"
+                            call["finished"] = True
+                            self._checkpoint(candidate_id, "tool_finished")
+                        evidence_list.append(evidence)
+                        apply_verification_delta_plan(session_state, plan)
+                        runtime.update(pending=None, last_action=asdict(proposal), observation_view=input_message)
+                        self._checkpoint(candidate_id, "action_completed")
+                        self._budget.record_validated_round()
+                        strikes = 0
+                        continue
 
-            if proposal.kind != "complete_verification":
-                raise ProposalRejectedError(
-                    "复核 Session 只接受 tool_action 或 complete_verification")
-            plan = self._validate_final(proposal, candidate_id)
-            # 先在 trial 上过"全部必填已有结果"门,拒绝路径零副作用。
-            trial = deepcopy(session_state)
-            apply_verification_delta_plan(trial, plan)
-            missing = [
-                name for name in required_claims(case["claim_profile"])
-                if name not in trial.get("claim_results", {})
-            ]
-            if missing:
-                raise ProposalRejectedError(
-                    "complete_verification 被拒:必填 Claim 尚无复核结果: "
-                    + ", ".join(missing))
-            if not pending:
-                runtime["pending"] = {"proposal": asdict(proposal)}
-                self._checkpoint(candidate_id, "proposal_accepted")
-            apply_verification_delta_plan(session_state, plan)
-            runtime.update(pending=None, last_action=asdict(proposal))
-            return self._finalize(candidate_id, stop_reason="completed")
+                    if proposal.kind != "complete_verification":
+                        raise ProposalRejectedError(
+                            "复核 Session 只接受 tool_action 或 complete_verification")
+                    plan = self._validate_final(proposal, candidate_id)
+                    # 先在 trial 上过"全部必填已有结果"门,拒绝路径零副作用。
+                    trial = deepcopy(session_state)
+                    apply_verification_delta_plan(trial, plan)
+                    missing = [
+                        name for name in required_claims(case["claim_profile"])
+                        if name not in trial.get("claim_results", {})
+                    ]
+                    if missing:
+                        raise ProposalRejectedError(
+                            "complete_verification 被拒:必填 Claim 尚无复核结果: "
+                            + ", ".join(missing))
+                    if not pending:
+                        runtime["pending"] = {"proposal": asdict(proposal)}
+                        self._checkpoint(candidate_id, "proposal_accepted")
+                    apply_verification_delta_plan(session_state, plan)
+                    runtime.update(pending=None, last_action=asdict(proposal))
+                    self._budget.record_validated_round()
+                    return self._finalize(candidate_id, stop_reason="completed")
+                except ProposalRejectedError as exc:
+                    strikes += 1
+                    if strikes >= MAX_PROTOCOL_ATTEMPTS:
+                        return self._finalize(candidate_id, stop_reason="protocol_error")
+                    input_message = regeneration_feedback(str(exc))
+        finally:
+            self._budget.stop_active()
 
     # ---- 终态与 Finding ----
 
@@ -821,8 +854,20 @@ class HostVerificationRunner:
         session_state = self._sessions[candidate_id]
         runtime = self._runtime[candidate_id]
         evidence_list = self._evidence[candidate_id]
-        verdict = aggregate_verdict(
-            case["claim_profile"], session_state.get("claim_results", {}))
+        if stop_reason == "protocol_error":
+            # 三连协议失败按 ADR-0012 收束为 inconclusive,不聚合出 confirmed:
+            # 复核未以合法 complete_verification 收尾,已录结果不足以确认;
+            # unsupported 逐项列出尚无结果的必填 Claim。
+            verdict = VerdictResult(
+                "inconclusive",
+                unsupported=tuple(
+                    name for name in required_claims(case["claim_profile"])
+                    if name not in _claim_results_state(session_state)
+                ),
+            )
+        else:
+            verdict = aggregate_verdict(
+                case["claim_profile"], session_state.get("claim_results", {}))
         related = list(session_state.get("related_candidates", []))
         finding_id = None
         if verdict.verdict == "confirmed":

@@ -2,15 +2,31 @@
 
 当前 expand 阶段暴露逐步 Agent Session 协议、单 Candidate Analysis tracer
 (Claim/假设门槛与案卷冻结)、Recon→Candidate Store 入口、Candidate 去重/
-评分/双队列与独立 Verification(案卷队列、Claim Result、verdict 聚合与
-Finding);公开入口切换由后续工单继续内聚在本包。
+评分/双队列、独立 Verification(案卷队列、Claim Result、verdict 聚合与
+Finding)与运行级预算(协议重生成×3、轮次/请求/工具/活动时长台账、四层
+配置解析与生效快照);公开入口切换由后续工单继续内聚在本包。
 """
 
 from .analysis import (
+    DEFAULT_ANALYSIS_MAX_ROUNDS,
     Candidate,
     HostAnalysisTracer,
     Investigation,
     ProposalRejectedError,
+    resolve_analysis_max_rounds,
+)
+from .budget import (
+    BUDGET_SCHEMA_VERSION,
+    CONFIG_SCHEMA_VERSION,
+    DEFAULT_BUDGET_CONFIG,
+    ENV_KEYS,
+    BudgetExhaustedError,
+    BudgetLedger,
+    ConfigError,
+    RunBudget,
+    load_config_snapshot,
+    persist_config_snapshot,
+    resolve_effective_config,
 )
 from .candidates import (
     CANDIDATE_STORE_SCHEMA_VERSION,
@@ -55,6 +71,7 @@ from .recon import (
     input_failure_reason,
 )
 from .session import (
+    MAX_PROTOCOL_ATTEMPTS,
     ActionProposal,
     AgentSession,
     FinalProposal,
@@ -88,19 +105,27 @@ __all__ = [
     "ADMISSION_REASONS",
     "ActionProposal",
     "AgentSession",
+    "BudgetExhaustedError",
+    "BudgetLedger",
+    "BUDGET_SCHEMA_VERSION",
     "CANDIDATE_STORE_SCHEMA_VERSION",
     "CASE_SCHEMA_VERSION",
     "CLAIM_PROFILES",
     "CLAIM_RESULT_JUDGMENTS",
     "CLAIM_STATUSES",
+    "CONFIG_SCHEMA_VERSION",
+    "ConfigError",
     "Candidate",
     "CandidateIntakeError",
     "CandidateProposal",
     "CandidateStore",
     "CaseOutcome",
     "ComparisonOutcome",
+    "DEFAULT_ANALYSIS_MAX_ROUNDS",
+    "DEFAULT_BUDGET_CONFIG",
     "DEFAULT_VERIFICATION_MAX_ROUNDS",
     "DISPOSITIONS",
+    "ENV_KEYS",
     "EvidenceReference",
     "FINDING_SCHEMA_VERSION",
     "FinalProposal",
@@ -111,12 +136,14 @@ __all__ = [
     "IntakeCandidate",
     "Investigation",
     "LIFECYCLE_STATUSES",
+    "MAX_PROTOCOL_ATTEMPTS",
     "PolicyError",
     "PriorityScorer",
     "ProposalError",
     "ProposalRejectedError",
     "RESULTS_SCHEMA_VERSION",
     "ReconRunResult",
+    "RunBudget",
     "STOP_REASONS",
     "Selection",
     "SemanticComparator",
@@ -138,13 +165,17 @@ __all__ = [
     "input_failure_reason",
     "is_decisive",
     "load_cases",
+    "load_config_snapshot",
     "normalize_intake",
     "normalize_target_path",
     "parse_proposal",
+    "persist_config_snapshot",
     "plan_verification_queue",
     "profile_claim_document",
     "protocol_instruction",
     "required_claims",
+    "resolve_analysis_max_rounds",
+    "resolve_effective_config",
     "resolve_verification_max_rounds",
     "revalidate_proposal",
     "select_for_processing",

@@ -826,39 +826,46 @@ def test_citing_frozen_analysis_evidence_is_rejected_without_residue(tmp_path: P
     tracer, (candidate_id,) = _prepared_tracer(tmp_path)
     tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
-
-    with pytest.raises(ProposalRejectedError, match="不属于本次复核会话"):
-        runner.run_case(candidate_id, FakeSession([
-            _v_action({"claim_results": {
-                "root_cause": _result("supported", "ev-000001")}})]))
-
-    assert tracer.investigation_for(candidate_id).lifecycle_status == "verifying"
-    assert not (tmp_path / "verifications" / candidate_id / "results.json").exists()
-    assert tool.calls == []
-    assert not list((tmp_path / "verifications" / candidate_id / "evidence").glob("*.json"))
-
-    # 拒绝不留 pending 残留:换正确 Session 可继续同一案卷。
-    outcome = runner.run_case(candidate_id, FakeSession([
+    session = FakeSession([
+        _v_action({"claim_results": {
+            "root_cause": _result("supported", "ev-000001")}}),
         _v_action({"claim_results": {
             name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
         _v_complete(),
-    ]))
+    ])
+
+    outcome = runner.run_case(candidate_id, session)
+
+    # 引用冻结案卷 Evidence 的动作整份拒绝并回喂:不执行工具、不留 Evidence;
+    # 同一 Session 以本次复核 Evidence 重新提交后正常确认。
+    assert "不属于本次复核会话" in (session.inputs[1] or "")
     assert outcome.verdict == "confirmed"
+    assert tracer.investigation_for(candidate_id).lifecycle_status == "finished"
+    assert len(tool.calls) == 1
+    saved = json.loads(outcome.results_path.read_text(encoding="utf-8"))
+    assert [reference["evidence_id"] for reference in saved["evidence_references"]] == [
+        "ev-000002"]
 
 
 def test_complete_verification_requires_all_required_results(tmp_path: Path) -> None:
     tracer, (candidate_id,) = _prepared_tracer(tmp_path)
     tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    session = FakeSession([
+        _v_action({"claim_results": {
+            "root_cause": _result("supported", "ev-000002")}}),
+        _v_complete(),
+        _v_action({"claim_results": {
+            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+        _v_complete(),
+    ])
 
-    with pytest.raises(ProposalRejectedError, match="尚无复核结果"):
-        runner.run_case(candidate_id, FakeSession([
-            _v_action({"claim_results": {
-                "root_cause": _result("supported", "ev-000002")}}),
-            _v_complete(),
-        ]))
+    outcome = runner.run_case(candidate_id, session)
 
-    assert not (tmp_path / "verifications" / candidate_id / "results.json").exists()
+    # 缺必填结果的收尾被拒并回喂;补齐后同一 Session 正常 complete。
+    assert "尚无复核结果" in (session.inputs[2] or "")
+    assert outcome.verdict == "confirmed"
+    assert outcome.stop_reason == "completed"
 
 
 def test_related_candidates_are_grounded_and_carried_into_finding(tmp_path: Path) -> None:

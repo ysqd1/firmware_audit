@@ -9,10 +9,11 @@
 工件布局的 Candidate Store 入口;去重与 cand-ID 分配完成后,才构成
 CONTEXT.md 定义的"校验、去重并分配稳定身份"的完整 Candidate Store)。
 
-角色越权(r2/Ghidra)与 survey 不完整都以结构化反馈回喂 Session,在轮次预算
-内自纠且零副作用;协议形状失败沿 tracer 先例抛 ProposalRejectedError(协议
-重生成与三次失败收束由后续工单实现)。Candidate ID 分配与去重在去重完成后
-进行(后续工单),本票以运行内 proposal 序号保序。
+角色越权(r2/Ghidra)与 survey 不完整的结构化反馈、协议形状失败的重生成
+提示统一进入同一 episode(票 10):无效回复整份重生成,连续三次按
+input_failure/protocol_error 收束;轮次与运行总预算经 ``budget.RunBudget``
+守卫。Candidate ID 分配与去重在去重完成后进行(后续工单),本票以运行内
+proposal 序号保序。
 """
 from __future__ import annotations
 
@@ -26,6 +27,7 @@ from typing import Any, Literal
 from ...file_rules import is_search_excluded
 from ..providers.tools import ToolAuthorizationError, authorize_tool, tool_names_for_role
 from ..providers.tools.base import MAX_TEXT_CHARS, validate_params
+from .budget import RunBudget
 from .candidates import CLAIM_PROFILES, FINGERPRINT_INPUT_FIELDS
 from .evidence import (
     DEFAULT_TOOL_RESULT_LIMIT_BYTES,
@@ -34,13 +36,14 @@ from .evidence import (
 )
 from .json_values import clone_json_value
 from .session import (
+    MAX_PROTOCOL_ATTEMPTS,
     ActionProposal,
     ProposalRejectedError,
     ValidationIssue,
     revalidate_proposal,
 )
 from .store import atomic_json
-from .tooling import execute_tool, normalize_tool_arguments
+from .tooling import execute_tool, normalize_tool_arguments, regeneration_feedback
 
 DEFAULT_RECON_MAX_ROUNDS = 30
 
@@ -445,9 +448,12 @@ class HostReconRunner:
         max_rounds: int | None = None,
         observation_view_limit: int = MAX_TEXT_CHARS,
         tool_result_limit_bytes: int = DEFAULT_TOOL_RESULT_LIMIT_BYTES,
+        budget: RunBudget | None = None,
     ):
         self.tools = dict(tools)
         self._run_dir = Path(run_dir)
+        # 运行级预算 seam:与 Analysis/Verification 共享 run_dir/budget.json 台账。
+        self._budget = budget if budget is not None else RunBudget.load(run_dir)
         self._evidence_store = EvidenceRecorder(
             run_dir,
             observation_view_limit=observation_view_limit,
@@ -477,59 +483,87 @@ class HostReconRunner:
         session_state: dict[str, Any] = {}
         evidence: list[EvidenceReference] = []
         rounds = 0
-        while rounds < self.max_rounds:
-            proposal = revalidate_proposal(session.step(input_message), "recon")
-            rounds += 1
-            if isinstance(proposal, ActionProposal):
-                guarded = self._guard_action(proposal)
-                if guarded.rejected:
-                    input_message = guarded.feedback or ""
-                    continue
-                assert guarded.state_delta is not None
-                slot = self._evidence_store.reserve(RECON_CANDIDATE_ID)
-                result = execute_tool(guarded.tool, guarded.arguments)
-                reference, input_message = self._evidence_store.record(
-                    slot,
-                    candidate_id=RECON_CANDIDATE_ID,
-                    investigation_id=RECON_INVESTIGATION_ID,
-                    tool_name=proposal.tool,
-                    arguments=guarded.arguments,
-                    result=result,
-                )
-                evidence.append(reference)
-                session_state.update(guarded.state_delta)
-                continue
+        # 无效回复(协议形状或守卫拒绝)整份重生成,连续 MAX_PROTOCOL_ATTEMPTS
+        # 次按 input_failure/protocol_error 收束;轮次口径不变——每次模型请求
+        # (含重生成)计一轮;重生成不计工具调用,活动时段离开 run 即封段。
+        strikes = 0
+        self._budget.start_active()
+        try:
+            while rounds < self.max_rounds:
+                self._budget.require_llm()
+                rounds += 1
+                raw = session.step(input_message)
+                self._budget.record_llm_call(getattr(session, "last_usage", None))
+                try:
+                    proposal = revalidate_proposal(raw, "recon")
+                    if isinstance(proposal, ActionProposal):
+                        guarded = self._guard_action(proposal)
+                        if guarded.rejected:
+                            raise ProposalRejectedError(guarded.feedback or "")
+                        assert guarded.state_delta is not None
+                        self._budget.require_tool()
+                        slot = self._evidence_store.reserve(RECON_CANDIDATE_ID)
+                        # 先计 attempt 再执行(与 analysis/verification 的崩溃
+                        # 口径一致:执行中断崩掉,这次真实尝试也已入账)。
+                        self._budget.record_logical_tool_call()
+                        self._budget.record_tool_execution()
+                        result = execute_tool(guarded.tool, guarded.arguments)
+                        reference, input_message = self._evidence_store.record(
+                            slot,
+                            candidate_id=RECON_CANDIDATE_ID,
+                            investigation_id=RECON_INVESTIGATION_ID,
+                            tool_name=proposal.tool,
+                            arguments=guarded.arguments,
+                            result=result,
+                        )
+                        evidence.append(reference)
+                        session_state.update(guarded.state_delta)
+                        self._budget.record_validated_round()
+                        strikes = 0
+                        continue
 
-            issues = _survey_issues(
-                proposal.state_delta,
-                frozenset(reference.evidence_id for reference in evidence),
-            )
-            if issues:
-                input_message = _feedback(
-                    "survey_rejected", issues,
-                    "complete_survey 未通过 Host 校验;请修正以下问题,"
-                    "从头重新提交整份 complete_survey。",
-                )
-                continue
-            proposals = _build_candidate_proposals(proposal.state_delta["candidates"])
-            store_path = self._persist_store(
-                proposal.state_delta, session_state, proposals,
-            )
+                    issues = _survey_issues(
+                        proposal.state_delta,
+                        frozenset(reference.evidence_id for reference in evidence),
+                    )
+                    if issues:
+                        raise ProposalRejectedError(_feedback(
+                            "survey_rejected", issues,
+                            "complete_survey 未通过 Host 校验;请修正以下问题,"
+                            "从头重新提交整份 complete_survey。",
+                        ))
+                    proposals = _build_candidate_proposals(proposal.state_delta["candidates"])
+                    store_path = self._persist_store(
+                        proposal.state_delta, session_state, proposals,
+                    )
+                    self._budget.record_validated_round()
+                    return ReconRunResult(
+                        status="completed",
+                        overview=overview,
+                        survey=clone_json_value(proposal.state_delta, "survey"),
+                        session_state=clone_json_value(session_state, "session_state"),
+                        candidates=tuple(proposals),
+                        evidence=tuple(evidence),
+                        rounds_used=rounds,
+                        store_path=store_path,
+                    )
+                except ProposalRejectedError as exc:
+                    strikes += 1
+                    if strikes >= MAX_PROTOCOL_ATTEMPTS:
+                        return ReconRunResult(
+                            status="input_failure", reason="protocol_error",
+                            overview=overview,
+                            session_state=clone_json_value(session_state, "session_state"),
+                            evidence=tuple(evidence), rounds_used=rounds,
+                        )
+                    input_message = regeneration_feedback(str(exc))
             return ReconRunResult(
-                status="completed",
-                overview=overview,
-                survey=clone_json_value(proposal.state_delta, "survey"),
-                session_state=clone_json_value(session_state, "session_state"),
-                candidates=tuple(proposals),
-                evidence=tuple(evidence),
-                rounds_used=rounds,
-                store_path=store_path,
+                status="incomplete", reason="rounds_exhausted",
+                overview=overview, session_state=clone_json_value(session_state, "session_state"),
+                evidence=tuple(evidence), rounds_used=rounds,
             )
-        return ReconRunResult(
-            status="incomplete", reason="rounds_exhausted",
-            overview=overview, session_state=clone_json_value(session_state, "session_state"),
-            evidence=tuple(evidence), rounds_used=rounds,
-        )
+        finally:
+            self._budget.stop_active()
 
     def _guard_action(self, proposal: ActionProposal) -> _GuardedAction:
         """整份校验通过才执行;角色越权与参数失约回喂反馈,接线错误致命。"""

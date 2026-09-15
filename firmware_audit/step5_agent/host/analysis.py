@@ -8,12 +8,17 @@
 Claim/假设/缺口等语义状态的门槛与案卷冻结策略见 ``claims`` 模块；本模块
 在唯一循环里接线：动作增量先整份校验后应用，close 派生 rejected/closed，
 submit_case 以 trial 状态过 ready gate 再冻结 Verification Case，连续五个
-无进展的已完成动作以 no_progress 收束。模块的公开 interface 刻意只有
-``add_candidate``、``investigation_for`` 和 ``run_analysis``。Session 与工具
+无进展的已完成动作以 no_progress 收束；无效回复整份重生成（连续三次按
+unresolved/protocol_error 收束，不阻断后续队列），局部轮次与运行总预算
+（票 10）经 ``budget.RunBudget`` 守卫，运行级耗尽保存现场不落终态。模块
+的公开 interface 刻意只有 ``add_candidate``、``investigation_for``、
+``candidate_for``、``begin_verification``、``finish_verification``、
+``mark_not_started``、``queued_ids`` 和 ``run_analysis``。Session 与工具
 都是注入的 adapter，测试和生产调用走同一 seam。
 """
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import json
@@ -22,6 +27,7 @@ from typing import Any
 
 from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
+from .budget import RunBudget
 from .candidates import CLAIM_PROFILES
 from .claims import (
     ADMISSION_REASONS,
@@ -41,9 +47,9 @@ from .evidence import (
     EvidenceReference,
 )
 from .session import (
+    MAX_PROTOCOL_ATTEMPTS,
     ActionProposal,
     FinalProposal,
-    ProposalError,
     ProposalRejectedError,
     revalidate_proposal,
 )
@@ -53,8 +59,26 @@ from .tooling import (
     json_clone_or_reject,
     normalize_tool_arguments,
     recover_cached_tool,
+    regeneration_feedback,
     validate_saved_tool_call,
 )
+
+DEFAULT_ANALYSIS_MAX_ROUNDS = 30
+
+
+def resolve_analysis_max_rounds() -> int:
+    """STEP5_ANALYSIS_MAX_ITERS 覆盖轮次上限(缺失/非法回落默认,下限 1)。
+
+    变量名沿用 legacy runner.resolve_max_iters 同名旋钮(默认同为 30,迁移期
+    同名双消费,legacy 随公开切换退役);与 budget.ENV_KEYS 的键名单一纪律
+    由测试钉住,防止两处漂移。
+    """
+    raw = os.environ.get("STEP5_ANALYSIS_MAX_ITERS", "").strip()
+    try:
+        value = int(raw) if raw else DEFAULT_ANALYSIS_MAX_ROUNDS
+    except ValueError:
+        return DEFAULT_ANALYSIS_MAX_ROUNDS
+    return max(1, value)
 
 
 @dataclass(frozen=True)
@@ -92,11 +116,18 @@ class HostAnalysisTracer:
         run_dir: Path,
         tools: dict[str, object],
         *,
+        max_rounds: int | None = None,
         observation_view_limit: int = MAX_TEXT_CHARS,
         tool_result_limit_bytes: int = DEFAULT_TOOL_RESULT_LIMIT_BYTES,
         remaining_budget: dict[str, Any] | None = None,
+        budget: RunBudget | None = None,
     ):
         self.tools = dict(tools)
+        self.max_rounds = (resolve_analysis_max_rounds() if max_rounds is None
+                           else max(1, int(max_rounds)))
+        # 运行级预算 seam:默认解析环境层并落 config.json 快照;测试注入
+        # 定制 RunBudget(小时钟/小上限)覆盖每个预算边界。
+        self._budget = budget if budget is not None else RunBudget.load(run_dir)
         self._evidence_store = EvidenceRecorder(
             run_dir,
             observation_view_limit=observation_view_limit,
@@ -143,7 +174,11 @@ class HostAnalysisTracer:
                 or not isinstance(runtime, dict)
                 or not isinstance(runtime["remaining_budget"], dict)
                 or not isinstance(runtime["last_action"], (dict, type(None)))
-                or not isinstance(runtime["observation_view"], (str, type(None)))):
+                or not isinstance(runtime["observation_view"], (str, type(None)))
+                or type(runtime.get("max_rounds")) is not int
+                or runtime["max_rounds"] < 1
+                or type(runtime.get("rounds_used")) is not int
+                or not 0 <= runtime["rounds_used"] <= runtime["max_rounds"]):
             raise StoreError("Investigation 状态结构或身份损坏")
         pending = runtime["pending"]
         if pending is not None:
@@ -210,6 +245,7 @@ class HostAnalysisTracer:
             "pending": None, "last_action": None, "observation_view": None,
             "last_tool_call": None,
             "remaining_budget": deepcopy(self._initial_budget),
+            "rounds_used": 0, "max_rounds": self.max_rounds,
         }
         self._checkpoint(candidate.candidate_id, "candidate_created")
         return deepcopy(candidate)
@@ -279,6 +315,31 @@ class HostAnalysisTracer:
         self._checkpoint(candidate_id, "verification_finished")
         return deepcopy(investigation)
 
+    def mark_not_started(
+        self, candidate_id: str, *, stop_reason: str = "budget_exhausted",
+    ) -> Investigation:
+        """queued → finished/not_started:运行总预算耗尽时未处理项的落账原语。
+
+        只有从未开始的 Candidate 可标 not_started(不得计作已检查);已进入
+        investigating 的调查由调用方按"保存现场"路径处理,不能用本方法收束。
+        """
+        investigation = self._live_investigation(candidate_id)
+        if investigation.lifecycle_status != "queued":
+            raise ValueError(
+                f"Investigation {investigation.investigation_id} 处于 "
+                f"{investigation.lifecycle_status},只有未开始的 Candidate 才能标记 not_started")
+        self._finish_investigation(
+            investigation, disposition="not_started", stop_reason=stop_reason)
+        self._checkpoint(candidate_id, "marked_not_started")
+        return deepcopy(investigation)
+
+    def queued_ids(self) -> tuple[str, ...]:
+        """按创建序返回仍处于 queued 的 Candidate(队列驱动的收束入口)。"""
+        return tuple(
+            candidate_id for candidate_id, investigation in self._investigations.items()
+            if investigation.lifecycle_status == "queued"
+        )
+
     def _live_investigation(self, candidate_id: str) -> Investigation:
         try:
             return self._investigations[candidate_id]
@@ -310,165 +371,207 @@ class HostAnalysisTracer:
             if callable(reset):
                 reset()
             self._resumed.remove(candidate_id)
-        while True:
-            pending = runtime["pending"]
-            if pending:
-                cls = ActionProposal if pending["proposal"]["kind"] == "tool_action" else FinalProposal
-                proposal = self._validated_proposal(cls(**pending["proposal"]))
-            else:
-                if needs_recovery_context:
-                    input_message = self._candidate_context(candidate_id)
-                    needs_recovery_context = False
-                proposal = self._validated_proposal(session.step(input_message))
-            if isinstance(proposal, ActionProposal):
-                # 动作执行块与 verification.py run_case 的对应块刻意逐行平行
-                # (票 05 恢复语义的安全关键路径);修改必须同步另一侧。
-                upcoming_evidence_id = (
-                    f"ev-{pending['sequence']:06d}" if pending
-                    else self._evidence_store.peek_next_evidence_id()
-                )
-                plan, arguments, tool = self._validate_action(
-                    proposal, candidate_id, upcoming_evidence_id)
-                if not pending:
-                    slot = self._evidence_store.reserve(candidate_id)
-                    pending = {"proposal": asdict(proposal), "sequence": slot.sequence, "executing": False}
-                    runtime["pending"] = pending
-                    runtime["last_tool_call"] = {
-                        "call_id": f"call-{slot.sequence:06d}",
-                        "evidence_id": slot.evidence_id,
-                        "tool": proposal.tool, "arguments": arguments,
-                        "replay_policy": authorize_tool("analysis", proposal.tool).replay_policy.value,
-                        "attempt": 0, "status": "prepared", "finished": False,
-                    }
-                    investigation.logical_tool_calls += 1
-                    self._checkpoint(candidate_id, "proposal_accepted")
-                else:
-                    slot = self._evidence_store.restore_slot(candidate_id, pending["sequence"])
-                recovered = self._evidence_store.recover(slot)
-                call = runtime["last_tool_call"]
-                if recovered is None:
-                    result = None
-                    execute_method = "execute"
-                    if pending["executing"] and call["replay_policy"] == ReplayPolicy.NEVER.value:
-                        if call["status"] != "interrupted":
-                            call["status"] = "interrupted"
-                            self._checkpoint(candidate_id, "tool_interrupted")
-                        result = ToolResult(
-                            ok=False, text="", data={"status": "interrupted", "call_id": call["call_id"]},
-                            error="interrupted：工具执行已中断，结果未知；禁止自动重放，请选择替代取证动作。",
-                        )
-                    elif pending["executing"] and call["replay_policy"] == ReplayPolicy.CACHE_VALIDATED.value:
-                        execute_method = "execute_after_interruption"
-                        result = recover_cached_tool(tool, arguments)
-                    if result is None:
-                        kind = "tool_attempt" if pending["executing"] else "tool_started"
-                        pending["executing"] = True
-                        call["attempt"] += 1
-                        call["status"] = "started"
-                        investigation.tool_attempts += 1
-                        self._checkpoint(candidate_id, kind)
-                        result = execute_tool(tool, arguments, method=execute_method)
-                    recovered = self._evidence_store.record(
-                        slot, candidate_id=candidate_id,
-                        investigation_id=investigation.investigation_id,
-                        tool_name=proposal.tool, arguments=arguments, result=result,
-                    )
-                evidence, input_message = recovered
-                if (evidence.tool != proposal.tool or evidence.arguments != arguments
-                        or evidence.investigation_id != investigation.investigation_id):
-                    raise StoreError("Evidence 与待执行动作不匹配；请检查工件")
-                if not call["finished"]:
-                    if call["status"] != "interrupted":
-                        call["status"] = "finished"
-                    call["finished"] = True
-                    self._checkpoint(candidate_id, "tool_finished")
-                prior_digests = {reference.digest for reference in investigation.evidence}
-                self._advance_lifecycle(investigation, "investigating")
-                investigation.evidence.append(evidence)
-                effects = apply_delta_plan(investigation.state, plan)
-                if action_progressed(effects, evidence.digest, prior_digests):
-                    investigation.no_progress_count = 0
-                else:
-                    investigation.no_progress_count += 1
-                runtime.update(pending=None, last_action=asdict(proposal), observation_view=input_message)
-                if investigation.no_progress_count >= NO_PROGRESS_LIMIT:
-                    self._finish_investigation(
-                        investigation, disposition="unresolved", stop_reason="no_progress")
-                    self._checkpoint(candidate_id, "no_progress_stop")
-                    return deepcopy(investigation)
-                self._checkpoint(candidate_id, "action_completed")
-                continue
-            if isinstance(proposal, FinalProposal):
-                if proposal.kind == "close_investigation":
-                    plan, closure_reason, closure_evidence = self._validate_close(
-                        proposal.state_delta,
-                        investigation,
-                    )
-                    if not pending:
-                        runtime["pending"] = {"proposal": asdict(proposal)}
-                        self._checkpoint(candidate_id, "proposal_accepted")
-                    apply_delta_plan(investigation.state, plan)
-                    gate = evaluate_ready_gate(
-                        investigation.state,
-                        profile=investigation.claim_profile,
-                        evidence_ids=self._evidence_ids(investigation),
-                    )
-                    if gate.decisive_refuted:
-                        disposition, stop_reason = "rejected", "decisive_refutation"
+        # 运行总预算的活动时段:离开本循环(正常返回/异常传播)即封段,停机与
+        # 等待恢复的间隔不进 active time;协议重生成只计 llm_calls,不计
+        # 工具调用或 no-progress(ADR-0012 L73)。
+        self._budget.start_active()
+        strikes = 0
+        try:
+            while True:
+                # 一个语义轮 = 一个 episode:无效回复(协议形状或 Host 守卫拒绝)
+                # 整份重生成,连续 MAX_PROTOCOL_ATTEMPTS 次按 unresolved/
+                # protocol_error 收束且不阻断后续队列;服务中断等其他异常不是
+                # 无效回复,原样传播、现场由既有 checkpoint 保存。
+                try:
+                    pending = runtime["pending"]
+                    if pending:
+                        cls = ActionProposal if pending["proposal"]["kind"] == "tool_action" else FinalProposal
+                        proposal = self._validated_proposal(cls(**pending["proposal"]))
                     else:
-                        disposition, stop_reason = "closed", "agent_closed"
-                    self._finish_investigation(
-                        investigation, disposition=disposition, stop_reason=stop_reason)
-                    investigation.closure_reason = closure_reason
-                    investigation.closure_evidence = closure_evidence
-                    runtime.update(pending=None, last_action=asdict(proposal))
-                    self._checkpoint(candidate_id, "analysis_closed")
-                    return deepcopy(investigation)
-                if proposal.kind == "submit_case":
-                    plan, admission_reason = self._validate_submission(proposal, investigation)
-                    trial = deepcopy(investigation.state)
-                    apply_delta_plan(trial, plan)
-                    gate = evaluate_ready_gate(
-                        trial,
-                        profile=investigation.claim_profile,
-                        evidence_ids=self._evidence_ids(investigation),
-                    )
-                    self._assert_admission_consistent(admission_reason, gate)
-                    if not pending:
-                        runtime["pending"] = {"proposal": asdict(proposal)}
-                        self._checkpoint(candidate_id, "proposal_accepted")
-                    apply_delta_plan(investigation.state, plan)
-                    payload = build_case_payload(
-                        candidate_id=candidate_id,
-                        investigation_id=investigation.investigation_id,
-                        profile=investigation.claim_profile,
-                        state=investigation.state,
-                        evidence_references=[
-                            asdict(reference) for reference in investigation.evidence
-                        ],
-                        gate=gate,
-                        admission_reason=admission_reason,
-                    )
-                    atomic_json(
-                        Path(self._evidence_store.run_dir)
-                        / "verifications" / candidate_id / "case.json",
-                        payload,
-                    )
-                    # evidence_gap 与 ready 都停在"案卷已冻结待复核"的进度位;
-                    # ADR-0012"不伪装成 ready"落在案卷内容上(admission_reason、
-                    # pending_claims、blocking_gaps),生命周期不新增第六个值。
-                    self._advance_lifecycle(investigation, "ready_for_verification")
-                    assert_terminal(
-                        investigation.lifecycle_status,
-                        investigation.disposition,
-                        investigation.stop_reason,
-                    )
-                    runtime.update(pending=None, last_action=asdict(proposal))
-                    self._checkpoint(candidate_id, "case_submitted")
-                    return deepcopy(investigation)
-                raise ProposalRejectedError(
-                    "单 Candidate Analysis tracer 只接受 close_investigation/submit_case"
-                )
+                        # 局部轮次上限计本单元模型请求(含重生成,recon 票 06 先例);
+                        # 耗尽按未收束收尾,unresolved 语义与 no_progress 同款。
+                        if runtime["rounds_used"] >= runtime["max_rounds"]:
+                            self._finish_investigation(
+                                investigation, disposition="unresolved",
+                                stop_reason="budget_exhausted")
+                            self._checkpoint(candidate_id, "round_budget_exhausted")
+                            return deepcopy(investigation)
+                        self._budget.require_llm()
+                        if needs_recovery_context:
+                            input_message = self._candidate_context(candidate_id)
+                            needs_recovery_context = False
+                        runtime["rounds_used"] += 1
+                        raw = session.step(input_message)
+                        self._budget.record_llm_call(getattr(session, "last_usage", None))
+                        proposal = self._validated_proposal(raw)
+                    if isinstance(proposal, ActionProposal):
+                        # 动作执行块与 verification.py run_case 的对应块刻意逐行平行
+                        # (票 05 恢复语义的安全关键路径);修改必须同步另一侧。
+                        upcoming_evidence_id = (
+                            f"ev-{pending['sequence']:06d}" if pending
+                            else self._evidence_store.peek_next_evidence_id()
+                        )
+                        plan, arguments, tool = self._validate_action(
+                            proposal, candidate_id, upcoming_evidence_id)
+                        if not pending:
+                            slot = self._evidence_store.reserve(candidate_id)
+                            pending = {"proposal": asdict(proposal), "sequence": slot.sequence, "executing": False}
+                            runtime["pending"] = pending
+                            runtime["last_tool_call"] = {
+                                "call_id": f"call-{slot.sequence:06d}",
+                                "evidence_id": slot.evidence_id,
+                                "tool": proposal.tool, "arguments": arguments,
+                                "replay_policy": authorize_tool("analysis", proposal.tool).replay_policy.value,
+                                "attempt": 0, "status": "prepared", "finished": False,
+                            }
+                            investigation.logical_tool_calls += 1
+                            self._budget.record_logical_tool_call()
+                            self._checkpoint(candidate_id, "proposal_accepted")
+                        else:
+                            slot = self._evidence_store.restore_slot(candidate_id, pending["sequence"])
+                        recovered = self._evidence_store.recover(slot)
+                        call = runtime["last_tool_call"]
+                        if recovered is None:
+                            result = None
+                            execute_method = "execute"
+                            if pending["executing"] and call["replay_policy"] == ReplayPolicy.NEVER.value:
+                                if call["status"] != "interrupted":
+                                    call["status"] = "interrupted"
+                                    self._checkpoint(candidate_id, "tool_interrupted")
+                                result = ToolResult(
+                                    ok=False, text="", data={"status": "interrupted", "call_id": call["call_id"]},
+                                    error="interrupted：工具执行已中断，结果未知；禁止自动重放，请选择替代取证动作。",
+                                )
+                            elif pending["executing"] and call["replay_policy"] == ReplayPolicy.CACHE_VALIDATED.value:
+                                execute_method = "execute_after_interruption"
+                                result = recover_cached_tool(tool, arguments)
+                            if result is None:
+                                kind = "tool_attempt" if pending["executing"] else "tool_started"
+                                self._budget.require_tool()
+                                pending["executing"] = True
+                                call["attempt"] += 1
+                                call["status"] = "started"
+                                investigation.tool_attempts += 1
+                                self._budget.record_tool_execution()
+                                self._checkpoint(candidate_id, kind)
+                                result = execute_tool(tool, arguments, method=execute_method)
+                            recovered = self._evidence_store.record(
+                                slot, candidate_id=candidate_id,
+                                investigation_id=investigation.investigation_id,
+                                tool_name=proposal.tool, arguments=arguments, result=result,
+                            )
+                        evidence, input_message = recovered
+                        if (evidence.tool != proposal.tool or evidence.arguments != arguments
+                                or evidence.investigation_id != investigation.investigation_id):
+                            raise StoreError("Evidence 与待执行动作不匹配；请检查工件")
+                        if not call["finished"]:
+                            if call["status"] != "interrupted":
+                                call["status"] = "finished"
+                            call["finished"] = True
+                            self._checkpoint(candidate_id, "tool_finished")
+                        prior_digests = {reference.digest for reference in investigation.evidence}
+                        self._advance_lifecycle(investigation, "investigating")
+                        investigation.evidence.append(evidence)
+                        effects = apply_delta_plan(investigation.state, plan)
+                        if action_progressed(effects, evidence.digest, prior_digests):
+                            investigation.no_progress_count = 0
+                        else:
+                            investigation.no_progress_count += 1
+                        runtime.update(pending=None, last_action=asdict(proposal), observation_view=input_message)
+                        if investigation.no_progress_count >= NO_PROGRESS_LIMIT:
+                            self._finish_investigation(
+                                investigation, disposition="unresolved", stop_reason="no_progress")
+                            self._checkpoint(candidate_id, "no_progress_stop")
+                            self._budget.record_validated_round()
+                            return deepcopy(investigation)
+                        self._checkpoint(candidate_id, "action_completed")
+                        self._budget.record_validated_round()
+                        strikes = 0
+                        continue
+                    if isinstance(proposal, FinalProposal):
+                        if proposal.kind == "close_investigation":
+                            plan, closure_reason, closure_evidence = self._validate_close(
+                                proposal.state_delta,
+                                investigation,
+                            )
+                            if not pending:
+                                runtime["pending"] = {"proposal": asdict(proposal)}
+                                self._checkpoint(candidate_id, "proposal_accepted")
+                            apply_delta_plan(investigation.state, plan)
+                            gate = evaluate_ready_gate(
+                                investigation.state,
+                                profile=investigation.claim_profile,
+                                evidence_ids=self._evidence_ids(investigation),
+                            )
+                            if gate.decisive_refuted:
+                                disposition, stop_reason = "rejected", "decisive_refutation"
+                            else:
+                                disposition, stop_reason = "closed", "agent_closed"
+                            self._finish_investigation(
+                                investigation, disposition=disposition, stop_reason=stop_reason)
+                            investigation.closure_reason = closure_reason
+                            investigation.closure_evidence = closure_evidence
+                            runtime.update(pending=None, last_action=asdict(proposal))
+                            self._checkpoint(candidate_id, "analysis_closed")
+                            self._budget.record_validated_round()
+                            return deepcopy(investigation)
+                        if proposal.kind == "submit_case":
+                            plan, admission_reason = self._validate_submission(proposal, investigation)
+                            trial = deepcopy(investigation.state)
+                            apply_delta_plan(trial, plan)
+                            gate = evaluate_ready_gate(
+                                trial,
+                                profile=investigation.claim_profile,
+                                evidence_ids=self._evidence_ids(investigation),
+                            )
+                            self._assert_admission_consistent(admission_reason, gate)
+                            if not pending:
+                                runtime["pending"] = {"proposal": asdict(proposal)}
+                                self._checkpoint(candidate_id, "proposal_accepted")
+                            apply_delta_plan(investigation.state, plan)
+                            payload = build_case_payload(
+                                candidate_id=candidate_id,
+                                investigation_id=investigation.investigation_id,
+                                profile=investigation.claim_profile,
+                                state=investigation.state,
+                                evidence_references=[
+                                    asdict(reference) for reference in investigation.evidence
+                                ],
+                                gate=gate,
+                                admission_reason=admission_reason,
+                            )
+                            atomic_json(
+                                Path(self._evidence_store.run_dir)
+                                / "verifications" / candidate_id / "case.json",
+                                payload,
+                            )
+                            # evidence_gap 与 ready 都停在"案卷已冻结待复核"的进度位;
+                            # ADR-0012"不伪装成 ready"落在案卷内容上(admission_reason、
+                            # pending_claims、blocking_gaps),生命周期不新增第六个值。
+                            self._advance_lifecycle(investigation, "ready_for_verification")
+                            assert_terminal(
+                                investigation.lifecycle_status,
+                                investigation.disposition,
+                                investigation.stop_reason,
+                            )
+                            runtime.update(pending=None, last_action=asdict(proposal))
+                            self._checkpoint(candidate_id, "case_submitted")
+                            self._budget.record_validated_round()
+                            return deepcopy(investigation)
+                        raise ProposalRejectedError(
+                            "单 Candidate Analysis tracer 只接受 close_investigation/submit_case"
+                        )
+                except ProposalRejectedError as exc:
+                    strikes += 1
+                    if strikes >= MAX_PROTOCOL_ATTEMPTS:
+                        self._finish_investigation(
+                            investigation, disposition="unresolved",
+                            stop_reason="protocol_error")
+                        self._checkpoint(candidate_id, "protocol_error")
+                        return deepcopy(investigation)
+                    input_message = regeneration_feedback(str(exc))
+        finally:
+            self._budget.stop_active()
 
     def _candidate_context(self, candidate_id: str) -> str:
         candidate = self._candidates[candidate_id]
@@ -483,6 +586,10 @@ class HostAnalysisTracer:
             "last_action": self._runtime[candidate_id]["last_action"],
             "observation_view": self._runtime[candidate_id]["observation_view"],
             "remaining_budget": self._runtime[candidate_id]["remaining_budget"],
+            "remaining_rounds": (
+                self._runtime[candidate_id]["max_rounds"]
+                - self._runtime[candidate_id]["rounds_used"]
+            ),
         }
         return (
             "Analysis Candidate（本 Session 只调查此 Candidate）：\n"

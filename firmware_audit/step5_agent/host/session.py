@@ -24,6 +24,9 @@ from .json_values import JsonValueError, clone_json_value
 
 MAX_DECISION_SUMMARY_CHARS = 500
 
+# 无效回复整份重生生的尝试上限:首次失败后最多再请求两次(ADR-0012 L43)。
+MAX_PROTOCOL_ATTEMPTS = 3
+
 
 class ProposalRejectedError(ValueError):
     """Proposal 未通过 Host 完整守卫;本轮不得产生 Host 或工具副作用。"""
@@ -418,6 +421,8 @@ class AgentSession:
         self.context = context
         self.transcript = transcript if isinstance(transcript, Transcript) else Transcript(transcript)
         self.request_count = 0
+        # 最近一次请求的用量(prompt/completion tokens);Host 台账鸭子类型读取。
+        self.last_usage: dict[str, Any] | None = None
 
     def _messages(self) -> list[dict]:
         """把角色协议并入请求副本，不改写调用方持有的 ContextManager。"""
@@ -448,6 +453,7 @@ class AgentSession:
         reply, usage_value = self.llm.chat(messages)
         usage = dict(usage_value or {})
         reasoning = usage.pop("reasoning_content", "")
+        self.last_usage = usage
         content = f"{reasoning}\n{reply}".strip() if reasoning else reply
         self.transcript.log(
             self.request_count,

@@ -61,6 +61,9 @@ def test_persisted_proposal_does_not_request_model_again(tmp_path, monkeypatch):
     candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
     replace = os.replace
     def crash_after_proposal(source, target):
+        if target.name != "state.json":
+            replace(source, target)  # 预算台账等运行级工件照常落盘
+            return
         events = target.parent / "events.jsonl"
         if json.loads(events.read_text().splitlines()[-1])["kind"] == "proposal_accepted":
             raise OSError("power lost")
@@ -116,6 +119,9 @@ def test_completed_evidence_and_close_survive_snapshot_failure(tmp_path, monkeyp
         else:
             kind = "action_completed" if boundary == "completed" else "analysis_closed"
             def crash_before_snapshot(source, target):
+                if target.name != "state.json":
+                    replace(source, target)  # 预算台账等运行级工件照常落盘
+                    return
                 event = json.loads((target.parent / "events.jsonl").read_text().splitlines()[-1])
                 if event["kind"] == kind:
                     raise OSError("power lost")
