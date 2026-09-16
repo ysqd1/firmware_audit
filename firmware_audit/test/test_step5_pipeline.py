@@ -214,33 +214,41 @@ def test_compaction_boundary_and_failure() -> list[str]:
 
 # ---- pipeline 全链路 ----
 
+# 全链路剧本的片段:多处以 step5_run 入口验收的用例共用,不各写一份。
+DISPATCH = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
+VERIFY_TOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 10}'
+SUMMARIZE = 'Thought: 收尾\nAction: summarize\nAction Input: {"conclusion": "全链路完成"}'
+REPORT_MD = ('Final Answer: # 固件安全审计报告\n## 发现清单\n'
+             '- [high] ✓ main 经 system 注入(unitree/bin/idlc)\n'
+             '## 误报剔除\n- 实为默认文档示例\n复核完成')
+
+
+def full_chain_script() -> list[str]:
+    """全链路剧本:orchestrator 决策与子 Agent(工具+终)交错,一条完整运行。
+
+    ADR-0003:verification 每疑点一实例——2 条 analysis findings → 2 个独立实例。
+    """
+    return [
+        DISPATCH % "recon",        # 0 orchestrator 调度 recon
+        'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}',
+        RECON_FINAL,               # 2 recon 终
+        DISPATCH % "analysis",     # 3 orchestrator 调度 analysis
+        'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 10}',
+        ANALYSIS_FINAL,            # 5 analysis 终
+        DISPATCH % "verification",  # 6 orchestrator 调度 verification(阶段)
+        VERIFY_TOOL, VERIFY_FINAL_F1,   # 7/8  复核实例 1(首条 finding)
+        VERIFY_TOOL, VERIFY_FINAL_F2,   # 9/10 复核实例 2(次条 finding)
+        SUMMARIZE,                 # 11 orchestrator summarize(取素材)
+        REPORT_MD,                 # 12 Final Answer = 报告正文
+    ]
+
+
 def test_full_chain_and_resume() -> list[str]:
     """Orchestrator 全链路(recon→analysis→verification)→finish,含断点续跑(子 Agent 跳过)。"""
     fails: list[str] = []
-    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
-    VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 10}'
     with tempfile.TemporaryDirectory() as td:
         target = _make_process(Path(td))
-        # 脚本顺序(共享一个 ScriptedLLM):orchestrator 决策 + 子 Agent(工具+终)交错。
-        # ADR-0003:verification 每疑点一实例——2 条 analysis findings → 2 个独立实例
-        S = 'Thought: 收尾\nAction: summarize\nAction Input: {"conclusion": "全链路完成"}'
-        REPORT_MD = ('Final Answer: # 固件安全审计报告\n## 发现清单\n'
-                     '- [high] ✓ main 经 system 注入(unitree/bin/idlc)\n'
-                     '## 误报剔除\n- 实为默认文档示例\n复核完成')
-        h = [
-            D % "recon",        # 0 orchestrator 调度 recon
-            'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}',
-            RECON_FINAL,        # 2 recon 终
-            D % "analysis",     # 3 orchestrator 调度 analysis
-            'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 10}',
-            ANALYSIS_FINAL,     # 5 analysis 终
-            D % "verification",  # 6 orchestrator 调度 verification(阶段)
-            VTOOL, VERIFY_FINAL_F1,   # 7/8  复核实例 1(首条 finding)
-            VTOOL, VERIFY_FINAL_F2,   # 9/10 复核实例 2(次条 finding)
-            S,                  # 11 orchestrator summarize(取素材)
-            REPORT_MD,          # 12 Final Answer = 报告正文
-        ]
-        llm = ScriptedLLM(h)
+        llm = ScriptedLLM(full_chain_script())
         summary = step5_run(target, llm=llm)
         if summary["mode"] != "llm":
             fails.append(f"应走 LLM 模式: {summary['mode']}")
@@ -305,8 +313,8 @@ def test_full_chain_and_resume() -> list[str]:
 
         # 断点续跑:recon/analysis/verified_findings 工件齐 → 子 Agent 全跳过,
         # 仅 orchestrator 消耗 5 次决策(3×dispatch + summarize + Final)
-        llm2 = ScriptedLLM([D % "recon", D % "analysis", D % "verification",
-                            S, REPORT_MD])
+        llm2 = ScriptedLLM([DISPATCH % "recon", DISPATCH % "analysis",
+                            DISPATCH % "verification", SUMMARIZE, REPORT_MD])
         s2 = step5_run(target, llm=llm2)
         if len(llm2.calls) != 5:
             fails.append(f"续跑 orchestrator 应 5 次调用(子 Agent 全跳过+summarize),"
@@ -431,19 +439,18 @@ def test_redispatch_analysis_brief_carries_recon_summary() -> list[str]:
 def test_fresh_run_with_tool_call() -> list[str]:
     """recon 先调一次 read_file(真实工具)再收尾,验证工具分发在 orchestrator 编排下也通。"""
     fails: list[str] = []
-    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
     VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.functions.json", "limit": 10}'
     with tempfile.TemporaryDirectory() as td:
         target = _make_process(Path(td))
         # ADR-0003:verification 每疑点一实例——2 条 findings → 2 个实例各 1 次 read_file
         llm = ScriptedLLM([
-            D % "recon",        # 0
+            DISPATCH % "recon",        # 0
             'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 10}',
             RECON_FINAL,        # 2
-            D % "analysis",     # 3
+            DISPATCH % "analysis",     # 3
             'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}',
             ANALYSIS_FINAL,     # 5
-            D % "verification",  # 6
+            DISPATCH % "verification",  # 6
             VTOOL, VERIFY_FINAL_F1,   # 7/8  复核实例 1
             VTOOL, VERIFY_FINAL_F2,   # 9/10 复核实例 2
             'Final Answer: {"summary": "完成", "conclusion": ""}',  # 11
@@ -777,7 +784,6 @@ def test_verification_per_finding_flow() -> list[str]:
     confidence 保留 analysis 初值)、每实例 max_iters=8、补跑逻辑取消
     (verification 只调度一次,不适用同类型 3 次上限)。"""
     fails: list[str] = []
-    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
     VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
     # 4 条 findings:两条同 severity=high(confidence 不同)验证 confidence 次排序,
     # 再加 medium/low → K=3 应复核 high+high(confidence 高的先)+medium,low 未复核
@@ -792,13 +798,13 @@ def test_verification_per_finding_flow() -> list[str]:
         os.environ["STEP5_VERIFY_K"] = "3"
         try:
             llm = ScriptedLLM([
-                D % "recon",
+                DISPATCH % "recon",
                 'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5}',
                 RECON_FINAL,
-                D % "analysis",
+                DISPATCH % "analysis",
                 'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 5}',
                 ANALYSIS3,
-                D % "verification",
+                DISPATCH % "verification",
                 VTOOL, _verify_single_final("f2", True),   # high+confidence=high 排最前
                 VTOOL, _verify_single_final("f1", True),   # high+confidence=low
                 VTOOL, _verify_single_final("f3", True),   # medium
@@ -875,7 +881,6 @@ def test_verification_k_cap() -> list[str]:
     """K 上限语义:analysis findings 超过 K 时只复核前 K 条,其余 verified=None;
     K 可配置(STEP5_VERIFY_K),默认 10。"""
     fails: list[str] = []
-    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
     VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
     with tempfile.TemporaryDirectory() as td:
         target = _make_process(Path(td))
@@ -886,9 +891,9 @@ def test_verification_k_cap() -> list[str]:
                      '{"title": "c", "severity": "medium", "file": "unitree/bin/idlc"},'
                      '{"title": "d", "severity": "low", "file": "unitree/bin/idlc"}]}')
         llm = ScriptedLLM([
-            D % "recon", 'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5}', RECON_FINAL,
-            D % "analysis", 'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 5}', ANALYSIS4,
-            D % "verification",
+            DISPATCH % "recon", 'Thought: 先看工件\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.imports.json", "limit": 5}', RECON_FINAL,
+            DISPATCH % "analysis", 'Thought: 取证\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.strings.json", "limit": 5}', ANALYSIS4,
+            DISPATCH % "verification",
             VTOOL, _verify_single_final("a", True),
             VTOOL, _verify_single_final("b", True),
             VTOOL, _verify_single_final("c", True),
@@ -916,7 +921,6 @@ def test_unreviewed_section_through_step5_run() -> list[str]:
     与 test_orchestrator.test_report_unreviewed_section(Orchestrator seam)互补:
     本用例从 step5_run 入口驱动,覆盖"所有 Step5 运行都产出报告"的公开契约。"""
     fails: list[str] = []
-    D = 'Thought: 调度\nAction: dispatch_agent\nAction Input: {"agent": "%s", "task": "x", "context": ""}'
     TOOL = ('Thought: 先看工件\nAction: read_file\nAction Input: '
             '{"path": "analysis/unitree/bin/idlc.imports.json", "limit": 10}')
     VTOOL = 'Thought: 复核\nAction: read_file\nAction Input: {"path": "analysis/unitree/bin/idlc.c", "limit": 5}'
@@ -939,9 +943,9 @@ def test_unreviewed_section_through_step5_run() -> list[str]:
         os.environ["STEP5_VERIFY_K"] = "2"
         try:
             llm = ScriptedLLM([
-                D % "recon", TOOL, RECON_FINAL,
-                D % "analysis", TOOL, ANALYSIS3,
-                D % "verification",
+                DISPATCH % "recon", TOOL, RECON_FINAL,
+                DISPATCH % "analysis", TOOL, ANALYSIS3,
+                DISPATCH % "verification",
                 VTOOL, VF1,
                 VTOOL, VF2,
                 S,
@@ -1010,52 +1014,72 @@ def test_unreviewed_section_through_step5_run() -> list[str]:
     return fails
 
 
-def test_blind_discovery_startup_skips_cve_preflight() -> list[str]:
-    """ADR-0012:Blind Discovery 禁用 CVE 工具，启动不得探测相关缓存。"""
+def test_legacy_cve_preflight_contract() -> list[str]:
+    """票 19/B1:在役 legacy 入口的非阻断 CVE 预检与 cve_cache_warning 返回字段。
+
+    当前公开入口仍走 LLM orchestrator 且角色工具集含 CVE 工具,所以缺库必须
+    告警而不阻断;Host 的"不预检"语义随票 14 一次切换,那时本用例改写为
+    "启动不扫描 CVE 缓存",不保留双模式。
+    """
     import contextlib
     import io
 
     from firmware_audit.step5_agent.providers.llm_client import LLMError
     from firmware_audit.step5_agent.providers.tools import cve_bin_tool_scan as cbt
-    from firmware_audit.step5_agent.run_step5 import step5_run
 
     fails: list[str] = []
+
+    class _NoKeyLLM:
+        available = False
+
+    def _start_without_key(target: Path) -> str:
+        """无 key 替身驱动一次启动,返回 stderr 文本(预检告警的观测点)。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                step5_run(target, llm=_NoKeyLLM())
+                return "无 key 应抛 LLMError"
+            except LLMError as exc:
+                return buf.getvalue() if "无 API key" in str(exc) \
+                    else f"终止原因应是无 key: {exc}"
+
     old = os.environ.get(cbt.CVE_CACHE_ENV)
     try:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            ws = root / "fresh"
-            (ws / "extracted").mkdir(parents=True)
+            target = _make_process(root)
+            workspace = target / "process"
 
-            class _NoKeyLLM:
-                available = False
-
-            # 默认 per-target 空库也不得告警；禁用知识源不参与启动前置步骤。
+            # 1) 缺缓存:先告警,再走无 key 终止(终止原因不是缺库)
             os.environ.pop(cbt.CVE_CACHE_ENV, None)
-            buf = io.StringIO()
-            with contextlib.redirect_stderr(buf):
-                try:
-                    step5_run(ws, llm=_NoKeyLLM())
-                    fails.append("无 key 应抛 LLMError")
-                except LLMError:
-                    pass
-            out = buf.getvalue()
-            if "预检告警" in out or "FIRMWARE_AUDIT_CVE_CACHE_DIR" in out:
-                fails.append(f"Blind Discovery 启动不得做 CVE 缓存预检, got: {out[:300]}")
+            stderr = _start_without_key(target)
+            if "预检告警" not in stderr:
+                fails.append(f"缺缓存应告警: {stderr[:200]}")
 
-            # 缓存就绪同样不应改变 Blind Discovery 启动行为。
+            # 2) 缺缓存 + 合法模型替身:照常跑完,返回字段就是打出来的那条告警
+            summary = step5_run(target, llm=ScriptedLLM(full_chain_script()))
+            warning = summary.get("cve_cache_warning")
+            if not isinstance(warning, str) or "预检告警" not in warning:
+                fails.append(f"缺缓存时 cve_cache_warning 应为告警文本: {warning!r}")
+            if warning not in stderr:
+                fails.append("stderr 告警应与返回字段一致(同一份预检结论)")
+            for key in ("mode", "stages", "usage", "tool_calls", "report"):
+                if key not in summary:
+                    fails.append(f"返回契约缺字段: {key}")
+
+            # 3) 缓存就绪:零误告警,返回字段为 None
             ready = root / "shared"
             (ready / "cve-bin-tool").mkdir(parents=True)
             (ready / "cve-bin-tool" / "cve.db").write_text("", encoding="utf-8")
             os.environ[cbt.CVE_CACHE_ENV] = str(ready)
-            buf2 = io.StringIO()
-            with contextlib.redirect_stderr(buf2):
-                try:
-                    step5_run(ws, llm=_NoKeyLLM())
-                except LLMError:
-                    pass
-            if "预检告警" in buf2.getvalue():
-                fails.append(f"缓存就绪应零告警, got: {buf2.getvalue()[:300]}")
+            ready_stderr = _start_without_key(target)
+            if "预检告警" in ready_stderr:
+                fails.append(f"缓存就绪应零告警: {ready_stderr[:200]}")
+            ready_summary = step5_run(
+                target, llm=ScriptedLLM(full_chain_script()), force=True)
+            if ready_summary.get("cve_cache_warning") is not None:
+                fails.append(f"缓存就绪时返回字段应为 None: "
+                             f"{ready_summary.get('cve_cache_warning')!r}")
     finally:
         if old is None:
             os.environ.pop(cbt.CVE_CACHE_ENV, None)
@@ -1086,6 +1110,7 @@ def test_main() -> int:
         ("v1_artifact_compat_read", test_v1_artifact_compat_read),
         ("compact_at_600k_threshold", test_compact_at_600k_threshold),
         ("resolve_workspace_absolute", test_resolve_workspace_absolute),
+        ("legacy_cve_preflight_contract", test_legacy_cve_preflight_contract),
     ]:
         fl = fn()
         if fl:

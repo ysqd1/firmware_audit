@@ -30,6 +30,7 @@ from pathlib import Path
 
 from .orchestration.orchestrator import Orchestrator
 from .providers.llm_client import LLMClient, LLMError
+from .providers.tools.cve_bin_tool_scan import cve_cache_preflight_warning
 
 
 def resolve_workspace(path: Path) -> Path:
@@ -76,7 +77,8 @@ def _tool_counts(tool_calls: list) -> dict[str, int]:
 
 
 def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
-    """跑完整 Step5(Orchestrator 统一编排)。返回摘要 dict(stages/report)。
+    """跑完整 Step5(Orchestrator 统一编排)。返回摘要 dict(stages/report/
+    cve_cache_warning,后者为 CVE 缓存预检结论,缓存就绪时为 None)。
     无 API key 或 API 调用失败时抛 LLMError(立即终止,不做降级)。
     llm 用于测试注入(ScriptedLLM);None 时按环境变量建 LLMClient。
     唯一路径=LLM 编排(ADR-0006:pipeline 快速模式已删,所有运行都产报告)。"""
@@ -85,6 +87,14 @@ def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
     # 边车由 ghidra_decompile 按需产出;老工作区已有 analysis/ 照样放行(当缓存)
     if not (process_dir / "extracted").is_dir():
         raise FileNotFoundError(f"工作区无 extracted/ 解包产物: {process_dir}(先跑 Step1 解包)")
+
+    # 启动预检(2026-09-11 票01,票19 回归修复):当前公开入口仍是带 CVE 工具的
+    # legacy orchestrator,缓存库缺失只告警不阻断;不告警时 recon 会在码 40
+    # "Database does not exist" 三连败后静默放弃,全审计无 CVE 数据且结束也无人
+    # 知晓。Host 公开切换(票 14)时随盲发现规则一并移除,不保留双模式。
+    cache_warn = cve_cache_preflight_warning(process_dir)
+    if cache_warn:
+        print(f"[step5] {cache_warn}", file=sys.stderr)
 
     base = llm or LLMClient()
     if not base.available:
@@ -126,6 +136,7 @@ def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
         "usage": usage_total,
         "tool_calls": tool_total,
         "report": str(report) if report else None,
+        "cve_cache_warning": cache_warn,
     }
 
 
