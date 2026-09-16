@@ -16,7 +16,7 @@ from typing import Any
 
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, truncate_text
 from .json_values import JsonValueError, clone_json_value
-from .store import StoreError, atomic_json
+from .store import StoreError, atomic_json, store_error_boundary
 
 EVIDENCE_SCHEMA_VERSION = 1
 # Evidence Index 摘要与协议 decision summary 共用 500 字可审阅粒度；原文不受此限。
@@ -143,8 +143,11 @@ class EvidenceRecorder:
         path = self.run_dir / slot.location
         if not path.exists():
             return None
-        try:
+        with store_error_boundary(
+                "Evidence 无法恢复；请检查原工件或创建新运行世代"):
             payload = clone_json_value(json.loads(path.read_text(encoding="utf-8")), "Evidence")
+            if not isinstance(payload, dict):
+                raise StoreError("Evidence schema 不兼容；请创建新运行世代")
             if type(payload.get("schema_version")) is not int or payload["schema_version"] != EVIDENCE_SCHEMA_VERSION:
                 raise StoreError("Evidence schema 不兼容；请创建新运行世代")
             reference = EvidenceReference(**{key: payload[key] for key in EvidenceReference.__dataclass_fields__})
@@ -157,8 +160,6 @@ class EvidenceRecorder:
                     or reference.digest != hashlib.sha256(observation.encode("utf-8")).hexdigest()):
                 raise ValueError("Evidence 身份或 digest 不匹配")
             return reference, self._observation_view(reference, observation, result.ok, result.error)
-        except (ValueError, KeyError, TypeError) as exc:
-            raise StoreError(f"Evidence 无法恢复；请检查原工件或创建新运行世代: {exc}") from exc
 
     def record(
         self,

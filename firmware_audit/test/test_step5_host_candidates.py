@@ -834,6 +834,65 @@ def test_store_not_started_requires_deduped_store(tmp_path: Path) -> None:
         CandidateStore(tmp_path).not_started_ids()
 
 
+# ---- 票 17/S6:盘上记录损坏属 Store 语义,不得泄漏 intake 契约错误类型 ----
+
+
+_CORRUPT_DISK_RECORDS = (
+    {"proposal_id": ""},
+    {"proposal_id": None},
+    {"target": None},
+    {"target": "   "},
+    {"signal": ""},
+    {"kind": "weird"},
+    {"evidence_id": "  "},
+    {"next_action": None},
+    {"claim_profile": "authentication"},
+)
+
+
+@pytest.mark.parametrize("mutation", _CORRUPT_DISK_RECORDS,
+                         ids=lambda item: next(iter(item)))
+def test_store_rejects_corrupt_v1_disk_records_as_store_errors(tmp_path: Path, mutation) -> None:
+    _write_v1_store(tmp_path, [_recon_proposal(**mutation)])
+
+    with pytest.raises(StoreError) as excinfo:
+        CandidateStore(tmp_path).build(_ScriptedComparator([]), lambda _ctx: _FakeScorer())
+
+    assert not isinstance(excinfo.value, CandidateIntakeError)
+
+
+@pytest.mark.parametrize("mutation", _CORRUPT_DISK_RECORDS + (
+    # v2 记录带权威 source;v1 记录没有该字段(来源由调用方按 "recon" 传入)。
+    {"source": None},
+    {"source": "   "},
+    {"candidate_id": ""},
+), ids=lambda item: str(tuple(item)))
+def test_store_rejects_corrupt_v2_disk_records_as_store_errors(tmp_path: Path, mutation) -> None:
+    _write_v1_store(tmp_path, [_recon_proposal()])
+    _write_evidence(tmp_path, "ev-000001")
+    store = CandidateStore(tmp_path)
+    store.build(_ScriptedComparator([]), lambda _ctx: _FakeScorer())
+    payload = json.loads(store.store_path.read_text(encoding="utf-8"))
+    payload["candidates"][0].update(mutation)
+    store.store_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(StoreError) as excinfo:
+        store.build(_ScriptedComparator([]), lambda _ctx: _FakeScorer())
+
+    assert not isinstance(excinfo.value, CandidateIntakeError)
+
+
+def test_new_intake_contract_errors_stay_model_facing(tmp_path: Path) -> None:
+    """同一份契约,两种来源:模型新输入是 CandidateIntakeError,盘上记录是 StoreError。"""
+    with pytest.raises(CandidateIntakeError):
+        normalize_intake(_recon_proposal(target=None), source="recon")
+    with pytest.raises(CandidateIntakeError):
+        normalize_intake(_recon_proposal(), source="  ")
+    _write_v1_store(tmp_path, [_recon_proposal(target=None)])
+    with pytest.raises(StoreError):
+        CandidateStore(tmp_path).build(_ScriptedComparator([]), lambda _ctx: _FakeScorer())
+
+
 def test_store_build_reads_slots_from_environment(tmp_path: Path, monkeypatch) -> None:
     proposals = [
         _recon_proposal(proposal_id=f"proposal-{i:04d}", target=f"extracted/bin/t{i}")

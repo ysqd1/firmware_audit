@@ -34,7 +34,7 @@ from firmware_audit.step5_agent.host.verification import (
     validate_verification_delta,
 )
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
-from firmware_audit.step5_agent.host.store import StoreError
+from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError
 
 GENERIC_REQUIRED = (
     "target_exists", "root_cause", "trigger_or_exposure", "actual_impact",
@@ -1106,6 +1106,176 @@ def test_restore_rejects_inconsistent_investigation_lifecycle(tmp_path: Path) ->
 
     with pytest.raises(StoreError, match="不一致"):
         HostVerificationRunner(tmp_path, {"read_file": tool}, StaleTracer())
+
+
+# ---- 票 17:恢复期领域契约(Claim Result 引用、已完成结果短路) ----
+
+
+def _inject_verification_projection(tmp_path: Path, candidate_id: str, mutate, kind: str) -> None:
+    """以 Store.save 追加一条与投影一致的非法复核事件(不是只改快照)。"""
+    store = InvestigationStore(tmp_path, candidate_id, root="verifications")
+    saved = store.load()
+    mutate(saved)
+    store.save(kind, saved)
+
+
+def _tree_snapshot(root: Path) -> dict[str, bytes]:
+    """整棵运行目录的字节快照:用于断言拒绝路径零副作用(无新请求/工具/工件)。"""
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*")) if path.is_file()
+    }
+
+
+def _interrupted_case(tmp_path: Path):
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    _interrupt_after_one_action(runner, candidate_id, names=GENERIC_REQUIRED[:3])
+    return tracer, candidate_id, tool
+
+
+def test_restore_rejects_claim_results_citing_unknown_evidence(tmp_path: Path) -> None:
+    tracer, candidate_id, tool = _interrupted_case(tmp_path)
+
+    def mutate(saved):
+        saved["session"]["claim_results"] = {
+            name: _result("supported", "ev-999999") for name in GENERIC_REQUIRED}
+
+    _inject_verification_projection(
+        tmp_path, candidate_id, mutate, "injected_unknown_evidence")
+
+    before = _tree_snapshot(tmp_path)
+    with pytest.raises(StoreError, match="检查原运行目录|新运行世代"):
+        HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+
+    # 拒绝在聚合与 Finding 写入之前:整棵运行目录逐字节不变,生命周期停在复核中。
+    assert _tree_snapshot(tmp_path) == before
+    assert not (tmp_path / "findings.json").exists()
+    assert tracer.investigation_for(candidate_id).lifecycle_status == "verifying"
+
+
+def test_restore_rejects_claim_results_citing_analysis_evidence(tmp_path: Path) -> None:
+    tracer, candidate_id, tool = _interrupted_case(tmp_path)
+    analysis_evidence = (tmp_path / "investigations" / candidate_id
+                         / "evidence" / "ev-000001.json")
+    assert analysis_evidence.exists()  # 该 ID 真实存在,只是在另一棵 Evidence 树里
+
+    def mutate(saved):
+        saved["session"]["claim_results"] = {
+            name: _result("supported", "ev-000001") for name in GENERIC_REQUIRED}
+
+    _inject_verification_projection(
+        tmp_path, candidate_id, mutate, "injected_analysis_evidence")
+
+    with pytest.raises(StoreError, match="检查原运行目录|新运行世代"):
+        HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    assert not (tmp_path / "findings.json").exists()
+
+
+@pytest.mark.parametrize("claim_results", [
+    {"invented_claim": _result("supported", "ev-000002")},
+    {"root_cause": {**_result("supported", "ev-000002"), "judgment": "maybe"}},
+    {"root_cause": {**_result("supported", "ev-000002"), "evidence_ids": []}},
+    {"root_cause": {**_result("supported", "ev-000002"), "evidence_ids": [7]}},
+    {"root_cause": {**_result("supported", "ev-000002"), "observed": ""}},
+    {"root_cause": {**_result("supported", "ev-000002"), "judgment": "not_applicable"}},
+    {"root_cause": {**_result("supported", "ev-000002"), "invented_field": 1}},
+    {"root_cause": "not-an-object"},
+], ids=["unknown_claim", "bad_judgment", "supported_without_reference",
+        "bad_reference", "missing_observation", "decisive_not_applicable",
+        "unknown_field", "bad_record"])
+def test_restore_rejects_claim_results_violating_profile_or_judgment(
+    tmp_path: Path, claim_results,
+) -> None:
+    """恢复口径与提交口径同一组规则:Profile、judgment、字段完整与独立引用。"""
+    tracer, candidate_id, tool = _interrupted_case(tmp_path)
+
+    def mutate(saved):
+        saved["session"]["claim_results"] = deepcopy(claim_results)
+
+    _inject_verification_projection(
+        tmp_path, candidate_id, mutate, "injected_claim_result_contract")
+
+    with pytest.raises(StoreError, match="检查原运行目录|新运行世代"):
+        HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+
+
+def _confirmed_results(tmp_path: Path):
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    outcome = runner.run_case(candidate_id, FakeSession([
+        _v_action({"claim_results": {
+            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+        _v_complete(),
+    ]))
+    assert outcome.verdict == "confirmed"
+    return tracer, candidate_id, tool
+
+
+def _tamper_results(tmp_path: Path, candidate_id: str, mutate) -> None:
+    path = tmp_path / "verifications" / candidate_id / "results.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.mark.parametrize("tamper", [
+    lambda payload: payload.update({"verdict": "confirmed", "claim_results": {
+        name: _result("unresolved", None) for name in GENERIC_REQUIRED}}),
+    lambda payload: payload.update({"claim_results": {
+        name: _result("supported", "ev-999999") for name in GENERIC_REQUIRED}}),
+    lambda payload: payload.update({"claim_profile": "memory"}),
+    lambda payload: payload.update({"investigation_id": "inv-9999"}),
+    lambda payload: payload.update({"finding_id": "f-9999"}),
+    lambda payload: payload.update({"verdict": "inconclusive"}),
+], ids=["verdict_mismatch", "unknown_evidence", "profile_mismatch",
+        "investigation_mismatch", "finding_mismatch", "verdict_without_finding"])
+def test_replay_finished_case_obeys_the_same_domain_contract(
+    tmp_path: Path, tamper,
+) -> None:
+    tracer, candidate_id, tool = _confirmed_results(tmp_path)
+    _tamper_results(tmp_path, candidate_id, tamper)
+    session = FakeSession([])
+
+    with pytest.raises(StoreError, match="检查原运行目录|新运行世代"):
+        HostVerificationRunner(tmp_path, {"read_file": tool}, tracer).run_case(
+            candidate_id, session)
+
+    # 短路恢复的校验同样在请求模型之前:Session 一次都没被驱动。
+    assert session.inputs == []
+
+
+def test_replay_finished_case_requires_evidence_on_disk(tmp_path: Path) -> None:
+    tracer, candidate_id, tool = _confirmed_results(tmp_path)
+    (tmp_path / "verifications" / candidate_id / "evidence" / "ev-000002.json").unlink()
+
+    with pytest.raises(StoreError, match="Evidence|检查原运行目录"):
+        HostVerificationRunner(tmp_path, {"read_file": tool}, tracer).run_case(
+            candidate_id, FakeSession([]))
+
+
+def test_replay_finished_case_requires_its_finding_entry(tmp_path: Path) -> None:
+    tracer, candidate_id, tool = _confirmed_results(tmp_path)
+    findings = json.loads((tmp_path / "findings.json").read_text(encoding="utf-8"))
+    findings["findings"] = []
+    (tmp_path / "findings.json").write_text(
+        json.dumps(findings, ensure_ascii=False), encoding="utf-8")
+
+    with pytest.raises(StoreError, match="finding|Finding|检查原运行目录"):
+        HostVerificationRunner(tmp_path, {"read_file": tool}, tracer).run_case(
+            candidate_id, FakeSession([]))
+
+
+def test_legal_finished_result_replay_stays_idempotent(tmp_path: Path) -> None:
+    tracer, candidate_id, tool = _confirmed_results(tmp_path)
+
+    replayed = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer).run_case(
+        candidate_id, FakeSession([]))
+
+    assert (replayed.verdict, replayed.finding_id) == ("confirmed", "f-0001")
+    assert tracer.investigation_for(candidate_id).lifecycle_status == "finished"
 
 
 # ---- 双轴评审补测:跨树唯一性、生命周期分支、损坏工件与提示词纪律 ----

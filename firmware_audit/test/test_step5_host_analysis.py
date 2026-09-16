@@ -19,7 +19,7 @@ from firmware_audit.step5_agent.host import (
 )
 from firmware_audit.step5_agent.host.claims import CLAIM_STATUSES
 from firmware_audit.step5_agent.host.evidence import EvidenceRecorder
-from firmware_audit.step5_agent.host.store import InvestigationStore
+from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
 
 
@@ -410,6 +410,35 @@ def test_reserve_refuses_concurrent_evidence_writer(tmp_path: Path) -> None:
 
     with pytest.raises(FileExistsError):
         recorder.reserve("cand-0001")
+
+
+def _write_evidence_file(tmp_path: Path, payload, evidence_id: str = "ev-000001") -> None:
+    path = tmp_path / "investigations" / "cand-0001" / "evidence" / f"{evidence_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+@pytest.mark.parametrize("payload", [
+    {"schema_version": 999},
+    {"schema_version": 1},
+    [],
+    "not-json-at-all",
+], ids=["incompatible_schema", "missing_fields", "not_an_object", "broken_json"])
+def test_evidence_recovery_failures_are_single_store_errors(tmp_path: Path, payload) -> None:
+    """票 17/S7:磁盘损坏统一按 StoreError 拒绝,且不重复包装同一 StoreError。"""
+    recorder = EvidenceRecorder(tmp_path)
+    _write_evidence_file(tmp_path, payload)
+
+    with pytest.raises(StoreError) as excinfo:
+        recorder.recover(recorder.restore_slot("cand-0001", 1))
+
+    message = str(excinfo.value)
+    assert message.startswith("Evidence 无法恢复") or "schema 不兼容" in message
+    assert message.count("请创建新运行世代") <= 1
+    assert "Evidence 无法恢复；请检查原工件或创建新运行世代: Evidence schema 不兼容" not in message
 
 
 def test_invalid_proposal_has_no_host_or_tool_side_effect(tmp_path: Path) -> None:

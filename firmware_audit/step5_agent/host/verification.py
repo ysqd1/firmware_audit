@@ -49,7 +49,12 @@ from .session import (
     ProposalRejectedError,
     revalidate_proposal,
 )
-from .store import InvestigationStore, StoreError, atomic_json
+from .store import (
+    InvestigationStore,
+    StoreError,
+    atomic_json,
+    store_error_boundary,
+)
 from .tooling import (
     execute_tool,
     json_clone_or_reject,
@@ -133,39 +138,45 @@ def _validate_claim_result_updates(
     *,
     evidence_ids: frozenset[str],
     profile: str,
+    path_prefix: str = "state_delta.claim_results",
 ) -> tuple[tuple[tuple[str, dict[str, Any]], ...], ...]:
+    """Claim Result 字段契约的唯一出处:提交路径与恢复路径共用同一组规则。
+
+    ``path_prefix`` 只影响报错里的字段路径(模型回复是 ``state_delta.claim_results``,
+    盘上工件是 ``claim_results``);调用方负责把拒绝翻译成各自边界的错误类型。
+    """
     if not isinstance(updates, dict):
-        _reject("state_delta.claim_results 必须为 JSON object")
+        _reject(f"{path_prefix} 必须为 JSON object")
     allowed_claims = required_claims(profile)
     planned: list[tuple[str, dict[str, Any]]] = []
     for name, value in updates.items():
         if name not in allowed_claims:
             _reject(
-                f"state_delta.claim_results 含未知 Claim {name!r}"
+                f"{path_prefix} 含未知 Claim {name!r}"
                 f"(Profile {profile!r} 必填项之外不允许自由扩张 schema)")
         if not isinstance(value, dict):
-            _reject(f"state_delta.claim_results.{name} 必须为 JSON object")
+            _reject(f"{path_prefix}.{name} 必须为 JSON object")
         _known_keys(
             value, {"judgment", "observed", "evidence_ids", "method", "limitations"},
-            f"state_delta.claim_results.{name}")
+            f"{path_prefix}.{name}")
         judgment = value.get("judgment")
         if judgment not in CLAIM_RESULT_JUDGMENTS:
             _reject(
-                f"state_delta.claim_results.{name}.judgment 只允许 "
+                f"{path_prefix}.{name}.judgment 只允许 "
                 + ", ".join(CLAIM_RESULT_JUDGMENTS))
         if judgment == "not_applicable" and is_decisive(profile, name):
             _reject(
                 f"决定性 Claim {name!r} 不允许 not_applicable;"
                 "复核中无法适用应判 unresolved 并说明限制")
         observed = _nonempty_string(
-            value.get("observed"), f"state_delta.claim_results.{name}.observed")
+            value.get("observed"), f"{path_prefix}.{name}.observed")
         method = _nonempty_string(
-            value.get("method"), f"state_delta.claim_results.{name}.method")
+            value.get("method"), f"{path_prefix}.{name}.method")
         raw_refs = value.get("evidence_ids", [])
         if not isinstance(raw_refs, list) or any(
                 not isinstance(item, str) or not item for item in raw_refs):
             _reject(
-                f"state_delta.claim_results.{name}.evidence_ids 必须为 Evidence ID 字符串数组")
+                f"{path_prefix}.{name}.evidence_ids 必须为 Evidence ID 字符串数组")
         if judgment in ("supported", "refuted") and not raw_refs:
             _reject(
                 f"{judgment} Claim Result {name!r} 必须引用至少一个本次复核"
@@ -173,7 +184,7 @@ def _validate_claim_result_updates(
         missing = [item for item in raw_refs if item not in evidence_ids]
         if missing:
             _reject(
-                f"state_delta.claim_results.{name}.evidence_ids 引用了不属于本次"
+                f"{path_prefix}.{name}.evidence_ids 引用了不属于本次"
                 "复核会话的 Evidence: " + ", ".join(missing))
         record: dict[str, Any] = {
             "judgment": judgment,
@@ -182,7 +193,7 @@ def _validate_claim_result_updates(
             "method": method,
         }
         limitations = _optional_string(
-            value.get("limitations"), f"state_delta.claim_results.{name}.limitations")
+            value.get("limitations"), f"{path_prefix}.{name}.limitations")
         if limitations is not None:
             record["limitations"] = limitations
         planned.append((name, record))
@@ -321,6 +332,29 @@ class VerdictResult:
     verdict: str
     decisive_refuted: tuple[str, ...] = ()
     unsupported: tuple[str, ...] = ()
+
+
+def _assert_restorable_claim_results(
+    claim_results: Any,
+    *,
+    profile: str,
+    session_evidence_ids: frozenset[str],
+    label: str,
+) -> None:
+    """恢复期的 Claim Result 契约 = 提交期的同一组规则,只在边界翻译错误类型。
+
+    盘上既有结果没有经过本轮校验,若被直接采纳,缺少有效引用的 supported 会在
+    聚合时被当作有效支持而生成 Finding(引用不存在的 ID 或 Analysis Evidence
+    同样是越权)。模型越权回复仍是 ProposalRejectedError,盘上损坏是 StoreError。
+    """
+    try:
+        _validate_claim_result_updates(
+            claim_results, evidence_ids=session_evidence_ids, profile=profile,
+            path_prefix="claim_results",
+        )
+    except ProposalRejectedError as exc:
+        raise StoreError(
+            f"{label} 的 claim_results 未通过复核契约；请检查原运行目录: {exc}") from exc
 
 
 def aggregate_verdict(
@@ -597,12 +631,9 @@ class HostVerificationRunner:
                     or (directory / "state.json").exists()):
                 continue  # 只有冻结案卷、尚未开过复核会话
             store = InvestigationStore(self._run_dir, directory.name, root="verifications")
-            try:
+            with store_error_boundary(
+                    "复核会话恢复失败；请检查原运行目录或创建新运行世代"):
                 self._restore_case_session(store, directory.name)
-            except (KeyError, TypeError, ValueError, AttributeError) as exc:
-                raise StoreError(
-                    f"复核会话恢复失败；请检查原运行目录或创建新运行世代: {exc}"
-                ) from exc
 
     # ---- 恢复 ----
 
@@ -610,7 +641,7 @@ class HostVerificationRunner:
         """只接纳身份一致、Evidence 完整、工具调用契约完好的复核投影。"""
         saved = store.load()
         if saved is None:
-            raise StoreError("复核会话缺少权威历史")
+            raise StoreError("复核会话缺少权威历史；请检查原运行目录")
         case, session, runtime = saved["case"], saved["session"], saved["runtime"]
         evidence = saved["evidence"]
         if (not isinstance(case, dict) or case.get("candidate_id") != candidate_id
@@ -629,7 +660,7 @@ class HostVerificationRunner:
                 or runtime["max_rounds"] < 1
                 or type(runtime.get("rounds_used")) is not int
                 or not 0 <= runtime["rounds_used"] <= runtime["max_rounds"]):
-            raise StoreError("复核会话状态结构或身份损坏")
+            raise StoreError("复核会话状态结构或身份损坏；请检查原运行目录")
         # 复核快照必须与盘上冻结案卷逐字节一致,防止案卷被换内容后旧会话续跑。
         if case != _read_case_file(
                 self._run_dir / "verifications" / candidate_id / "case.json",
@@ -638,11 +669,11 @@ class HostVerificationRunner:
         lifecycle = self.tracer.investigation_for(candidate_id).lifecycle_status
         if lifecycle not in ("verifying", "finished"):
             raise StoreError(
-                f"Investigation 处于 {lifecycle},与已存在的复核会话不一致")
+                f"Investigation 处于 {lifecycle},与已存在的复核会话不一致；请检查原运行目录")
         pending = runtime["pending"]
         if pending is not None:
             if not isinstance(pending["proposal"], dict):
-                raise StoreError("待执行 Proposal 结构损坏")
+                raise StoreError("待执行 Proposal 结构损坏；请检查原运行目录")
             proposal_type = (ActionProposal
                              if pending["proposal"]["kind"] == "tool_action"
                              else FinalProposal)
@@ -650,16 +681,25 @@ class HostVerificationRunner:
             if proposal_type is ActionProposal:
                 if (type(pending["sequence"]) is not int or pending["sequence"] < 1
                         or type(pending["executing"]) is not bool):
-                    raise StoreError("待执行工具身份损坏")
+                    raise StoreError("待执行工具身份损坏；请检查原运行目录")
                 self._evidence_store.restore_sequence(pending["sequence"])
         references = [EvidenceReference(**item) for item in evidence]
         for reference in references:
             if type(reference.sequence) is not int or reference.sequence < 1:
-                raise StoreError("Evidence sequence 非法")
+                raise StoreError("Evidence sequence 非法；请检查原运行目录")
             slot = self._evidence_store.restore_slot(candidate_id, reference.sequence)
             recovered = self._evidence_store.recover(slot)
             if recovered is None or recovered[0] != reference:
-                raise StoreError("已引用复核 Evidence 缺失或与事件不一致")
+                raise StoreError("已引用复核 Evidence 缺失或与事件不一致；请检查原运行目录")
+        # 已落盘的 Claim Result 同样受领域契约约束:引用只能指向本次复核会话
+        # 独立取得的 Evidence(案卷自带的 analysis Evidence 只用于重定位)。
+        _assert_restorable_claim_results(
+            session.get("claim_results"),
+            profile=case["claim_profile"],
+            session_evidence_ids=frozenset(
+                reference.evidence_id for reference in references),
+            label="复核会话",
+        )
         validate_saved_tool_call(
             self._evidence_store, candidate_id,
             call=runtime["last_tool_call"], pending=runtime["pending"],
@@ -693,7 +733,7 @@ class HostVerificationRunner:
         results_path = self._results_path(candidate_id)
         if results_path.exists():
             # 已收尾案卷的幂等重放:只补齐生命周期落账,不重新驱动 Session。
-            return self._replay_finished_case(candidate_id, results_path)
+            return self._replay_finished_case(candidate_id, case, results_path)
 
         # 会话开始前从两棵 Evidence 树抬水位:Analysis/前次复核可能已占号,
         # 保证本次复核的 Evidence ID 全运行唯一(ADR-0012)。
@@ -803,7 +843,7 @@ class HostVerificationRunner:
                         evidence, input_message = recovered
                         if (evidence.tool != proposal.tool or evidence.arguments != arguments
                                 or evidence.investigation_id != verification_id):
-                            raise StoreError("复核 Evidence 与待执行动作不匹配；请检查工件")
+                            raise StoreError("复核 Evidence 与待执行动作不匹配；请检查原运行目录")
                         if not call["finished"]:
                             if call["status"] != "interrupted":
                                 call["status"] = "finished"
@@ -909,9 +949,14 @@ class HostVerificationRunner:
         )
 
     def _replay_finished_case(
-        self, candidate_id: str, results_path: Path,
+        self, candidate_id: str, case: dict[str, Any], results_path: Path,
     ) -> CaseOutcome:
-        """results.json 已存在的恢复路径:校验后幂等落账,不重跑 Session。"""
+        """results.json 已存在的恢复路径:校验后幂等落账,不重跑 Session。
+
+        results.json 存在不是跳过校验的理由:领域契约(案卷身份、Claim Result
+        的 Profile/judgment/独立引用、verdict 与结果的聚合一致、Finding 落账)
+        与会话恢复同一口径。
+        """
         try:
             payload = json.loads(results_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeError) as exc:
@@ -931,12 +976,42 @@ class HostVerificationRunner:
                 or type(payload.get("rounds_used")) is not int
                 or type(payload.get("max_rounds")) is not int):
             raise StoreError("复核结果结构或身份损坏；请检查原运行目录")
+        if (payload.get("claim_profile") != case["claim_profile"]
+                or payload.get("investigation_id") != case["investigation_id"]):
+            raise StoreError("复核结果与冻结案卷身份不一致；请检查原运行目录")
         try:
             evidence = tuple(
                 EvidenceReference(**item) for item in payload["evidence_references"])
         except (TypeError, KeyError) as exc:
             raise StoreError(
                 f"复核结果 Evidence 引用损坏；请检查原运行目录: {exc}") from exc
+        for reference in evidence:
+            if type(reference.sequence) is not int or reference.sequence < 1:
+                raise StoreError("复核结果的 Evidence sequence 非法；请检查原运行目录")
+            slot = self._evidence_store.restore_slot(candidate_id, reference.sequence)
+            recovered = self._evidence_store.recover(slot)
+            if recovered is None or recovered[0] != reference:
+                raise StoreError("复核结果引用的 Evidence 缺失或与工件不一致；请检查原运行目录")
+        _assert_restorable_claim_results(
+            payload["claim_results"],
+            profile=case["claim_profile"],
+            session_evidence_ids=frozenset(
+                reference.evidence_id for reference in evidence),
+            label="复核结果",
+        )
+        # verdict 由 Host 聚合,不接受与已落 Claim Result 相矛盾的结论。
+        expected = ("inconclusive" if payload["stop_reason"] == "protocol_error"
+                    else aggregate_verdict(case["claim_profile"], payload["claim_results"]).verdict)
+        if payload["verdict"] != expected:
+            raise StoreError(
+                f"复核结果 verdict {payload['verdict']!r} 与 Claim Results 聚合 "
+                f"{expected!r} 不一致；请检查原运行目录")
+        if payload["verdict"] == "confirmed":
+            if not isinstance(payload["finding_id"], str) or not payload["finding_id"]:
+                raise StoreError("confirmed 复核结果缺少 Finding ID；请检查原运行目录")
+            self._assert_finding_linkage(candidate_id, payload["finding_id"])
+        elif payload["finding_id"] is not None:
+            raise StoreError("非 confirmed 复核结果不得携带 Finding ID；请检查原运行目录")
         self.tracer.finish_verification(
             candidate_id,
             disposition=payload["verdict"],
@@ -957,6 +1032,38 @@ class HostVerificationRunner:
             results_path=results_path,
         )
 
+    def _assert_finding_linkage(self, candidate_id: str, finding_id: str) -> None:
+        """confirmed 结果必须仍有对应 Finding 落账:短路恢复不得掩盖丢失的结论。"""
+        if not (self._run_dir / "findings.json").exists():
+            raise StoreError("confirmed 复核结果缺少 findings.json；请检查原运行目录")
+        document = self._load_findings_document()
+        linked = any(
+            isinstance(item, dict) and item.get("candidate_id") == candidate_id
+            and item.get("finding_id") == finding_id
+            for item in document["findings"]
+        )
+        if not linked:
+            raise StoreError(
+                f"confirmed 复核结果在 findings.json 中缺少对应 Finding "
+                f"{finding_id}；请检查原运行目录")
+
+    def _load_findings_document(self) -> dict[str, Any]:
+        """读取 findings.json(尚未生成时给空文档);结构损坏按 Store 语义拒绝。"""
+        findings_path = self._run_dir / "findings.json"
+        document: dict[str, Any] = {
+            "schema_version": FINDING_SCHEMA_VERSION, "findings": []}
+        if not findings_path.exists():
+            return document
+        try:
+            loaded = json.loads(findings_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise StoreError(f"Findings 损坏；请检查原运行目录: {exc}") from exc
+        if (not isinstance(loaded, dict)
+                or loaded.get("schema_version") != FINDING_SCHEMA_VERSION
+                or not isinstance(loaded.get("findings"), list)):
+            raise StoreError("Findings 结构损坏；请检查原运行目录")
+        return loaded
+
     def _append_finding(
         self,
         candidate_id: str,
@@ -967,19 +1074,7 @@ class HostVerificationRunner:
     ) -> str:
         """confirmed 追加为运行内递增 Finding;按 Candidate 幂等防崩溃重放重复。"""
         findings_path = self._run_dir / "findings.json"
-        document: dict[str, Any] = {
-            "schema_version": FINDING_SCHEMA_VERSION, "findings": []}
-        if findings_path.exists():
-            try:
-                loaded = json.loads(findings_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, UnicodeError) as exc:
-                raise StoreError(
-                    f"Findings 损坏；请检查原运行目录: {exc}") from exc
-            if (not isinstance(loaded, dict)
-                    or loaded.get("schema_version") != FINDING_SCHEMA_VERSION
-                    or not isinstance(loaded.get("findings"), list)):
-                raise StoreError("Findings 结构损坏；请检查原运行目录")
-            document = loaded
+        document = self._load_findings_document()
         for item in document["findings"]:
             if isinstance(item, dict) and item.get("candidate_id") == candidate_id:
                 if not isinstance(item.get("finding_id"), str):

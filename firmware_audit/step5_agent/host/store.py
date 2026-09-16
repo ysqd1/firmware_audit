@@ -6,6 +6,7 @@ projection replay work. Run locking and generation management belong to ticket 1
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 import json
 import os
@@ -19,9 +20,28 @@ from .json_values import clone_json_value
 SCHEMA_VERSION = 1
 EVENT_VERSION = 1
 
+# Candidate 身份的单一格式出处(Candidate Store 与 Investigation Store 共用)。
+CANDIDATE_ID_PATTERN = re.compile(r"cand-[0-9]{4,}")
+
 
 class StoreError(ValueError):
     """History cannot be safely recovered; preserve it for manual inspection."""
+
+
+@contextmanager
+def store_error_boundary(message: str):
+    """恢复边界:非 Store 错误按 ``message`` 统一包装,StoreError 原样穿透。
+
+    StoreError 继承 ValueError,若与 ValueError 一起被兜底捕获,同一结论会被
+    二次包装成双层恢复指引(S7)。各恢复入口共用本上下文管理器,不各写一份
+    "先 re-raise" 的拷贝。
+    """
+    try:
+        yield
+    except StoreError:
+        raise
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise StoreError(f"{message}: {exc}") from exc
 
 
 def _decode(raw: bytes) -> dict:
@@ -79,7 +99,7 @@ class InvestigationStore:
     """One Candidate's durable history; callers save only fully validated states."""
 
     def __init__(self, run_dir: Path, candidate_id: str, *, root: str = "investigations"):
-        if not re.fullmatch(r"cand-[0-9]{4,}", candidate_id):
+        if not CANDIDATE_ID_PATTERN.fullmatch(candidate_id):
             raise StoreError("非法 Candidate ID；请检查运行目录")
         # root 区分事件树归属:investigations(Analysis)或 verifications(独立复核)。
         self.directory = Path(run_dir) / root / candidate_id

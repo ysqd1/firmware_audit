@@ -124,26 +124,26 @@ def validate_saved_tool_call(
     if (type(logical_tool_calls) is not int or type(tool_attempts) is not int
             or tool_attempts < 0
             or logical_tool_calls != len(evidence) + int(active)):
-        raise StoreError("工具调用计数损坏")
+        raise StoreError("工具调用计数损坏；请检查原运行目录")
     if call is None:
         if logical_tool_calls or tool_attempts:
-            raise StoreError("缺少逻辑调用记录")
+            raise StoreError("缺少逻辑调用记录；请检查原运行目录")
         return
     if not isinstance(call, dict):
-        raise StoreError("逻辑调用记录结构损坏")
+        raise StoreError("逻辑调用记录结构损坏；请检查原运行目录")
     if active:
         sequence = pending["sequence"]
         proposal = pending["proposal"]
         tool_name, arguments = proposal["tool"], proposal["arguments"]
     else:
         if not evidence:
-            raise StoreError("工具调用缺少 Evidence")
+            raise StoreError("工具调用缺少 Evidence；请检查原运行目录")
         reference = evidence[-1]
         sequence, tool_name, arguments = reference.sequence, reference.tool, reference.arguments
     contract = authorize_tool(role, tool_name)
     checked, error = validate_params(contract.tool_type.params, arguments)
     if error:
-        raise StoreError("持久化工具参数失约")
+        raise StoreError("持久化工具参数失约；请检查原运行目录")
     arguments = normalize_tool_arguments(contract.tool_type.params, checked)
     attempt, status, finished = call["attempt"], call["status"], call["finished"]
     if (call["call_id"] != f"call-{sequence:06d}"
@@ -159,8 +159,8 @@ def validate_saved_tool_call(
             or (status == "interrupted" and contract.replay_policy is not ReplayPolicy.NEVER)
             or (active and pending["executing"] != (attempt > 0))
             or (not active and not finished)):
-        raise StoreError("工具调用身份、状态或 replay policy 损坏")
+        raise StoreError("工具调用身份、状态或 replay policy 损坏；请检查原运行目录")
     if finished:
         slot = evidence_store.restore_slot(candidate_id, sequence)
         if evidence_store.recover(slot) is None:
-            raise StoreError("tool_finished 缺少持久化 Observation")
+            raise StoreError("tool_finished 缺少持久化 Observation；请检查原运行目录")

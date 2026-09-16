@@ -32,6 +32,7 @@ from .candidates import CLAIM_PROFILES
 from .claims import (
     ADMISSION_REASONS,
     NO_PROGRESS_LIMIT,
+    PolicyError,
     action_progressed,
     apply_delta_plan,
     assert_lifecycle_transition,
@@ -53,7 +54,7 @@ from .session import (
     ProposalRejectedError,
     revalidate_proposal,
 )
-from .store import InvestigationStore, StoreError, atomic_json
+from .store import InvestigationStore, StoreError, atomic_json, store_error_boundary
 from .tooling import (
     execute_tool,
     json_clone_or_reject,
@@ -143,18 +144,15 @@ class HostAnalysisTracer:
         self._initial_budget = json_clone_or_reject(remaining_budget or {}, "remaining_budget")
         for directory in sorted((Path(run_dir) / "investigations").glob("cand-*")):
             store = InvestigationStore(run_dir, directory.name)
-            try:
+            with store_error_boundary(
+                    "Investigation 恢复失败；请检查原运行目录或创建新运行世代"):
                 self._restore_investigation(store, directory.name)
-            except (KeyError, TypeError, ValueError, AttributeError) as exc:
-                raise StoreError(
-                    f"Investigation 恢复失败；请检查原运行目录或创建新运行世代: {exc}"
-                ) from exc
 
     def _restore_investigation(self, store: InvestigationStore, candidate_id: str) -> None:
         """Hydrate only identity-consistent domain projections and referenced Evidence."""
         saved = store.load()
         if saved is None:
-            raise StoreError("Investigation 缺少权威历史")
+            raise StoreError("Investigation 缺少权威历史；请检查原运行目录")
         candidate = Candidate(**saved["candidate"])
         data = saved["investigation"]
         runtime = saved["runtime"]
@@ -179,28 +177,29 @@ class HostAnalysisTracer:
                 or runtime["max_rounds"] < 1
                 or type(runtime.get("rounds_used")) is not int
                 or not 0 <= runtime["rounds_used"] <= runtime["max_rounds"]):
-            raise StoreError("Investigation 状态结构或身份损坏")
+            raise StoreError("Investigation 状态结构或身份损坏；请检查原运行目录")
         pending = runtime["pending"]
         if pending is not None:
             if not isinstance(pending, dict) or not isinstance(pending["proposal"], dict):
-                raise StoreError("待执行 Proposal 结构损坏")
+                raise StoreError("待执行 Proposal 结构损坏；请检查原运行目录")
             proposal_type = ActionProposal if pending["proposal"]["kind"] == "tool_action" else FinalProposal
             self._validated_proposal(proposal_type(**pending["proposal"]))
             if proposal_type is ActionProposal:
                 if (type(pending["sequence"]) is not int or pending["sequence"] < 1
                         or type(pending["executing"]) is not bool):
-                    raise StoreError("待执行工具身份损坏")
+                    raise StoreError("待执行工具身份损坏；请检查原运行目录")
                 self._evidence_store.restore_sequence(pending["sequence"])
         data["evidence"] = [EvidenceReference(**item) for item in data["evidence"]]
         data["closure_evidence"] = tuple(data["closure_evidence"])
         investigation = Investigation(**data)
+        self._assert_restorable_lifecycle(investigation)
         for reference in investigation.evidence:
             if type(reference.sequence) is not int or reference.sequence < 1:
-                raise StoreError("Evidence sequence 非法")
+                raise StoreError("Evidence sequence 非法；请检查原运行目录")
             slot = self._evidence_store.restore_slot(candidate_id, reference.sequence)
             recovered = self._evidence_store.recover(slot)
             if recovered is None or recovered[0] != reference:
-                raise StoreError("已引用 Evidence 缺失或与事件不一致")
+                raise StoreError("已引用 Evidence 缺失或与事件不一致；请检查原运行目录")
         self._validate_saved_call(runtime, data, candidate_id)
         self._candidates[candidate_id] = candidate
         self._investigations[candidate_id] = investigation
@@ -218,6 +217,44 @@ class HostAnalysisTracer:
             tool_attempts=data["tool_attempts"],
             evidence=data["evidence"], role="analysis",
         )
+
+    @staticmethod
+    def _assert_restorable_lifecycle(investigation: Investigation) -> None:
+        """恢复期生命周期契约:生命周期/处置/停止原因三轴取值与组合,关闭记录只属于已结束的调查。
+
+        queued+confirmed 之类不是"结构损坏"而是领域非法:接受它会让模型在错误
+        前提下请求工具,或让缺引用的 Claim 直接生成 Finding。拒绝发生在任何
+        模型请求、工具执行与 Finding 写入之前,原工件保留供检查。
+        生命周期进度闸门(ready/verifying 等)由各自入口的转换守卫另行把关。
+        """
+        try:
+            assert_terminal(
+                investigation.lifecycle_status,
+                investigation.disposition,
+                investigation.stop_reason,
+            )
+        except PolicyError as exc:
+            raise StoreError(f"生命周期投影非法；请检查原运行目录: {exc}") from exc
+        owned = {reference.evidence_id for reference in investigation.evidence}
+        closure_evidence = investigation.closure_evidence
+        if any(not isinstance(item, str) or not item for item in closure_evidence):
+            raise StoreError("关闭证据必须是 Evidence ID 字符串；请检查原运行目录")
+        if investigation.closure_reason is None:
+            if closure_evidence:
+                raise StoreError("关闭证据缺少关闭原因；请检查原运行目录")
+            return
+        if (not isinstance(investigation.closure_reason, str)
+                or not investigation.closure_reason.strip()):
+            raise StoreError("关闭原因必须是非空字符串；请检查原运行目录")
+        if investigation.lifecycle_status != "finished":
+            raise StoreError("关闭记录只属于已结束的调查；请检查原运行目录")
+        if not closure_evidence:
+            raise StoreError("关闭记录缺少关闭证据；请检查原运行目录")
+        unknown = [item for item in closure_evidence if item not in owned]
+        if unknown:
+            raise StoreError(
+                "关闭证据引用不属于本 Investigation: " + ", ".join(unknown)
+                + "；请检查原运行目录")
 
     def add_candidate(self, proposal: dict[str, Any]) -> Candidate:
         """分配 Candidate ID，并一一创建隔离的 queued Investigation。"""
@@ -463,7 +500,7 @@ class HostAnalysisTracer:
                         evidence, input_message = recovered
                         if (evidence.tool != proposal.tool or evidence.arguments != arguments
                                 or evidence.investigation_id != investigation.investigation_id):
-                            raise StoreError("Evidence 与待执行动作不匹配；请检查工件")
+                            raise StoreError("Evidence 与待执行动作不匹配；请检查原运行目录")
                         if not call["finished"]:
                             if call["status"] != "interrupted":
                                 call["status"] = "finished"

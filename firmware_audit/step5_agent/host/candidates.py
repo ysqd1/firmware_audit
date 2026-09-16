@@ -21,8 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from .json_values import clone_json_value
-from .store import StoreError, atomic_json
+from .json_values import JsonValueError, clone_json_value
+from .store import CANDIDATE_ID_PATTERN, StoreError, atomic_json
 
 # Claim Profile 枚举(ADR-0012):Profile 内容与 Claim 门槛由后续工单实现,
 # 此处只作为 fingerprint 输入与语义比较门控维度。
@@ -150,6 +150,21 @@ def _field_from(record: dict[str, Any], name: str) -> Any:
     if isinstance(extras, dict):
         return extras.get(name)
     return None
+
+
+def _intake_from_stored_record(record: dict[str, Any], *, source: str) -> IntakeCandidate:
+    """归一盘上已入册的 Candidate 记录。
+
+    同一份 intake 契约有两种来源:模型新输入(Recon proposal / Related
+    Candidate)失败是 ``CandidateIntakeError``,由调用方翻译成模型可见的拒绝;
+    盘上记录损坏则是 Store 语义,必须按 StoreError 停下并引导检查原目录,
+    不得让模型契约错误类型冒充磁盘损坏。
+    """
+    try:
+        return normalize_intake(record, source=source)
+    except (CandidateIntakeError, JsonValueError) as exc:
+        raise StoreError(
+            f"既有 Candidate 记录未通过 intake 契约；请检查原运行目录: {exc}") from exc
 
 
 def _text(value: Any, *, nullable: bool = False) -> str | None:
@@ -365,24 +380,33 @@ class _Survivor:
 
     @classmethod
     def from_record(cls, record: dict[str, Any]) -> _Survivor:
+        # 先做结构把关,再归一内容:盘上记录损坏一律 StoreError,不落进
+        # normalize_intake 的模型契约错误通道(票 17/S6)。
+        if not isinstance(record, dict):
+            raise StoreError("既有 Candidate 记录结构损坏;请检查原运行目录")
+        candidate_id = record.get("candidate_id")
+        aliases = record.get("aliases", [])
+        merged = record.get("merged_proposals", [])
+        priority = record.get("priority")
+        if (not isinstance(candidate_id, str)
+                or not CANDIDATE_ID_PATTERN.fullmatch(candidate_id)
+                or not isinstance(aliases, list)
+                or not all(isinstance(item, str) for item in aliases)
+                or not isinstance(merged, list)
+                or not all(isinstance(item, dict) for item in merged)
+                or (priority is not None and not isinstance(priority, dict))):
+            # 盘上既有记录损坏属 Store 语义:停止并引导检查,不混入 intake 契约错误。
+            raise StoreError("既有 Candidate 记录结构损坏;请检查原运行目录")
         # 记账键(candidate_id/source/fingerprint/aliases/merged_proposals/priority)
         # 与派生字段(queue/disposition,每次 build 重算)不参与 intake 归一,否则
         # 会漏进 extras 导致重放比对误判"内容不同"。
         bookkeeping = {"candidate_id", "source", "fingerprint", "aliases",
                        "merged_proposals", "queue", "disposition", "priority"}
-        intake = normalize_intake(
+        intake = _intake_from_stored_record(
             {key: value for key, value in record.items() if key not in bookkeeping},
             source=record.get("source", "recon"),
         )
-        aliases = record.get("aliases", [])
-        merged = record.get("merged_proposals", [])
-        priority = record.get("priority")
-        if (not isinstance(record.get("candidate_id"), str)
-                or not isinstance(aliases, list) or not isinstance(merged, list)
-                or (priority is not None and not isinstance(priority, dict))):
-            # 盘上既有记录损坏属 Store 语义:停止并引导检查,不混入 intake 契约错误。
-            raise StoreError("既有 Candidate 记录结构损坏;请检查原运行目录")
-        return cls(intake, record["candidate_id"], list(aliases),
+        return cls(intake, candidate_id, list(aliases),
                    [dict(item) for item in merged],
                    dict(priority) if priority is not None else None)
 
@@ -829,7 +853,7 @@ class CandidateStore:
                              if isinstance(payload.get("session_state"), dict) else {})
             if payload["schema_version"] == _V1_STORE_SCHEMA_VERSION:
                 intakes = [
-                    normalize_intake(record, source="recon")
+                    _intake_from_stored_record(record, source="recon")
                     for record in payload["candidates"]
                 ] + intakes
             else:
