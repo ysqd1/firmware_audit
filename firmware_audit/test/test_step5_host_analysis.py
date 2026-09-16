@@ -21,6 +21,9 @@ from firmware_audit.step5_agent.host.claims import CLAIM_STATUSES
 from firmware_audit.step5_agent.host.evidence import EvidenceRecorder
 from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
+from firmware_audit.test.host_related import related_entry as _related_entry
+
+
 
 
 class FakeSession:
@@ -987,3 +990,47 @@ def test_protocol_failure_never_enters_no_progress_count(tmp_path: Path) -> None
 def test_claim_statuses_vocabulary_is_the_adr_set() -> None:
     assert CLAIM_STATUSES == (
         "unassessed", "supported", "refuted", "not_applicable")
+
+
+# ---- 票 18:Related Candidate 在 Action Loop 里的整份拒绝与持久化 ----
+
+
+def test_illegal_related_candidate_rejects_the_whole_action_before_the_tool(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="must not run", raw="must not run"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    session = FakeSession([
+        _action({"related_candidates": [{"nonsense": True}]}),
+        _action({"related_candidates": [_related_entry()]}),
+        _close(),
+    ])
+
+    result = host.run_analysis(candidate.candidate_id, session)
+
+    # 非法 proposal 整份拒绝:没有工具副作用、没有部分状态,理由回喂同一 Session。
+    assert "Candidate 契约" in (session.inputs[1] or "")
+    assert len(tool.calls) == 1
+    assert len(result.evidence) == 1
+    assert [item["proposal_id"] for item in result.state["related_candidates"]] == [
+        "rel-cand-0001-1"]
+    assert result.state["related_candidates"][0]["origin"]["relation"] == "analysis_related"
+
+
+def test_valid_related_candidate_survives_resume_with_origin(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="literal", raw="literal"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    with pytest.raises(StopIteration):
+        host.run_analysis(candidate.candidate_id, FakeSession([
+            _action({"related_candidates": [_related_entry()]})]))
+
+    resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    record = resumed.investigation_for(candidate.candidate_id).state["related_candidates"][0]
+
+    assert record["origin"] == {
+        "relation": "analysis_related",
+        "from_candidate": candidate.candidate_id,
+        "from_investigation": "inv-0001",
+    }
+    assert record["evidence_id"] == "ev-000001"
+    assert record["extras"] == {}

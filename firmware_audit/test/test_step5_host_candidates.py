@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -11,12 +12,14 @@ from firmware_audit.step5_agent.host.candidates import (
     CLAIM_PROFILES,
     COVERAGE_FACTORS,
     DEFAULT_PROCESSING_SLOTS,
+    RELATED_CANDIDATE_FIELDS,
     SIGNAL_FACTORS,
     CandidateIntakeError,
     CandidateStore,
     ComparisonOutcome,
     IntakeCandidate,
     PriorityScorer,
+    RelatedOrigin,
     Selection,
     SemanticComparator,
     compute_total,
@@ -27,16 +30,22 @@ from firmware_audit.step5_agent.host.candidates import (
     make_priority_scorer,
     normalize_intake,
     normalize_target_path,
+    related_candidate_contract,
+    related_candidate_records,
+    related_intake,
     resolve_processing_slots,
     select_for_processing,
     signal_fingerprint,
+    stored_related_proposals,
 )
+from firmware_audit.step5_agent.host.claims import validate_analysis_delta
 from firmware_audit.step5_agent.host.recon import (
     RECON_SESSION_SYSTEM,
     HostReconRunner,
 )
 from firmware_audit.step5_agent.host.session import AgentSession
-from firmware_audit.step5_agent.host.store import StoreError, atomic_json
+from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError, atomic_json
+from firmware_audit.step5_agent.host.verification import validate_verification_delta
 from firmware_audit.step5_agent.providers.tools import ToolContext, make_tools
 from firmware_audit.test.scripted_llm import ScriptedLLM
 
@@ -1036,3 +1045,104 @@ def test_recon_output_builds_deduped_scored_and_selected_store(tmp_path: Path) -
     first_scoring_user = scorer_llm.calls[0][1]["content"]
     assert "ev-000002" in first_scoring_user
     assert "extracted/etc/device.conf" in first_scoring_user  # read_file Evidence 摘要入评分依据
+
+
+# ---- 票 18:Related Candidate 契约单一出处与回队出口 ----
+
+
+def _contract_examples(text: str) -> list[dict]:
+    """从提示文本里抽出 JSON 示例块:提示写的样例必须真的能被机器消费。"""
+    blocks = re.findall(r"```json\n(.*?)\n```", text, re.S)
+    assert len(blocks) == 2
+    return [json.loads(block) for block in blocks]
+
+
+@pytest.mark.parametrize("index,kind", [(0, "signal"), (1, "coverage")])
+def test_contract_example_passes_analysis_and_verification_validation(index: int, kind: str) -> None:
+    example = _contract_examples(related_candidate_contract())[index]
+    entries = example["related_candidates"]
+    assert entries[0]["kind"] == kind
+    for field in RELATED_CANDIDATE_FIELDS:
+        assert field in entries[0], field
+    evidence = frozenset({entries[0]["evidence_id"]})
+
+    analysis = validate_analysis_delta(
+        {}, example, evidence_ids=evidence, profile="generic",
+        related_origin=RelatedOrigin("analysis", "cand-0001", "inv-0001"))
+    verification = validate_verification_delta(
+        {}, example, evidence_ids=evidence, profile="generic",
+        case_candidate_id="cand-0001", case_investigation_id="inv-0001")
+
+    assert len(analysis.related_candidates) == 1
+    assert len(verification.related_candidates) == 1
+    assert analysis.related_candidates[0]["proposal_id"] \
+        == verification.related_candidates[0]["proposal_id"]
+
+
+def test_contract_text_names_every_required_field() -> None:
+    text = related_candidate_contract()
+
+    for field in RELATED_CANDIDATE_FIELDS:
+        assert field in text, field
+    for field in ("anchor", "mechanism", "component_or_entry", "check_goal"):
+        assert field in text, field
+    assert "signal" in text and "coverage" in text
+
+
+def test_related_origin_rejects_unknown_role_and_missing_identity() -> None:
+    with pytest.raises(CandidateIntakeError, match="角色"):
+        RelatedOrigin("recon", "cand-0001", "inv-0001")
+    with pytest.raises(CandidateIntakeError, match="candidate_id"):
+        RelatedOrigin("analysis", "", "inv-0001")
+    assert RelatedOrigin("verification", "cand-0002", "inv-0002").source \
+        == "verification:cand-0002"
+
+
+def test_related_candidate_records_reject_broken_shapes() -> None:
+    origin = RelatedOrigin("analysis", "cand-0001", "inv-0001")
+    with pytest.raises(CandidateIntakeError, match="非空数组"):
+        related_candidate_records({}, evidence_ids=frozenset(), origin=origin)
+    with pytest.raises(CandidateIntakeError, match="必须为 JSON object"):
+        related_candidate_records([1], evidence_ids=frozenset(), origin=origin)
+    with pytest.raises(CandidateIntakeError, match="本 Investigation 的 Evidence"):
+        related_candidate_records(
+            [_recon_proposal(evidence_id="ev-999999")],
+            evidence_ids=frozenset({"ev-000001"}), origin=origin)
+
+
+def test_related_intake_restores_a_candidate_store_ready_record() -> None:
+    """票 11 的入口:已校验记录 → Candidate Store 可消费的 intake,来源身份不丢。"""
+    origin = RelatedOrigin("verification", "cand-0001", "inv-0001")
+    record = related_candidate_records(
+        [_recon_proposal(proposal_id="rel-cand-0001-1", anchor="handle_msg")],
+        evidence_ids=frozenset({"ev-000001"}), origin=origin)[0]
+
+    intake = related_intake(record)
+
+    assert isinstance(intake, IntakeCandidate)
+    assert intake.source == "verification:cand-0001"
+    assert intake.proposal_id == "rel-cand-0001-1"
+    assert intake.target == "extracted/bin/robotd"
+    assert intake.claim_profile == "generic"
+
+
+def test_stored_related_proposals_reads_both_roles_and_dedups_by_source(tmp_path: Path) -> None:
+    """票 11 的入口:从权威工件读回已校验线索,不依赖 Transcript 或 Finding。"""
+    origin = RelatedOrigin("analysis", "cand-0001", "inv-0001")
+    record = related_candidate_records(
+        [_recon_proposal(proposal_id="rel-cand-0001-1", anchor="handle_msg")],
+        evidence_ids=frozenset({"ev-000001"}), origin=origin)[0]
+    store = InvestigationStore(tmp_path, "cand-0001")
+    store.save("candidate_created", {
+        "candidate": {"candidate_id": "cand-0001", "proposal": {}},
+        "investigation": {"state": {"related_candidates": [record]}},
+        "runtime": {},
+    })
+    atomic_json(tmp_path / "verifications" / "cand-0001" / "results.json", {
+        "candidate_id": "cand-0001", "related_candidates": [record],
+    })
+
+    proposals = stored_related_proposals(tmp_path)
+
+    assert proposals == (record,)
+    assert stored_related_proposals(tmp_path) == proposals  # 读取幂等

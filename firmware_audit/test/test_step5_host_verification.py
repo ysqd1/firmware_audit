@@ -34,6 +34,8 @@ from firmware_audit.step5_agent.host.verification import (
     validate_verification_delta,
 )
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
+from firmware_audit.test.host_related import related_entry
+from firmware_audit.step5_agent.host.candidates import stored_related_proposals
 from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError
 
 GENERIC_REQUIRED = (
@@ -230,18 +232,10 @@ def test_apply_plan_is_idempotent_and_last_write_wins() -> None:
 
 
 def _related_entry(**overrides) -> dict:
-    entry = {
-        "proposal_id": "rel-0001",
-        "kind": "signal",
-        "target": "extracted/bin/updater",
-        "signal": "升级处理器解析未校验长度字段",
-        "evidence_id": "ev-000002",
-        "next_action": "反编译解析函数确认边界检查",
-        "anchor": "parse_header+0x42",
-        "mechanism": "integer overflow",
-    }
-    entry.update(overrides)
-    return entry
+    """本文件缺省:复核会话的 Evidence 是 ev-000002,线索 ID 沿用 rel-0001。"""
+    overrides.setdefault("proposal_id", "rel-0001")
+    overrides.setdefault("evidence_id", "ev-000002")
+    return related_entry(**overrides)
 
 
 def test_related_candidate_is_normalized_with_origin() -> None:
@@ -1407,3 +1401,131 @@ def test_append_finding_rejects_corrupted_entry(tmp_path: Path) -> None:
                 name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
             _v_complete(),
         ]))
+
+
+def test_verification_prompt_documents_the_full_related_candidate_contract() -> None:
+    """票 18/S1:提示必须写全必填字段与两类示例,而不是只有 anchor/mechanism。"""
+    from firmware_audit.step5_agent.host.candidates import (
+        RELATED_CANDIDATE_FIELDS,
+        related_candidate_contract,
+    )
+
+    section = VERIFICATION_SESSION_SYSTEM.split("## 5")[1]
+    for field in RELATED_CANDIDATE_FIELDS:
+        assert field in section, field
+    for field in ("anchor", "mechanism", "component_or_entry", "check_goal"):
+        assert field in section, field
+    assert section.count("```json") == 2
+    # 提示里的样例就是共享契约的样例(同一出处),不再各写一份。
+    assert related_candidate_contract() in VERIFICATION_SESSION_SYSTEM
+
+
+def test_verification_related_candidate_is_origin_stamped_and_persisted(tmp_path: Path) -> None:
+    """合法 proposal 进 results.json 与 CaseOutcome,供票 11 幂等回队。"""
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    session = FakeSession([
+        _v_action({
+            "claim_results": {
+                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED},
+            "related_candidates": [_related_entry(
+                proposal_id="rel-cand-0001-1", evidence_id="ev-000002")],
+        }),
+        _v_complete(),
+    ])
+
+    outcome = runner.run_case(candidate_id, session)
+
+    assert outcome.verdict == "confirmed"
+    payload = json.loads(outcome.results_path.read_text(encoding="utf-8"))
+    record = payload["related_candidates"][0]
+    assert record["origin"]["relation"] == "verification_related"
+    assert record["origin"]["from_candidate"] == candidate_id
+    assert stored_related_proposals(tmp_path) == (record,)
+
+
+def test_analysis_related_proposal_is_readable_from_artifacts(tmp_path: Path) -> None:
+    """票 18/AC8:分析侧的已校验 proposal 从权威工件读回,不解析 Transcript。"""
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    tracer = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = tracer.add_candidate({
+        "target": "extracted/etc/device.conf",
+        "signal": "管理配置包含凭据样式文本",
+        "next_action": "确认配置生效路径",
+    })
+    action = parse_proposal(json.dumps({
+        "decision_summary": "一轮取证并附带线索",
+        "state_delta": {"related_candidates": [
+            _related_entry(proposal_id="rel-cand-0001-1", evidence_id="ev-000001")]},
+        "next": {"kind": "tool_action", "tool": "read_file",
+                 "arguments": {"path": "extracted/etc/device.conf"}},
+    }), "analysis")
+    with pytest.raises(StopIteration):
+        tracer.run_analysis(candidate.candidate_id, FakeSession([action], role="analysis"))
+
+    proposals = stored_related_proposals(tmp_path)
+
+    assert len(proposals) == 1
+    assert proposals[0]["origin"] == {
+        "relation": "analysis_related",
+        "from_candidate": candidate.candidate_id,
+        "from_investigation": "inv-0001",
+    }
+    assert proposals[0]["evidence_id"] == "ev-000001"
+    assert proposals[0]["mechanism"] == "integer overflow"
+
+
+def test_same_proposal_id_with_different_content_is_rejected_in_verification() -> None:
+    """票 18/AC5:两角色同口径——同来源同 ID 异内容整份拒绝,不静默保留先到者。"""
+    state: dict = {}
+    first = _validate(
+        delta={"related_candidates": [_related_entry()]},
+        evidence_ids=frozenset({"ev-000002"}),
+    )
+    apply_verification_delta_plan(state, first)
+
+    with pytest.raises(ProposalRejectedError, match="已按不同内容入册"):
+        _validate(
+            state=state,
+            delta={"related_candidates": [
+                _related_entry(mechanism="use after free")]},
+            evidence_ids=frozenset({"ev-000002"}),
+        )
+
+    # 内容一致的恢复重放仍然幂等。
+    replay = _validate(
+        state=state,
+        delta={"related_candidates": [_related_entry()]},
+        evidence_ids=frozenset({"ev-000002"}),
+    )
+    apply_verification_delta_plan(state, replay)
+    assert state["related_candidates"][0]["mechanism"] == "integer overflow"
+    assert len(state["related_candidates"]) == 1
+
+
+def test_illegal_related_candidate_rejects_the_whole_verification_action(tmp_path: Path) -> None:
+    """票 18/AC7:复核侧非法线索的整份拒绝与零副作用。"""
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    session = FakeSession([
+        _v_action({
+            "claim_results": {"root_cause": _result("supported", "ev-000002")},
+            "related_candidates": [{"nonsense": True}],
+        }),
+        _v_action({
+            "claim_results": {
+                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED},
+            "related_candidates": [_related_entry(evidence_id="ev-000002")],
+        }),
+        _v_complete(),
+    ])
+
+    outcome = runner.run_case(candidate_id, session)
+
+    assert "Candidate 契约" in (session.inputs[1] or "")
+    assert len(tool.calls) == 1  # 非法 proposal 的动作没有执行工具
+    assert [item.evidence_id for item in outcome.evidence] == ["ev-000002"]
+    assert len(outcome.related_candidates) == 1
+    assert outcome.related_candidates[0]["origin"]["relation"] == "verification_related"

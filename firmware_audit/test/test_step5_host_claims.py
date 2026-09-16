@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from firmware_audit.step5_agent.host.candidates import CLAIM_PROFILES
+from firmware_audit.step5_agent.host.candidates import CLAIM_PROFILES, RelatedOrigin
 from firmware_audit.step5_agent.host.claims import (
     ADMISSION_REASONS,
     ASSESSABLE_STATUSES,
@@ -32,18 +32,29 @@ from firmware_audit.step5_agent.host.claims import (
     validate_analysis_delta,
 )
 from firmware_audit.step5_agent.host.session import ProposalRejectedError
+from firmware_audit.test.host_related import related_entry as _related_entry
+
+
 
 EV = frozenset({"ev-000001", "ev-000002"})
+ORIGIN = RelatedOrigin("analysis", "cand-0001", "inv-0001")
 
 
 def _supported(evidence_ids: list[str] | None = None) -> dict:
     return {"status": "supported", "evidence_ids": evidence_ids or ["ev-000001"]}
 
 
+def _apply_analysis_delta(state, delta, *, evidence_ids=EV, profile="generic"):
+    """策略测试统一入口:补上固定的 Host 来源身份(票 18 后为必填上下文)。"""
+    return apply_analysis_delta(
+        state, delta, evidence_ids=evidence_ids, profile=profile,
+        related_origin=ORIGIN)
+
+
 def _apply(delta: dict, state: dict | None = None, *,
            evidence_ids: frozenset[str] = EV, profile: str = "generic"):
     state = {} if state is None else state
-    return state, apply_analysis_delta(
+    return state, _apply_analysis_delta(
         state, delta, evidence_ids=evidence_ids, profile=profile)
 
 
@@ -356,7 +367,9 @@ def test_plan_apply_round_trip_is_idempotent() -> None:
         "note": "自由笔记",
     }
     state: dict = {}
-    plan = validate_analysis_delta(state, delta, evidence_ids=EV, profile="generic")
+    plan = validate_analysis_delta(
+        state, delta, evidence_ids=EV, profile="generic",
+        related_origin=ORIGIN)
     first = apply_delta_plan(state, plan)
     snapshot = {key: (list(value) if isinstance(value, list) else dict(value) if isinstance(value, dict) else value)
                 for key, value in state.items()}
@@ -446,7 +459,8 @@ def test_finished_rejects_incomplete_or_unknown_terminal_fields(
 def _ready_state(profile: str = "generic") -> dict:
     state: dict = {"claims": {}}
     delta = {name: _supported() for name in required_claims(profile)}
-    apply_analysis_delta(state, {"claims": delta}, evidence_ids=EV, profile=profile)
+    _apply_analysis_delta(
+        state, {"claims": delta}, evidence_ids=EV, profile=profile)
     return state
 
 
@@ -470,7 +484,7 @@ def test_gate_fails_while_any_required_claim_unassessed(profile: str) -> None:
 @pytest.mark.parametrize("claim", COMMON_DECISIVE_CLAIMS)
 def test_decisive_refutation_directs_to_rejected_closure(claim: str) -> None:
     state = _ready_state()
-    apply_analysis_delta(
+    _apply_analysis_delta(
         state, {"claims": {claim: {"status": "refuted"}}},
         evidence_ids=EV, profile="generic")
     gate = evaluate_ready_gate(state, profile="generic", evidence_ids=EV)
@@ -493,12 +507,12 @@ def test_decisive_refutation_directs_rejection_even_with_broken_refs() -> None:
 @pytest.mark.parametrize("claim", COMMON_NON_DECISIVE_CLAIMS)
 def test_non_decisive_states_do_not_block_ready(claim: str) -> None:
     state = _ready_state()
-    apply_analysis_delta(
+    _apply_analysis_delta(
         state, {"claims": {claim: {"status": "not_applicable"}}},
         evidence_ids=EV, profile="generic")
     assert evaluate_ready_gate(state, profile="generic", evidence_ids=EV).ok
 
-    apply_analysis_delta(
+    _apply_analysis_delta(
         state, {"claims": {claim: {"status": "refuted"}}},
         evidence_ids=EV, profile="generic")
     assert evaluate_ready_gate(state, profile="generic", evidence_ids=EV).ok
@@ -516,7 +530,7 @@ def test_supported_claim_without_real_evidence_fails_gate() -> None:
 
 def test_open_blocking_gap_blocks_ready_until_resolved() -> None:
     state = _ready_state()
-    apply_analysis_delta(state, {"gaps_opened": [
+    _apply_analysis_delta(state, {"gaps_opened": [
         {"id": "gap-1", "description": "缺运行时证据", "blocking": True},
         {"id": "gap-2", "description": "备注性缺口", "blocking": False},
     ]}, evidence_ids=EV, profile="generic")
@@ -524,7 +538,7 @@ def test_open_blocking_gap_blocks_ready_until_resolved() -> None:
     assert not gate.ok
     assert [gap["id"] for gap in gate.open_blocking_gaps] == ["gap-1"]
 
-    apply_analysis_delta(state, {"gaps_resolved": ["gap-1"]},
+    _apply_analysis_delta(state, {"gaps_resolved": ["gap-1"]},
                          evidence_ids=EV, profile="generic")
     assert evaluate_ready_gate(state, profile="generic", evidence_ids=EV).ok
 
@@ -572,7 +586,7 @@ def test_ready_case_freezes_full_claim_snapshot() -> None:
 
 def test_evidence_gap_case_freezes_pending_and_gaps() -> None:
     state: dict = {}
-    apply_analysis_delta(state, {
+    _apply_analysis_delta(state, {
         "claims": {"target_exists": _supported()},
         "gaps_opened": [{"id": "gap-1", "description": "缺调用点证据",
                          "blocking": True}],
@@ -637,3 +651,105 @@ def test_action_progressed_combines_delta_and_digest_signals() -> None:
         AppliedEffects(path_nodes_added=("node",)), "digest-old", {"digest-old"})
     assert action_progressed(
         AppliedEffects(gaps_resolved=("gap-1",)), "digest-old", {"digest-old"})
+
+
+# ---- 票 18:Related Candidate 受管协议字段(A2/S1) ----
+
+
+def test_related_candidates_are_a_validated_protocol_field() -> None:
+    """自由笔记形态(如 [{"nonsense": true}])不再是合法增量。"""
+    with pytest.raises(ProposalRejectedError, match="Candidate 契约"):
+        _apply({"related_candidates": [{"nonsense": True}]})
+    with pytest.raises(ProposalRejectedError, match="非空数组"):
+        _apply({"related_candidates": []})
+    with pytest.raises(ProposalRejectedError, match="必须为 JSON object"):
+        _apply({"related_candidates": ["rel-1"]})
+
+
+def test_related_candidate_is_stamped_with_analysis_origin() -> None:
+    state, effects = _apply({"related_candidates": [_related_entry()]})
+
+    record = state["related_candidates"][0]
+    assert record["origin"] == {
+        "relation": "analysis_related",
+        "from_candidate": "cand-0001",
+        "from_investigation": "inv-0001",
+    }
+    assert record["proposal_id"] == "rel-cand-0001-1"
+    assert record["evidence_id"] == "ev-000001"
+    assert record["claim_profile"] == "generic"
+    assert not effects.any_progress()  # 线索不是 Claim/路径进展信号
+
+
+@pytest.mark.parametrize("missing", [
+    "proposal_id", "kind", "target", "signal", "evidence_id", "next_action",
+])
+def test_related_candidate_requires_every_intake_field(missing: str) -> None:
+    entry = _related_entry()
+    del entry[missing]
+
+    with pytest.raises(ProposalRejectedError, match="Candidate 契约"):
+        _apply({"related_candidates": [entry]})
+
+
+@pytest.mark.parametrize("entry", [
+    {"proposal_id": "rel-1", "kind": "weird", "target": "extracted/bin/a",
+     "signal": "s", "evidence_id": "ev-000001", "next_action": "n"},
+    {"proposal_id": "rel-1", "kind": "signal", "target": "extracted/bin/a",
+     "signal": "s", "evidence_id": "ev-000001", "next_action": "n",
+     "claim_profile": "authentication"},
+    _related_entry(anchor="", mechanism=""),
+    _related_entry(kind="coverage", anchor="", mechanism="",
+                   component_or_entry="", check_goal=""),
+], ids=["bad_kind", "bad_profile", "signal_without_independence",
+        "coverage_without_independence"])
+def test_related_candidate_obeys_intake_and_independence_contract(entry: dict) -> None:
+    with pytest.raises(ProposalRejectedError, match="Candidate 契约|独立入口、位置或机制"):
+        _apply({"related_candidates": [entry]})
+
+
+def test_related_candidate_evidence_must_belong_to_this_investigation() -> None:
+    with pytest.raises(ProposalRejectedError, match="本 Investigation 的 Evidence"):
+        _apply({"related_candidates": [_related_entry(evidence_id="ev-999999")]})
+
+
+def test_related_candidate_may_cite_this_actions_reserved_evidence() -> None:
+    state, _ = _apply(
+        {"related_candidates": [_related_entry(evidence_id="ev-000003")]},
+        evidence_ids=frozenset({"ev-000001", "ev-000003"}))
+
+    assert state["related_candidates"][0]["evidence_id"] == "ev-000003"
+
+
+def test_replaying_the_same_related_candidate_is_idempotent() -> None:
+    delta = {"related_candidates": [_related_entry()]}
+    state, _ = _apply(delta)
+    first = [dict(item) for item in state["related_candidates"]]
+
+    _, effects = _apply(delta, state)
+
+    assert state["related_candidates"] == first
+    assert not effects.any_progress()
+
+
+def test_same_proposal_id_with_different_content_is_rejected() -> None:
+    state, _ = _apply({"related_candidates": [_related_entry()]})
+
+    with pytest.raises(ProposalRejectedError, match="已按不同内容入册"):
+        _apply(
+            {"related_candidates": [_related_entry(mechanism="use after free")]},
+            state)
+
+    separate, _ = _apply(
+        {"related_candidates": [_related_entry(proposal_id="rel-cand-0001-2")]},
+        state)
+    assert [item["proposal_id"] for item in separate["related_candidates"]] == [
+        "rel-cand-0001-1", "rel-cand-0001-2"]
+
+
+def test_unrelated_notebook_keys_keep_passthrough_behaviour() -> None:
+    state, _ = _apply({"note": "自由笔记", "observations": [{"a": 1}]})
+
+    assert state["note"] == "自由笔记"
+    assert state["observations"] == [{"a": 1}]
+    assert "related_candidates" not in state

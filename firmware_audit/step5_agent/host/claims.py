@@ -12,7 +12,13 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .candidates import CLAIM_PROFILES
+from .candidates import (
+    CLAIM_PROFILES,
+    CandidateIntakeError,
+    RelatedOrigin,
+    related_candidate_conflicts,
+    related_candidate_records,
+)
 from .json_values import JsonValueError, clone_json_value
 from .session import ProposalRejectedError
 
@@ -161,6 +167,8 @@ def assert_terminal(lifecycle: str, disposition: str | None, stop_reason: str | 
 # ---- state_delta 的两阶段处理:先整份校验成计划,再免校验幂等应用 ----
 
 # 策略拥有的 state 键;只能经对应 delta 键结构化写入,直写即拒绝。
+# 这里是被直写即拒的状态键;related_candidates 同样由 Host 管理,但走专门的
+# 校验分支(见 _validate_related_candidate_updates),故不列在此处。
 OWNED_STATE_KEYS = frozenset({"hypothesis", "claims", "path_nodes", "evidence_gaps"})
 
 
@@ -259,6 +267,38 @@ def _validate_claim_updates(
     return tuple(planned), changed
 
 
+def _related_state(state: dict[str, Any]) -> list[dict[str, Any]]:
+    related = state.get("related_candidates")
+    if not isinstance(related, list):
+        return []
+    return [item for item in related if isinstance(item, dict)]
+
+
+def _validate_related_candidate_updates(
+    entries: Any,
+    state: dict[str, Any],
+    evidence_ids: frozenset[str],
+    origin: RelatedOrigin,
+) -> tuple[dict[str, Any], ...]:
+    """Related Candidate 与 Claim 同级:整份校验后才进计划与状态。
+
+    校验规则来自 candidates.related_candidate_records(与 verification 共用);
+    同来源重复提交同一 proposal_id 幂等跳过,同 ID 异内容拒绝——绝不静默覆盖
+    已入册的线索。
+    """
+    try:
+        records = related_candidate_records(
+            entries, evidence_ids=evidence_ids, origin=origin)
+    except CandidateIntakeError as exc:
+        raise ProposalRejectedError(str(exc)) from exc
+    conflicts = related_candidate_conflicts(records, _related_state(state))
+    if conflicts:
+        raise ProposalRejectedError(
+            f"proposal_id {', '.join(conflicts)} 已按不同内容入册,拒绝复用;"
+            "同一线索补充信息请沿用原内容或另起 proposal_id")
+    return records
+
+
 @dataclass(frozen=True)
 class DeltaPlan:
     """已整份校验的状态增量计划;应用阶段不再校验,按构造幂等。"""
@@ -271,6 +311,7 @@ class DeltaPlan:
     path_nodes: tuple[str, ...] = ()
     gaps_opened: tuple[dict[str, Any], ...] = ()
     gaps_resolved: tuple[str, ...] = ()
+    related_candidates: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -295,6 +336,7 @@ def validate_analysis_delta(
     *,
     evidence_ids: frozenset[str],
     profile: str,
+    related_origin: RelatedOrigin,
 ) -> DeltaPlan:
     """整份校验 analysis state_delta;任何字段失约都拒绝,不做局部应用。
 
@@ -312,6 +354,7 @@ def validate_analysis_delta(
     path_nodes: tuple[str, ...] = ()
     gaps_opened: list[dict[str, Any]] = []
     gaps_resolved: list[str] = []
+    related_candidates: tuple[dict[str, Any], ...] = ()
 
     hypothesis = _hypothesis_state(state)
     for key, value in delta.items():
@@ -387,6 +430,9 @@ def validate_analysis_delta(
                 if gap_id not in known_ids:
                     _reject(f"state_delta.gaps_resolved 含未知 Gap ID {gap_id!r}")
                 gaps_resolved.append(gap_id)
+        elif key == "related_candidates":
+            related_candidates = _validate_related_candidate_updates(
+                value, state, evidence_ids, related_origin)
         elif key in OWNED_STATE_KEYS:
             _reject(
                 f"state_delta.{key} 是 Host 管理的结构化状态,不能直写;"
@@ -407,6 +453,7 @@ def validate_analysis_delta(
         path_nodes=path_nodes,
         gaps_opened=tuple(gaps_opened),
         gaps_resolved=tuple(gaps_resolved),
+        related_candidates=related_candidates,
     )
 
 
@@ -456,6 +503,15 @@ def apply_delta_plan(state: dict[str, Any], plan: DeltaPlan) -> AppliedEffects:
                 nodes.append(node)
                 path_added.append(node)
 
+    if plan.related_candidates:
+        related = _related_state(state)
+        state["related_candidates"] = related
+        known = {item.get("proposal_id") for item in related}
+        for item in plan.related_candidates:
+            if item["proposal_id"] not in known:
+                related.append(deepcopy(item))
+                known.add(item["proposal_id"])
+
     gaps_resolved: list[str] = []
     if plan.gaps_opened or plan.gaps_resolved:
         gaps = _gaps_state(state)
@@ -483,6 +539,7 @@ def apply_analysis_delta(
     *,
     evidence_ids: frozenset[str],
     profile: str,
+    related_origin: RelatedOrigin,
 ) -> AppliedEffects:
     """Evidence 集合不变时的一次性校验+应用便捷路径。
 
@@ -490,7 +547,9 @@ def apply_analysis_delta(
     trial gate,必须走 validate_analysis_delta + apply_delta_plan 两段式;
     本函数只服务不需要中段的调用方。
     """
-    plan = validate_analysis_delta(state, delta, evidence_ids=evidence_ids, profile=profile)
+    plan = validate_analysis_delta(
+        state, delta, evidence_ids=evidence_ids, profile=profile,
+        related_origin=related_origin)
     return apply_delta_plan(state, plan)
 
 

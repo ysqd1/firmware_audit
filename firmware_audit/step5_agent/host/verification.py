@@ -27,7 +27,14 @@ from typing import Any
 from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
 from .budget import RunBudget
-from .candidates import CLAIM_PROFILES, normalize_intake
+from .candidates import (
+    CLAIM_PROFILES,
+    CandidateIntakeError,
+    RelatedOrigin,
+    related_candidate_conflicts,
+    related_candidate_contract,
+    related_candidate_records,
+)
 from .claims import (
     ADMISSION_REASONS,
     CASE_SCHEMA_VERSION,
@@ -202,46 +209,32 @@ def _validate_claim_result_updates(
 
 def _validate_related_candidates(
     entries: Any,
+    state: dict[str, Any],
     *,
     evidence_ids: frozenset[str],
     case_candidate_id: str,
     case_investigation_id: str,
 ) -> tuple[dict[str, Any], ...]:
-    if not isinstance(entries, list) or not entries:
-        _reject("state_delta.related_candidates 必须为非空数组")
-    validated: list[dict[str, Any]] = []
-    for index, entry in enumerate(entries):
-        label = f"state_delta.related_candidates[{index}]"
-        if not isinstance(entry, dict):
-            _reject(f"{label} 必须为 JSON object")
-        try:
-            intake = normalize_intake(entry, source=f"verification:{case_candidate_id}")
-        except ValueError as exc:
-            raise ProposalRejectedError(f"{label} 未通过 Candidate 契约: {exc}") from exc
-        if intake.evidence_id not in evidence_ids:
-            _reject(
-                f"{label}.evidence_id 必须引用本次复核会话独立取得的 Evidence;"
-                f"实际引用 {intake.evidence_id!r}")
-        independent = (
-            intake.anchor.strip() or intake.mechanism.strip()
-            if intake.kind == "signal"
-            else intake.component_or_entry.strip() or intake.check_goal.strip()
+    """复核侧 Related Candidate:规则与 Analysis 共用 intake 契约单一出处。
+
+    只有本次复核会话独立取得的 Evidence 能作为线索的初始证据;案卷自带的
+    analysis Evidence 只用于重定位。同来源同 proposal_id 异内容与 Analysis
+    一样整份拒绝,不静默保留先到者。违规不产生部分状态。
+    """
+    try:
+        records = related_candidate_records(
+            entries, evidence_ids=evidence_ids,
+            origin=RelatedOrigin(
+                "verification", case_candidate_id, case_investigation_id),
         )
-        if not independent:
-            required = ("anchor", "mechanism") if intake.kind == "signal" \
-                else ("component_or_entry", "check_goal")
-            _reject(
-                f"{label} 缺少独立入口、位置或机制字段({'/'.join(required)} 至少其一);"
-                "同一案卷内的分支观察应写入 Claim Result,不构成 Related Candidate")
-        validated.append({
-            "origin": {
-                "relation": "verification_related",
-                "from_candidate": case_candidate_id,
-                "from_investigation": case_investigation_id,
-            },
-            **intake.as_dict(),
-        })
-    return tuple(validated)
+    except CandidateIntakeError as exc:
+        raise ProposalRejectedError(str(exc)) from exc
+    conflicts = related_candidate_conflicts(records, _related_state(state))
+    if conflicts:
+        raise ProposalRejectedError(
+            f"proposal_id {', '.join(conflicts)} 已按不同内容入册,拒绝复用;"
+            "同一线索补充信息请沿用原内容或另起 proposal_id")
+    return records
 
 
 @dataclass(frozen=True)
@@ -278,7 +271,7 @@ def validate_verification_delta(
                 value, evidence_ids=evidence_ids, profile=profile)
         elif key == "related_candidates":
             related = _validate_related_candidates(
-                value, evidence_ids=evidence_ids,
+                value, state, evidence_ids=evidence_ids,
                 case_candidate_id=case_candidate_id,
                 case_investigation_id=case_investigation_id,
             )
@@ -1211,7 +1204,9 @@ class HostVerificationRunner:
 
 
 
-VERIFICATION_SESSION_SYSTEM = """## 1 角色与使命
+RELATED_CANDIDATE_CONTRACT = related_candidate_contract()
+
+_VERIFICATION_SESSION_SYSTEM = """## 1 角色与使命
 你是固件安全审计的独立复核 Agent(verification)。给你一份冻结的 Verification
 Case:对其中每条必填 Claim 独立重新取证并逐项提交 Claim Result。你不接收也不
 猜测 analysis 的判定、severity、confidence 或结论性说明;案卷中的 Evidence
@@ -1240,7 +1235,10 @@ Reference 只用于重新定位原始材料,不能作为你的支持证据。最
 同样放入 state_delta);缺项会被整份拒绝。轮次预算有限,优先覆盖决定性 Claim。
 
 ## 5 Related Candidate 纪律
-只有出现独立入口、处理位置或问题机制(signal 带 anchor/mechanism,coverage 带
-component_or_entry/check_goal)时才在 state_delta.related_candidates 提出,且必须
-引用本次复核 Evidence;同一案卷内的分支观察写进 Claim Result,不要开新
-Candidate。"""
+{{RELATED_CANDIDATE_CONTRACT}}
+只有出现独立入口、处理位置或问题机制时才提出线索;同一案卷内的分支观察写进
+Claim Result,不要开新 Candidate。"""
+
+# 提示正文含 JSON 花括号,不能用 str.format;用占位符替换嵌入共享契约。
+VERIFICATION_SESSION_SYSTEM = _VERIFICATION_SESSION_SYSTEM.replace(
+    "{{RELATED_CANDIDATE_CONTRACT}}", RELATED_CANDIDATE_CONTRACT)

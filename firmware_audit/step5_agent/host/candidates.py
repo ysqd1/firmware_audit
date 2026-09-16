@@ -1,5 +1,10 @@
 """Candidate 接收、去重、评分与双队列选取的 Host 内聚模块。
 
+另承载 Related Candidate 的共享契约:分析/复核两角色提出线索时用同一份字段
+规格与校验(``related_candidate_records``/``related_candidate_contract``),运行
+结束后由 ``stored_related_proposals``/``related_intake`` 把已校验线索交回 Candidate
+Store 消费。
+
 ADR-0012 把"Candidate 接收与去重、队列与优先级"收进 Host:本模块先把 Recon
 survey 与 Related Candidate proposals 归一为 ``IntakeCandidate``,按
 signal/coverage 两类确定性 fingerprint 合并精确重复,仅对"目标与 Claim
@@ -22,7 +27,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .json_values import JsonValueError, clone_json_value
-from .store import CANDIDATE_ID_PATTERN, StoreError, atomic_json
+from .store import CANDIDATE_ID_PATTERN, InvestigationStore, StoreError, atomic_json
 
 # Claim Profile 枚举(ADR-0012):Profile 内容与 Claim 门槛由后续工单实现,
 # 此处只作为 fingerprint 输入与语义比较门控维度。
@@ -47,7 +52,12 @@ _KNOWN_KEYS = frozenset({
 
 
 class CandidateIntakeError(ValueError):
-    """Candidate proposal 未通过归一化契约;属于 Host 接线侧错误,非模型反馈通道。"""
+    """Candidate proposal 未通过归一化契约。
+
+    模型回复方向由调用边界翻译成模型可见的拒绝(ProposalRejectedError),盘上
+    记录方向翻译成 StoreError(见 ``_intake_from_stored_record``);错误类型本身
+    不表达"给谁看"。
+    """
 
 
 def normalize_target_path(value: str) -> str:
@@ -248,6 +258,237 @@ def normalize_intake(record: dict[str, Any], *, source: str, proposal_id: str | 
         possible_sink=values["possible_sink"],
         extras=extras,
     )
+
+
+# ---- Related Candidate:两角色共用的校验与提示契约 ----
+
+# 模型回复里必须自带的字段:proposal_id 加上 intake 自身的必填文本字段清单,
+# 与 normalize_intake 同源,不另抄一份(claim_profile/possible_*/extras 仍按
+# intake 缺省规则处理)。
+RELATED_CANDIDATE_FIELDS = ("proposal_id", *_INTAKE_REQUIRED_TEXT)
+_RELATED_ROLES = ("analysis", "verification")
+# relation 字符串 → 角色,登记在案而非靠后缀解析。
+_RELATION_ROLES = {f"{role}_related": role for role in _RELATED_ROLES}
+# 独立入口/位置/机制门槛:两角色一致,按 kind 取对应字段,至少一项非空。
+RELATED_INDEPENDENCE_FIELDS: dict[str, tuple[str, ...]] = {
+    "signal": ("anchor", "mechanism"),
+    "coverage": ("component_or_entry", "check_goal"),
+}
+# 引用纪律的角色措辞:证据集合由调用方给出,这里只决定报错怎么说。
+_EVIDENCE_DISCIPLINE = {
+    "analysis": "本 Investigation 的 Evidence",
+    "verification": "本次复核会话独立取得的 Evidence",
+}
+# 分支观察该写回哪里:analysis 写 Claim,verification 写 Claim Result。
+_OBSERVATION_TARGET = {"analysis": "Claim", "verification": "Claim Result"}
+
+
+@dataclass(frozen=True)
+class RelatedOrigin:
+    """Related Candidate 的来源身份:提出角色 + 提出时的 Candidate/Investigation。"""
+
+    role: str
+    candidate_id: str
+    investigation_id: str
+
+    def __post_init__(self) -> None:
+        if self.role not in _RELATED_ROLES:
+            raise CandidateIntakeError(
+                f"未知 Related Candidate 提出角色 {self.role!r};允许值: "
+                + ", ".join(_RELATED_ROLES))
+        for name in ("candidate_id", "investigation_id"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise CandidateIntakeError(f"Related Candidate 来源缺少 {name}")
+
+    @property
+    def source(self) -> str:
+        """proposal 的稳定来源标签(来源角色 + 提出方 Candidate)。"""
+        return f"{self.role}:{self.candidate_id}"
+
+    def record(self) -> dict[str, Any]:
+        """落盘用的来源关系块;由 Host 盖章,模型提供的同名字段一律被覆盖。"""
+        return {
+            "relation": f"{self.role}_related",
+            "from_candidate": self.candidate_id,
+            "from_investigation": self.investigation_id,
+        }
+
+
+def related_candidate_records(
+    entries: Any,
+    *,
+    evidence_ids: frozenset[str],
+    origin: RelatedOrigin,
+    label: str = "state_delta.related_candidates",
+) -> tuple[dict[str, Any], ...]:
+    """校验并固化 Related Candidate proposal(analysis 与 verification 单一出处)。
+
+    契约 = Candidate intake 契约(必填/类型/Profile/fingerprint 输入)+ 独立入口
+    门槛 + 引用纪律(只能指向调用方给出的证据集合)。返回的记录带 Host 盖章的
+    ``origin``,``source`` 由来源身份派生,模型无法冒充来源。违规抛
+    ``CandidateIntakeError``,由调用边界翻译成模型可见的拒绝。
+    """
+    if not isinstance(entries, list) or not entries:
+        raise CandidateIntakeError(f"{label} 必须为非空数组")
+    records: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        item_label = f"{label}[{index}]"
+        if not isinstance(entry, dict):
+            raise CandidateIntakeError(f"{item_label} 必须为 JSON object")
+        try:
+            intake = normalize_intake(entry, source=origin.source)
+        except CandidateIntakeError as exc:
+            raise CandidateIntakeError(f"{item_label} 未通过 Candidate 契约: {exc}") from exc
+        if intake.evidence_id not in evidence_ids:
+            raise CandidateIntakeError(
+                f"{item_label}.evidence_id 必须引用{_EVIDENCE_DISCIPLINE[origin.role]};"
+                f"实际引用 {intake.evidence_id!r}")
+        independent = RELATED_INDEPENDENCE_FIELDS[intake.kind]
+        if not any(getattr(intake, name).strip() for name in independent):
+            raise CandidateIntakeError(
+                f"{item_label} 缺少独立入口、位置或机制字段"
+                f"({'/'.join(independent)} 至少其一);"
+                f"同一案卷内的分支观察应写入 {_OBSERVATION_TARGET[origin.role]},"
+                "不构成 Related Candidate")
+        records.append({"origin": origin.record(), **intake.as_dict()})
+    return tuple(records)
+
+
+# 提示里可直接照抄的完整 state_delta 片段(两段覆盖 signal/coverage 两类线索)。
+_RELATED_EXAMPLES: tuple[dict[str, Any], ...] = (
+    {"related_candidates": [{
+        "proposal_id": "rel-cand-0001-1", "kind": "signal",
+        "target": "extracted/bin/updater", "signal": "升级包解析未校验长度字段",
+        "evidence_id": "ev-000123", "next_action": "反编译解析函数确认边界检查",
+        "anchor": "parse_header+0x42", "mechanism": "integer overflow",
+    }]},
+    {"related_candidates": [{
+        "proposal_id": "rel-cand-0001-2", "kind": "coverage",
+        "target": "extracted/usr/bin/mqtt_client", "signal": "MQTT 客户端未见入站报文校验",
+        "evidence_id": "ev-000123", "next_action": "审计入站解析与主题授权",
+        "component_or_entry": "mqtt_client 订阅回调", "check_goal": "入站主题与载荷校验覆盖",
+    }]},
+)
+
+
+def related_candidate_contract() -> str:
+    """Related Candidate 的 LLM 可读契约(analysis 与 verification 单一出处)。
+
+    字段清单与 ``normalize_intake`` 同源;示例是完整 state_delta 片段,由测试
+    钉住"提示里写的样例真的能过解析与领域校验"。
+    """
+    lines = [
+        "在 state_delta.related_candidates 里提交线索,每项必须自带:",
+        "- proposal_id:本角色内唯一的线索 ID(同来源重复提交同 ID 视为同一项,内容必须一致)",
+        "- kind:signal 或 coverage",
+        "- target:工具路径(如 extracted/etc/device.conf)",
+        "- signal:触发该线索的具体信号",
+        "- evidence_id:你本次已取得的 Evidence ID,作为该线索的初始证据",
+        "- next_action:下一步调查动作",
+        "signal 线索还需 anchor(位置锚点)或 mechanism(问题机制)至少其一;coverage",
+        "线索需 component_or_entry(组件或入口)或 check_goal(检查目标)至少其一。两者",
+        "都为空说明它只是同一案卷内的分支观察,请写进 Claim,不要新开线索。可选字段",
+        "claim_profile(缺省 generic)、possible_source/possible_sink。",
+    ]
+    for example, kind in zip(_RELATED_EXAMPLES, ("signal", "coverage")):
+        lines += [
+            f"示例(state_delta 片段,{kind}):",
+            "```json",
+            json.dumps(example, ensure_ascii=False),
+            "```",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def related_candidate_conflicts(
+    records: tuple[dict[str, Any], ...],
+    existing: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """同来源同一 proposal_id 但内容不同的线索 ID(两角色共用的幂等判据)。
+
+    什么都不返回表示这次提交要么是新线索、要么是同一内容的恢复重放,可以幂等
+    跳过;返回的 ID 说明模型想改写已入册线索,必须整份拒绝而非静默覆盖。
+    """
+    prior = {
+        item["proposal_id"]: item for item in existing
+        if isinstance(item, dict) and isinstance(item.get("proposal_id"), str)
+    }
+    return tuple(
+        record["proposal_id"] for record in records
+        if record["proposal_id"] in prior
+        and prior[record["proposal_id"]] != record
+    )
+
+
+def related_intake(record: dict[str, Any]) -> IntakeCandidate:
+    """已校验记录 → Candidate Store 可消费的 intake(票 11 幂等回队入口)。
+
+    ``source`` 由记录里的 Host 盖章 origin 还原,不由调用方另传,避免跨来源
+    同名 proposal 混源;记录损坏按 Store 语义拒绝。
+    """
+    origin = record.get("origin") if isinstance(record, dict) else None
+    if not isinstance(origin, dict):
+        raise StoreError("Related Candidate 记录缺少来源关系;请检查原运行目录")
+    role = _RELATION_ROLES.get(origin.get("relation"))
+    candidate_id = origin.get("from_candidate")
+    if role is None:
+        raise StoreError("Related Candidate 来源关系损坏;请检查原运行目录")
+    try:
+        source = RelatedOrigin(role, candidate_id, origin.get("from_investigation")).source
+    except CandidateIntakeError as exc:
+        raise StoreError(
+            f"Related Candidate 来源身份损坏;请检查原运行目录: {exc}") from exc
+    return _intake_from_stored_record(record, source=source)
+
+
+def stored_related_proposals(run_dir: Path) -> tuple[dict[str, Any], ...]:
+    """运行目录内两角色已校验的 Related Candidate(票 11 幂等回队入口)。
+
+    只读权威工件,不解析 Transcript,也不依赖是否生成 Finding:分析侧取
+    ``investigations/<cand>/state.json`` 的 ``state.related_candidates``,复核侧取
+    ``verifications/<cand>/results.json``(中断未收尾的会话取同目录 state.json 的
+    ``session.related_candidates``)。同一来源(relation + from_candidate +
+    proposal_id)重复出现只保留一条;此处不合并候选、不分配 Candidate ID。
+    """
+    collected: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    def collect(entries: Any) -> None:
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise StoreError("Related Candidate 记录结构损坏;请检查原运行目录")
+            origin = entry.get("origin")
+            proposal_id = entry.get("proposal_id")
+            if not isinstance(origin, dict) or not isinstance(proposal_id, str):
+                raise StoreError("Related Candidate 记录缺少来源或身份;请检查原运行目录")
+            abstract_intake = (origin.get("relation"), origin.get("from_candidate"))
+            if not all(isinstance(item, str) and item for item in abstract_intake):
+                raise StoreError("Related Candidate 来源关系损坏;请检查原运行目录")
+            collected.setdefault((*abstract_intake, proposal_id), entry)
+
+    run_dir = Path(run_dir)
+    for directory in sorted((run_dir / "investigations").glob("cand-*")):
+        snapshot = InvestigationStore(run_dir, directory.name).load()
+        investigation = snapshot.get("investigation") if isinstance(snapshot, dict) else None
+        state = investigation.get("state") if isinstance(investigation, dict) else None
+        collect(state.get("related_candidates") if isinstance(state, dict) else None)
+    for directory in sorted((run_dir / "verifications").glob("cand-*")):
+        results_path = directory / "results.json"
+        if results_path.exists():
+            try:
+                payload = json.loads(results_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise StoreError(f"复核结果损坏;请检查原运行目录: {exc}") from exc
+            collect(payload.get("related_candidates") if isinstance(payload, dict) else None)
+            continue
+        if not ((directory / "state.json").exists() or (directory / "events.jsonl").exists()):
+            continue
+        snapshot = InvestigationStore(run_dir, directory.name, root="verifications").load()
+        session = snapshot.get("session") if isinstance(snapshot, dict) else None
+        collect(session.get("related_candidates") if isinstance(session, dict) else None)
+    return tuple(collected.values())
 
 
 # ---- 语义去重 ----

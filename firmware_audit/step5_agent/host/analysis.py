@@ -28,7 +28,7 @@ from typing import Any
 from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
 from .budget import RunBudget
-from .candidates import CLAIM_PROFILES
+from .candidates import CLAIM_PROFILES, RelatedOrigin
 from .claims import (
     ADMISSION_REASONS,
     NO_PROGRESS_LIMIT,
@@ -663,6 +663,7 @@ class HostAnalysisTracer:
             proposal.state_delta,
             evidence_ids=self._evidence_ids(investigation) | {upcoming_evidence_id},
             profile=investigation.claim_profile,
+            related_origin=self._related_origin(investigation),
         )
         arguments = json_clone_or_reject(proposal.arguments, "tool arguments")
         try:
@@ -731,6 +732,7 @@ class HostAnalysisTracer:
         plan = validate_analysis_delta(
             investigation.state, remaining,
             evidence_ids=frozenset(owned), profile=investigation.claim_profile,
+            related_origin=cls._related_origin(investigation),
         )
         return plan, reason.strip(), tuple(refs)
 
@@ -752,6 +754,7 @@ class HostAnalysisTracer:
             investigation.state, delta,
             evidence_ids=cls._evidence_ids(investigation),
             profile=investigation.claim_profile,
+            related_origin=cls._related_origin(investigation),
         )
         return plan, admission_reason
 
@@ -777,6 +780,12 @@ class HostAnalysisTracer:
     @staticmethod
     def _evidence_ids(investigation: Investigation) -> frozenset[str]:
         return frozenset(reference.evidence_id for reference in investigation.evidence)
+
+    @staticmethod
+    def _related_origin(investigation: Investigation) -> RelatedOrigin:
+        """Related Candidate 的来源身份由 Host 盖章,模型无法冒充。"""
+        return RelatedOrigin(
+            "analysis", investigation.candidate_id, investigation.investigation_id)
 
     @staticmethod
     def _advance_lifecycle(investigation: Investigation, target: str) -> None:

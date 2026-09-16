@@ -183,11 +183,12 @@ def protocol_instruction(role: str) -> str:
 顶层必须且只能有 decision_summary、state_delta、next：
 {{
   "decision_summary": "不超过 {MAX_DECISION_SUMMARY_CHARS} 字的简短判断",
-  "state_delta": {{"related_candidates": []}},
+  "state_delta": {{}},
   "next": {{"kind": "tool_action", "tool": "工具名", "arguments": {{}}}}
 }}
 decision_summary 必须是非空字符串；state_delta 必须是 object。Related Candidate
-proposal 如有，只能放在 state_delta.related_candidates 数组中。next.kind 对
+proposal 如有，只能放在 state_delta.related_candidates 数组中(非空数组，逐项
+遵守该角色的 intake 契约说明)。next.kind 对
 {role} 只允许 {kinds}。tool_action 的 next 必须且只能包含 kind/tool/arguments；
 终止建议写作 {{"kind": "{terminal}"}}，其内容放入 state_delta。每次只能提出
 一个 next；Host 校验后才会应用状态、执行工具或决定是否推进生命周期。"""
