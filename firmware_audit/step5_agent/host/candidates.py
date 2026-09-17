@@ -22,10 +22,12 @@ from __future__ import annotations
 import json
 import os
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from .budget import BudgetExhaustedError
 from .json_values import JsonValueError, clone_json_value
 from .store import CANDIDATE_ID_PATTERN, InvestigationStore, StoreError, atomic_json
 
@@ -549,6 +551,10 @@ class SemanticComparator:
         ]
         try:
             reply, _usage = self.llm.chat(messages)
+        except BudgetExhaustedError:
+            # 预算拒绝不是语义比较失败:耗尽必须中止流水,不得被误判为
+            # uncertain 而保留独立 Candidate 后继续发请求(票 11 AC16)。
+            raise
         except Exception:
             return ComparisonOutcome(status="service_error", verdict=None)
         try:
@@ -894,6 +900,9 @@ class PriorityScorer:
         ]
         try:
             reply, _usage = self.llm.chat(messages)
+        except BudgetExhaustedError:
+            # 预算拒绝不是评分失败:不得回落全 0 分并继续为后续候选发请求。
+            raise
         except Exception:
             return self._result(candidate.kind, {}, "service_error")
         try:
@@ -1120,16 +1129,7 @@ class CandidateStore:
                 llm_calls["scoring"] += 1
 
         resolved_slots = resolve_processing_slots() if slots is None else slots
-        selection = select_for_processing(records, slots=resolved_slots)
-        selected = set(selection.selected)
-        for record in records:
-            candidate_id = record["candidate_id"]
-            record["queue"] = {
-                "queue": selection.queue_of[candidate_id],
-                "rank": selection.rank_of[candidate_id],
-                "selected": candidate_id in selected,
-            }
-            record["disposition"] = None if candidate_id in selected else "not_started"
+        self._apply_queue_projection(records, previous=existing, slots=resolved_slots)
 
         final = clone_json_value({
             "schema_version": CANDIDATE_STORE_SCHEMA_VERSION,
@@ -1142,14 +1142,90 @@ class CandidateStore:
         atomic_json(self.store_path, final)
         return final
 
+    def _apply_queue_projection(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        previous: list[dict[str, Any]] | None,
+        slots: int,
+    ) -> None:
+        """写入选取投影;增量重建时既有选取被锁定,新候选只竞争剩余名额。
+
+        既有记录的 ``disposition is None`` 表示已入选(结局在 Investigation,
+        票 11 的锁定选取):队列更新不得把已开始/已完成的调查挤成
+        ``not_started``。新增记录按 ``slots - 已锁定数`` 的剩余名额重新走
+        signal/coverage 双队列选取;名额用尽则明确 ``not_started``。
+        """
+        prior: dict[str, dict[str, Any]] = {}
+        if previous:
+            for record in previous:
+                if not isinstance(record, dict):
+                    raise StoreError("既有 Candidate 记录结构损坏;请检查原运行目录")
+                candidate_id = record.get("candidate_id")
+                queue = record.get("queue")
+                disposition = record.get("disposition")
+                if (not isinstance(candidate_id, str)
+                        or not isinstance(queue, dict)
+                        or disposition not in (None, "not_started")
+                        or not isinstance(queue.get("selected"), bool)
+                        or queue["selected"] != (disposition is None)):
+                    raise StoreError(
+                        "既有 Candidate 队列投影损坏;请检查原运行目录")
+                prior[candidate_id] = record
+
+        locked = [
+            candidate_id for candidate_id, record in prior.items()
+            if record["disposition"] is None
+        ]
+        fresh = [record for record in records
+                 if record["candidate_id"] not in prior]
+        if fresh:
+            remaining = slots - len(locked)
+            if remaining >= 1:
+                selection = select_for_processing(fresh, slots=remaining)
+                selected = set(selection.selected)
+            else:
+                selection = None
+                selected = set()
+        else:
+            selection = None
+            selected = set()
+        for record in records:
+            candidate_id = record["candidate_id"]
+            if candidate_id in prior:
+                # 既有记录:保留上次选取投影(ID/评分/别名已由 dedup 往返携带)
+                record["queue"] = deepcopy(prior[candidate_id]["queue"])
+                record["disposition"] = prior[candidate_id]["disposition"]
+                continue
+            if selection is not None:
+                record["queue"] = {
+                    "queue": selection.queue_of[candidate_id],
+                    "rank": selection.rank_of[candidate_id],
+                    "selected": candidate_id in selected,
+                }
+            else:
+                record["queue"] = {
+                    "queue": record.get("kind", "signal"),
+                    "rank": 0,
+                    "selected": False,
+                }
+            record["disposition"] = None if candidate_id in selected else "not_started"
+
     def _evidence_context(self) -> dict[str, str]:
         """评分依据的 Evidence 摘要表:盘上全部 Evidence ID → summary。
 
         评分依据只认这份全集(与 EvidenceRecorder.seed_sequence_from_files 同
-        扫描口径);损坏文件跳过——对应分项会因 evidence_id 不在全集而取 0。
+        扫描口径,覆盖 investigations 与 verifications 两棵树——verification
+        提出的 Related Candidate 初始证据在 verifications 树,漏扫会让它的
+        分项永远无法以自身证据 ground);损坏文件跳过——对应分项会因
+        evidence_id 不在全集而取 0。
         """
         context: dict[str, str] = {}
-        for path in sorted(self.run_dir.glob("investigations/*/evidence/ev-*.json")):
+        paths = sorted(
+            self.run_dir.glob("investigations/*/evidence/ev-*.json"))
+        paths += sorted(
+            self.run_dir.glob("verifications/*/evidence/ev-*.json"))
+        for path in paths:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 evidence_id = payload["evidence_id"]

@@ -13,7 +13,8 @@ unresolved/protocol_error 收束，不阻断后续队列），局部轮次与运
 （票 10）经 ``budget.RunBudget`` 守卫，运行级耗尽保存现场不落终态。模块
 的公开 interface 刻意只有 ``add_candidate``、``investigation_for``、
 ``candidate_for``、``begin_verification``、``finish_verification``、
-``mark_not_started``、``queued_ids`` 和 ``run_analysis``。Session 与工具
+``mark_not_started``、``queued_ids``、``runnable_ids`` 和 ``run_analysis``。
+Session 与工具
 都是注入的 adapter，测试和生产调用走同一 seam。
 """
 from __future__ import annotations
@@ -54,7 +55,13 @@ from .session import (
     ProposalRejectedError,
     revalidate_proposal,
 )
-from .store import InvestigationStore, StoreError, atomic_json, store_error_boundary
+from .store import (
+    CANDIDATE_ID_PATTERN,
+    InvestigationStore,
+    StoreError,
+    atomic_json,
+    store_error_boundary,
+)
 from .tooling import (
     execute_tool,
     json_clone_or_reject,
@@ -256,8 +263,14 @@ class HostAnalysisTracer:
                 "关闭证据引用不属于本 Investigation: " + ", ".join(unknown)
                 + "；请检查原运行目录")
 
-    def add_candidate(self, proposal: dict[str, Any]) -> Candidate:
-        """分配 Candidate ID，并一一创建隔离的 queued Investigation。"""
+    def add_candidate(
+        self, proposal: dict[str, Any], *, candidate_id: str | None = None,
+    ) -> Candidate:
+        """分配 Candidate ID，并一一创建隔离的 queued Investigation。
+
+        运行驱动按 Candidate Store 已分配的显式 ID 注册(两处权威不对齐会直接
+        拒绝);不传 ID 时沿用运行内递增分配,行为与独立使用 tracer 一致。
+        """
         if not isinstance(proposal, dict):
             raise ValueError("Candidate proposal 必须是 JSON object")
         normalized = json_clone_or_reject(proposal, "Candidate proposal")
@@ -266,8 +279,18 @@ class HostAnalysisTracer:
             raise ValueError(
                 f"Candidate proposal 含未知 Claim Profile {claim_profile!r};"
                 f"允许值: {', '.join(CLAIM_PROFILES)}")
-        self._candidate_seq += 1
-        sequence = self._candidate_seq
+        if candidate_id is None:
+            self._candidate_seq += 1
+            sequence = self._candidate_seq
+        else:
+            if not CANDIDATE_ID_PATTERN.fullmatch(candidate_id):
+                raise ValueError(f"非法 Candidate ID: {candidate_id!r}")
+            sequence = int(candidate_id.split("-")[1])
+            if sequence <= self._candidate_seq:
+                raise ValueError(
+                    f"显式 Candidate ID 必须高于当前水位 "
+                    f"cand-{self._candidate_seq:04d}: {candidate_id}")
+            self._candidate_seq = sequence
         candidate = Candidate(f"cand-{sequence:04d}", normalized)
         investigation = Investigation(
             f"inv-{sequence:04d}", candidate.candidate_id,
@@ -371,10 +394,22 @@ class HostAnalysisTracer:
         return deepcopy(investigation)
 
     def queued_ids(self) -> tuple[str, ...]:
-        """按创建序返回仍处于 queued 的 Candidate(队列驱动的收束入口)。"""
+        """按创建序返回仍处于 queued 的 Candidate(队列驱动的收账入口)。"""
         return tuple(
             candidate_id for candidate_id, investigation in self._investigations.items()
             if investigation.lifecycle_status == "queued"
+        )
+
+    def runnable_ids(self) -> tuple[str, ...]:
+        """按创建序返回可继续驱动的 Candidate(queued + investigating)。
+
+        服务中断的调查停在 investigating(首个动作完成即推进),恢复时
+        运行驱动从这里继续"当前 Investigation",而不是只看 queued——否则
+        未完成责任会被静默跳过甚至误封 finalizing(票 11 验收补充)。
+        """
+        return tuple(
+            candidate_id for candidate_id, investigation in self._investigations.items()
+            if investigation.lifecycle_status in ("queued", "investigating")
         )
 
     def _live_investigation(self, candidate_id: str) -> Investigation:

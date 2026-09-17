@@ -218,6 +218,11 @@ class BudgetLedger:
     # ---- 活动时长 ----
 
     @property
+    def is_active(self) -> bool:
+        """是否处于开放活动段(驱动层去重/评分请求自管活动段用)。"""
+        return self._segment_start is not None
+
+    @property
     def active_seconds(self) -> float:
         open_delta = (self.clock() - self._segment_start
                       if self._segment_start is not None else 0.0)

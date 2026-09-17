@@ -4,7 +4,9 @@
 (Claim/假设门槛与案卷冻结)、Recon→Candidate Store 入口、Candidate 去重/
 评分/双队列、独立 Verification(案卷队列、Claim Result、verdict 聚合与
 Finding)与运行级预算(协议重生成×3、轮次/请求/工具/活动时长台账、四层
-配置解析与生效快照);公开入口切换由后续工单继续内聚在本包。
+配置解析与生效快照);票 11 起增加运行世代(manifest/run_state)、工作区
+活动锁与串行运行驱动(单一有效配置下发、共享 RunBudget、Recon 恢复、
+Related 幂等回队、not_started 收账);公开入口切换由后续工单继续内聚在本包。
 """
 
 from .analysis import (
@@ -28,6 +30,17 @@ from .budget import (
     persist_config_snapshot,
     resolve_effective_config,
 )
+from .driver import RunDriver, RunSummary
+from .generation import (
+    MANIFEST_SCHEMA_VERSION,
+    RUN_STATE_SCHEMA_VERSION,
+    create_generation,
+    list_generations,
+    load_run_state,
+    read_manifest,
+    save_run_state,
+)
+from .locking import LockActiveError, acquire_lock
 from .candidates import (
     CANDIDATE_STORE_SCHEMA_VERSION,
     CLAIM_PROFILES,
@@ -108,6 +121,7 @@ from .verification import (
 )
 
 __all__ = [
+    "acquire_lock",
     "action_progressed",
     "ActionProposal",
     "ADMISSION_REASONS",
@@ -137,6 +151,7 @@ __all__ = [
     "ConfigError",
     "CONFIG_SCHEMA_VERSION",
     "coverage_fingerprint",
+    "create_generation",
     "DEFAULT_ANALYSIS_MAX_ROUNDS",
     "DEFAULT_BUDGET_CONFIG",
     "DEFAULT_VERIFICATION_MAX_ROUNDS",
@@ -155,8 +170,12 @@ __all__ = [
     "Investigation",
     "is_decisive",
     "LIFECYCLE_STATUSES",
+    "list_generations",
     "load_cases",
     "load_config_snapshot",
+    "load_run_state",
+    "LockActiveError",
+    "MANIFEST_SCHEMA_VERSION",
     "MAX_PROTOCOL_ATTEMPTS",
     "normalize_intake",
     "normalize_target_path",
@@ -169,6 +188,7 @@ __all__ = [
     "ProposalError",
     "ProposalRejectedError",
     "protocol_instruction",
+    "read_manifest",
     "ReconRunResult",
     "related_candidate_contract",
     "RELATED_CANDIDATE_FIELDS",
@@ -182,6 +202,10 @@ __all__ = [
     "RESULTS_SCHEMA_VERSION",
     "revalidate_proposal",
     "RunBudget",
+    "RunDriver",
+    "RunSummary",
+    "RUN_STATE_SCHEMA_VERSION",
+    "save_run_state",
     "select_for_processing",
     "Selection",
     "SemanticComparator",

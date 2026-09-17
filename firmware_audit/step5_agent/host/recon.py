@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -28,7 +28,11 @@ from ...file_rules import is_search_excluded
 from ..providers.tools import ToolAuthorizationError, authorize_tool, tool_names_for_role
 from ..providers.tools.base import MAX_TEXT_CHARS, validate_params
 from .budget import RunBudget
-from .candidates import CLAIM_PROFILES, FINGERPRINT_INPUT_FIELDS
+from .candidates import (
+    CANDIDATE_STORE_SCHEMA_VERSION,
+    CLAIM_PROFILES,
+    FINGERPRINT_INPUT_FIELDS,
+)
 from .evidence import (
     DEFAULT_TOOL_RESULT_LIMIT_BYTES,
     EvidenceRecorder,
@@ -42,7 +46,7 @@ from .session import (
     ValidationIssue,
     revalidate_proposal,
 )
-from .store import atomic_json
+from .store import StoreError, atomic_json
 from .tooling import execute_tool, normalize_tool_arguments, regeneration_feedback
 
 DEFAULT_RECON_MAX_ROUNDS = 30
@@ -147,6 +151,8 @@ def input_failure_reason(overview: dict[str, Any]) -> str | None:
 # Recon 写下的原始 proposal 工件版本;去重评分后的 Candidate Store 权威版本
 # 见 candidates.CANDIDATE_STORE_SCHEMA_VERSION(工单 07 起为 2)。
 RECON_STORE_SCHEMA_VERSION = 1
+# 阶段检查点(票 11)的工件版本:阶段进度/终态与已引用 Evidence 的持久化。
+RECON_STATE_SCHEMA_VERSION = 1
 SURVEY_SECTIONS = ("attack_surface", "candidates", "checked_scope", "coverage_gaps")
 _CANDIDATE_KINDS = ("signal", "coverage")
 _CANDIDATE_REQUIRED_TEXT_FIELDS = ("target", "signal", "next_action")
@@ -438,7 +444,20 @@ class _GuardedAction:
 
 
 class HostReconRunner:
-    """Recon 阶段的唯一真实循环:概览注入、浅层工具、survey 门与入库。"""
+    """Recon 阶段的唯一真实循环:概览注入、浅层工具、survey 门与入库。
+
+    阶段进度持久化为 ``investigations/recon/state.json`` 检查点(票 11):每个
+    动作接受/执行/收尾与全部终态都原子落盘,服务中断后从保存边界继续,不以
+    重新执行整段 Recon 代替恢复;已记录 Evidence 按 ID 恢复回放,已接受未
+    记录的动作在同一槽位重执行。Recon 没有 Investigation 事件投影,输入失败
+    也绝不伪造 Investigation。
+    """
+
+    # 检查点状态机:running(进行中)→ survey_accepted(survey 已过门,待入库)
+    # → completed;input_failure(输入/协议)/ incomplete(轮次耗尽)为终态。
+    _CHECKPOINT_STATUSES = (
+        "running", "survey_accepted", "completed", "input_failure", "incomplete",
+    )
 
     def __init__(
         self,
@@ -466,6 +485,135 @@ class HostReconRunner:
             self.max_rounds = resolve_recon_max_rounds()
         else:
             self.max_rounds = max(1, int(max_rounds))
+        self._checkpoint = self._load_checkpoint()
+
+    # ---- 检查点 ----
+
+    def _checkpoint_path(self) -> Path:
+        return self._run_dir / "investigations" / RECON_CANDIDATE_ID / "state.json"
+
+    def _load_checkpoint(self) -> dict[str, Any] | None:
+        path = self._checkpoint_path()
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise StoreError(
+                f"Recon 检查点损坏；请检查原运行目录: {exc}") from exc
+        if (not isinstance(payload, dict)
+                or type(payload.get("schema_version")) is not int
+                or payload["schema_version"] != RECON_STATE_SCHEMA_VERSION
+                or payload.get("status") not in self._CHECKPOINT_STATUSES
+                or type(payload.get("rounds_used")) is not int
+                or payload["rounds_used"] < 0
+                or not isinstance(payload.get("session_state"), dict)
+                or not isinstance(payload.get("evidence"), list)
+                or not all(isinstance(item, dict) for item in payload["evidence"])
+                or not all(isinstance(item, dict)
+                           for item in payload.get("proposals", []))
+                or not (payload.get("pending") is None
+                        or isinstance(payload.get("pending"), dict))
+                or not (payload.get("survey") is None
+                        or isinstance(payload.get("survey"), dict))
+                or not isinstance(payload.get("proposals"), list)
+                or not (payload.get("store_path") is None
+                        or isinstance(payload.get("store_path"), str))
+                or not (payload.get("reason") is None
+                        or isinstance(payload.get("reason"), str))
+                or not (payload.get("overview") is None
+                        or isinstance(payload.get("overview"), dict))):
+            raise StoreError("Recon 检查点结构或版本损坏；请检查原运行目录")
+        return payload
+
+    def _save_checkpoint(
+        self,
+        status: str,
+        ctx: dict[str, Any],
+        *,
+        reason: str | None = None,
+        survey: dict[str, Any] | None = None,
+        store_path: Path | None = None,
+    ) -> None:
+        payload = {
+            "schema_version": RECON_STATE_SCHEMA_VERSION,
+            "status": status,
+            "reason": reason,
+            "rounds_used": ctx["rounds"],
+            "max_rounds": self.max_rounds,
+            "session_state": clone_json_value(ctx["session_state"], "session_state"),
+            "evidence": [asdict(reference) for reference in ctx["evidence"]],
+            "pending": ctx["pending"],
+            "survey": survey,
+            "proposals": ctx["proposals"],
+            "store_path": str(store_path) if store_path is not None else None,
+            "overview": ctx["overview"],
+        }
+        atomic_json(self._checkpoint_path(), payload)
+
+    def _recorded_result(self, saved: dict[str, Any]) -> ReconRunResult:
+        """从检查点忠实重建终态结果,不再发起模型请求或工具执行。"""
+        proposals = self._recorded_proposals(saved)
+        return ReconRunResult(
+            status=saved["status"],
+            reason=saved.get("reason"),
+            overview=saved.get("overview"),
+            survey=saved.get("survey"),
+            session_state=saved.get("session_state") or {},
+            candidates=tuple(proposals),
+            evidence=tuple(EvidenceReference(**item) for item in saved["evidence"]),
+            rounds_used=saved["rounds_used"],
+            store_path=Path(saved["store_path"]) if saved.get("store_path") else None,
+        )
+
+    @staticmethod
+    def _recorded_proposals(saved: dict[str, Any]) -> list[CandidateProposal]:
+        try:
+            return [CandidateProposal(**dict(item))
+                    for item in saved.get("proposals", [])]
+        except TypeError as exc:
+            raise StoreError(
+                f"Recon 检查点 proposal 损坏；请检查原运行目录: {exc}") from exc
+
+    def _recovered_evidence(
+        self, saved: dict[str, Any],
+    ) -> list[EvidenceReference]:
+        """按权威文件恢复检查点引用的 Evidence;缺件或失约按 Store 语义拒绝。"""
+        evidence: list[EvidenceReference] = []
+        for item in saved["evidence"]:
+            try:
+                reference = EvidenceReference(**item)
+            except TypeError as exc:
+                raise StoreError(
+                    f"Recon Evidence 引用损坏；请检查原运行目录: {exc}") from exc
+            if type(reference.sequence) is not int or reference.sequence < 1:
+                raise StoreError("Recon Evidence sequence 非法；请检查原运行目录")
+            slot = self._evidence_store.restore_slot(
+                RECON_CANDIDATE_ID, reference.sequence)
+            recovered = self._evidence_store.recover(slot)
+            if recovered is None or recovered[0] != reference:
+                raise StoreError(
+                    "Recon 已引用 Evidence 缺失或与事件不一致；请检查原运行目录")
+            evidence.append(reference)
+        return evidence
+
+    @staticmethod
+    def _validated_pending(pending: dict[str, Any]) -> ActionProposal:
+        if (not isinstance(pending, dict)
+                or not isinstance(pending.get("proposal"), dict)
+                or pending["proposal"].get("kind") != "tool_action"
+                or type(pending.get("sequence")) is not int
+                or pending["sequence"] < 1
+                or type(pending.get("executing")) is not bool):
+            raise StoreError("Recon 待执行动作结构或身份损坏；请检查原运行目录")
+        try:
+            proposal = ActionProposal(**pending["proposal"])
+        except TypeError as exc:
+            raise StoreError(
+                f"Recon 待执行动作字段损坏；请检查原运行目录: {exc}") from exc
+        return revalidate_proposal(proposal, "recon")
+
+    # ---- 主循环 ----
 
     def run(self, session, process_dir: Path) -> ReconRunResult:
         """驱动单实例 Recon Session,直到 survey 被接受或轮次耗尽。"""
@@ -473,16 +621,83 @@ class HostReconRunner:
             raise ValueError("HostReconRunner 只接受 role='recon' 的 Agent Session")
         overview = build_site_overview(process_dir)
         failure = input_failure_reason(overview)
+        saved = self._checkpoint
+
+        # 幂等与终态短路:已完成/输入仍失败的检查点直接按记录返回,
+        # 轮次已耗尽的 incomplete 不重跑;输入已修复的 input_failure 继续。
+        if saved is not None:
+            if saved["status"] == "completed":
+                return self._recorded_result(saved)
+            if (saved["status"] == "input_failure"
+                    and failure == saved.get("reason")):
+                return self._recorded_result(saved)
+            if (saved["status"] == "incomplete"
+                    and saved["rounds_used"] >= self.max_rounds):
+                return self._recorded_result(saved)
+
+        # 每次运行前从两棵 Evidence 树抬水位:与 runner 构造顺序解耦,
+        # 其他阶段占号后本阶段 Evidence ID 依然全运行唯一。
+        self._evidence_store.seed_sequence_from_files()
+
+        ctx: dict[str, Any] = {
+            "rounds": 0,
+            "session_state": {},
+            "evidence": [],
+            "pending": None,
+            "proposals": [],
+            "overview": overview,
+        }
+        resuming = False
+        if saved is not None:
+            ctx["rounds"] = saved["rounds_used"]
+            ctx["session_state"] = dict(saved["session_state"])
+            ctx["evidence"] = self._recovered_evidence(saved)
+            ctx["proposals"] = list(saved.get("proposals", []))
+            ctx["overview"] = saved.get("overview") or overview
+            resuming = bool(saved["rounds_used"] or ctx["evidence"])
+            if saved["status"] == "survey_accepted":
+                # survey 已过门:确定性收尾入库,零模型请求(崩溃夹缝恢复)。
+                proposals = self._recorded_proposals(saved)
+                store_path = self._persist_store(
+                    saved["survey"], ctx["session_state"], proposals,
+                )
+                self._save_checkpoint(
+                    "completed", ctx, survey=saved["survey"], store_path=store_path)
+                return ReconRunResult(
+                    status="completed",
+                    overview=ctx["overview"],
+                    survey=saved["survey"],
+                    session_state=clone_json_value(ctx["session_state"], "session_state"),
+                    candidates=tuple(proposals),
+                    evidence=tuple(ctx["evidence"]),
+                    rounds_used=ctx["rounds"],
+                    store_path=store_path,
+                )
+
         if failure is not None:
+            self._save_checkpoint("input_failure", ctx, reason=failure)
             return ReconRunResult(
                 status="input_failure", reason=failure,
-                overview=overview, rounds_used=0,
+                overview=overview,
+                session_state=clone_json_value(
+                    ctx["session_state"], "session_state"),
+                evidence=tuple(ctx["evidence"]),
+                rounds_used=ctx["rounds"],
             )
 
-        input_message = self._overview_message(overview)
-        session_state: dict[str, Any] = {}
-        evidence: list[EvidenceReference] = []
-        rounds = 0
+        pending: dict[str, Any] | None = None
+        if saved is not None and saved.get("pending") is not None:
+            self._validated_pending(saved["pending"])
+            pending = saved["pending"]
+            self._evidence_store.restore_sequence(pending["sequence"])
+
+        input_message = (
+            self._resume_message(ctx) if resuming and pending is None
+            else self._overview_message(overview)
+        )
+        rounds = ctx["rounds"]
+        session_state = ctx["session_state"]
+        evidence = ctx["evidence"]
         # 无效回复(协议形状或守卫拒绝)整份重生成,连续 MAX_PROTOCOL_ATTEMPTS
         # 次按 input_failure/protocol_error 收束;轮次口径不变——每次模型请求
         # (含重生成)计一轮;重生成不计工具调用,活动时段离开 run 即封段。
@@ -490,34 +705,63 @@ class HostReconRunner:
         self._budget.start_active()
         try:
             while rounds < self.max_rounds:
-                self._budget.require_llm()
-                rounds += 1
-                raw = session.step(input_message)
-                self._budget.record_llm_call(getattr(session, "last_usage", None))
                 try:
-                    proposal = revalidate_proposal(raw, "recon")
+                    if pending is None:
+                        self._budget.require_llm()
+                        rounds += 1
+                        ctx["rounds"] = rounds
+                        raw = session.step(input_message)
+                        self._budget.record_llm_call(
+                            getattr(session, "last_usage", None))
+                        proposal = revalidate_proposal(raw, "recon")
+                    else:
+                        proposal = self._validated_pending(pending)
                     if isinstance(proposal, ActionProposal):
                         guarded = self._guard_action(proposal)
                         if guarded.rejected:
                             raise ProposalRejectedError(guarded.feedback or "")
                         assert guarded.state_delta is not None
-                        self._budget.require_tool()
-                        slot = self._evidence_store.reserve(RECON_CANDIDATE_ID)
-                        # 先计 attempt 再执行(与 analysis/verification 的崩溃
-                        # 口径一致:执行中断崩掉,这次真实尝试也已入账)。
-                        self._budget.record_logical_tool_call()
-                        self._budget.record_tool_execution()
-                        result = execute_tool(guarded.tool, guarded.arguments)
-                        reference, input_message = self._evidence_store.record(
-                            slot,
-                            candidate_id=RECON_CANDIDATE_ID,
-                            investigation_id=RECON_INVESTIGATION_ID,
-                            tool_name=proposal.tool,
-                            arguments=guarded.arguments,
-                            result=result,
-                        )
+                        if pending is None:
+                            slot = self._evidence_store.reserve(RECON_CANDIDATE_ID)
+                            pending = {
+                                "proposal": asdict(proposal),
+                                "sequence": slot.sequence,
+                                "executing": False,
+                            }
+                            ctx["pending"] = pending
+                            self._budget.record_logical_tool_call()
+                            self._save_checkpoint("running", ctx)
+                        else:
+                            slot = self._evidence_store.restore_slot(
+                                RECON_CANDIDATE_ID, pending["sequence"])
+                        recovered = self._evidence_store.recover(slot)
+                        if recovered is None:
+                            # 先计 attempt 再执行(与 analysis/verification 的
+                            # 崩溃口径一致:执行中断崩掉,这次真实尝试也已入账)。
+                            self._budget.require_tool()
+                            pending["executing"] = True
+                            self._budget.record_tool_execution()
+                            self._save_checkpoint("running", ctx)
+                            result = execute_tool(guarded.tool, guarded.arguments)
+                            recovered = self._evidence_store.record(
+                                slot,
+                                candidate_id=RECON_CANDIDATE_ID,
+                                investigation_id=RECON_INVESTIGATION_ID,
+                                tool_name=proposal.tool,
+                                arguments=guarded.arguments,
+                                result=result,
+                            )
+                        reference, input_message = recovered
+                        if (reference.tool != proposal.tool
+                                or reference.arguments != guarded.arguments
+                                or reference.investigation_id != RECON_INVESTIGATION_ID):
+                            raise StoreError(
+                                "Recon Evidence 与待执行动作不匹配；请检查原运行目录")
                         evidence.append(reference)
                         session_state.update(guarded.state_delta)
+                        pending = None
+                        ctx["pending"] = None
+                        self._save_checkpoint("running", ctx)
                         self._budget.record_validated_round()
                         strikes = 0
                         continue
@@ -533,8 +777,18 @@ class HostReconRunner:
                             "从头重新提交整份 complete_survey。",
                         ))
                     proposals = _build_candidate_proposals(proposal.state_delta["candidates"])
+                    ctx["proposals"] = [item.as_dict() for item in proposals]
+                    self._save_checkpoint(
+                        "survey_accepted", ctx, survey=clone_json_value(
+                            proposal.state_delta, "survey"),
+                    )
                     store_path = self._persist_store(
                         proposal.state_delta, session_state, proposals,
+                    )
+                    self._save_checkpoint(
+                        "completed", ctx,
+                        survey=clone_json_value(proposal.state_delta, "survey"),
+                        store_path=store_path,
                     )
                     self._budget.record_validated_round()
                     return ReconRunResult(
@@ -550,6 +804,8 @@ class HostReconRunner:
                 except ProposalRejectedError as exc:
                     strikes += 1
                     if strikes >= MAX_PROTOCOL_ATTEMPTS:
+                        self._save_checkpoint(
+                            "input_failure", ctx, reason="protocol_error")
                         return ReconRunResult(
                             status="input_failure", reason="protocol_error",
                             overview=overview,
@@ -557,6 +813,7 @@ class HostReconRunner:
                             evidence=tuple(evidence), rounds_used=rounds,
                         )
                     input_message = regeneration_feedback(str(exc))
+            self._save_checkpoint("incomplete", ctx, reason="rounds_exhausted")
             return ReconRunResult(
                 status="incomplete", reason="rounds_exhausted",
                 overview=overview, session_state=clone_json_value(session_state, "session_state"),
@@ -624,19 +881,58 @@ class HostReconRunner:
             + json.dumps(payload, ensure_ascii=False, sort_keys=True)
         )
 
+    def _resume_message(self, ctx: dict[str, Any]) -> str:
+        """恢复简报:概览 + 已完成动作 + 阶段状态 + 剩余轮次。"""
+        payload = {
+            "phase": "recon",
+            "site_overview": ctx["overview"],
+            "resume": {
+                "completed_actions": [
+                    {"evidence_id": reference.evidence_id,
+                     "tool": reference.tool,
+                     "summary": reference.summary}
+                    for reference in ctx["evidence"]
+                ],
+                "session_state": ctx["session_state"],
+                "rounds_used": ctx["rounds"],
+                "remaining_rounds": self.max_rounds - ctx["rounds"],
+            },
+            "task": (
+                "本次运行从保存边界恢复:已完成动作的 Evidence 如上,不要重复"
+                "执行;继续广度攻击面调查,完成时以 complete_survey 提交四段。"
+            ),
+        }
+        return (
+            "Recon 恢复简报(Host 注入):\n"
+            + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        )
+
     def _persist_store(
         self,
         survey: dict[str, Any],
         session_state: dict[str, Any],
         proposals: list[CandidateProposal],
     ) -> Path:
+        store_path = self._run_dir / "candidates.json"
+        if store_path.exists():
+            # 已升级的权威 Candidate Store(v2)绝不被 recon 的原始 proposal
+            # 工件(v1)降级覆盖(票 11 接缝:恢复不得丢去重/评分/映射)。
+            try:
+                existing = json.loads(store_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise StoreError(
+                    f"Candidate Store 损坏;请检查原运行目录: {exc}") from exc
+            if (isinstance(existing, dict)
+                    and existing.get("schema_version") == CANDIDATE_STORE_SCHEMA_VERSION):
+                raise StoreError(
+                    "Candidate Store 已完成去重升级;拒绝把已升级的库降级写回,"
+                    "请检查原运行目录或创建新运行世代")
         payload = clone_json_value({
             "schema_version": RECON_STORE_SCHEMA_VERSION,
             "survey": survey,
             "session_state": session_state,
             "candidates": [proposal.as_dict() for proposal in proposals],
         }, "Candidate Store")
-        store_path = self._run_dir / "candidates.json"
         atomic_json(store_path, payload)
         return store_path
 
