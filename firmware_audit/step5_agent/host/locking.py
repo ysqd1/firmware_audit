@@ -18,7 +18,7 @@ from pathlib import Path
 import time
 import warnings
 
-from .store import StoreError, atomic_json
+from .store import StoreError, atomic_json, read_json_object
 
 LOCK_SCHEMA_VERSION = 1
 
@@ -60,10 +60,16 @@ def _default_alive(pid: int, start_marker: int | None) -> bool:
     return True
 
 
-def _hostname() -> str:
+def hostname() -> str:
+    """本机主机名;进程身份三件套之一(与 pid/start_marker 同级)。"""
     if hasattr(os, "uname"):
         return os.uname().nodename
     return os.environ.get("COMPUTERNAME") or "unknown-host"
+
+
+# acquire_lock 的形参 hostname(公开关键字)遮蔽本模块同名函数,
+# 默认值经此别名取用;generation.py 也从这里导入主机名默认值。
+HOSTNAME_DEFAULT = hostname
 
 
 class LockHandle:
@@ -100,14 +106,10 @@ def _read_lock(path: Path) -> dict | None:
     """读取锁文件;缺失返回 None,损坏按 Store 语义拒绝。"""
     if not path.exists():
         return None
-    try:
-        held = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeError) as exc:
-        raise StoreError(
-            f"活动锁损坏,无法判定是否有并发运行;请人工检查后处理: "
-            f"{path} ({exc})") from exc
-    if (not isinstance(held, dict)
-            or type(held.get("pid")) is not int
+    held = read_json_object(
+        path, "活动锁",
+        guidance="无法判定是否有并发运行,请人工检查后处理")
+    if (type(held.get("pid")) is not int
             or not isinstance(held.get("hostname"), str)
             or held.get("schema_version") != LOCK_SCHEMA_VERSION):
         raise StoreError(f"活动锁结构损坏;请人工检查后处理: {path}")
@@ -127,7 +129,7 @@ def acquire_lock(
     path = root / "lock.json"
     identity = {
         "pid": os.getpid() if pid is None else int(pid),
-        "hostname": _hostname() if hostname is None else str(hostname),
+        "hostname": hostname if hostname is not None else HOSTNAME_DEFAULT(),
         "started_at": float(time.time()),
     }
     document = {

@@ -12,13 +12,12 @@ run_state.status 词汇:
 """
 from __future__ import annotations
 
-import json
-import os
 import re
 import time
 from pathlib import Path
 
-from .store import StoreError, atomic_json
+from .locking import hostname as default_hostname
+from .store import StoreError, atomic_json, read_json_object
 
 MANIFEST_SCHEMA_VERSION = 1
 RUN_STATE_SCHEMA_VERSION = 1
@@ -31,23 +30,13 @@ def generations_root(root: Path) -> Path:
     return Path(root) / "generations"
 
 
-def _decode(path: Path, label: str) -> dict:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeError, OSError) as exc:
-        raise StoreError(f"{label}损坏；请检查原运行目录: {path} ({exc})") from exc
-    if not isinstance(payload, dict):
-        raise StoreError(f"{label}必须是 JSON object；请检查原运行目录: {path}")
-    return payload
-
-
 def read_manifest(gen_dir: Path) -> dict:
     """读取并校验世代 manifest;版本不兼容引导新建世代(票 11 AC5)。"""
     gen_dir = Path(gen_dir)
     manifest_path = gen_dir / "manifest.json"
     if not manifest_path.exists():
         raise StoreError(f"世代目录缺少 manifest: {gen_dir}；请检查原运行目录")
-    payload = _decode(manifest_path, "世代 manifest")
+    payload = read_json_object(manifest_path, "世代 manifest")
     generation = payload.get("generation")
     if (type(payload.get("schema_version")) is not int
             or payload["schema_version"] != MANIFEST_SCHEMA_VERSION):
@@ -96,7 +85,7 @@ def create_generation(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "generation": name,
         "created_at": float(now if now is not None else _wall_clock()),
-        "hostname": hostname if hostname is not None else _hostname(),
+        "hostname": hostname if hostname is not None else default_hostname(),
     })
     save_run_state(gen_dir, status="running")
     return name, gen_dir
@@ -106,18 +95,12 @@ def _wall_clock() -> float:
     return time.time()
 
 
-def _hostname() -> str:
-    if hasattr(os, "uname"):
-        return os.uname().nodename
-    return os.environ.get("COMPUTERNAME") or "unknown-host"
-
-
 def load_run_state(gen_dir: Path) -> dict | None:
     """读取 run_state;缺失返回 None(由调用方按新建 running 处理)。"""
     path = Path(gen_dir) / "run_state.json"
     if not path.exists():
         return None
-    payload = _decode(path, "run_state")
+    payload = read_json_object(path, "run_state")
     if (type(payload.get("schema_version")) is not int
             or payload["schema_version"] != RUN_STATE_SCHEMA_VERSION
             or payload.get("status") not in RUN_STATUSES

@@ -17,7 +17,6 @@ evidence-gap 按优先级)→ Related Candidate 幂等回队} 至不动点 → �
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 import time
@@ -49,7 +48,7 @@ from .generation import (
 )
 from .locking import acquire_lock
 from .recon import HostReconRunner
-from .store import StoreError
+from .store import StoreError, read_json_object
 from .verification import (
     HostVerificationRunner,
     load_cases,
@@ -362,6 +361,8 @@ class RunDriver:
     ) -> list[str]:
         """把入选且尚未注册的 Candidate 按 Store 分配的显式 ID 注册进 tracer。"""
         registered: list[str] = []
+        # 升序注册是下方 ID 对齐校验的前提:tracer 的数值水位只增不减,
+        # 乱序注册会让低号候选撞上已抬高的水位,报"Candidate ID 对齐失败"。
         for record in sorted(payload["candidates"],
                              key=lambda item: item["candidate_id"]):
             queue = record.get("queue") or {}
@@ -390,12 +391,12 @@ class RunDriver:
         candidates = 0
         store_path = gen_dir / "candidates.json"
         if store_path.exists():
-            document = json.loads(store_path.read_text(encoding="utf-8"))
+            document = read_json_object(store_path, "Candidate Store")
             candidates = len(document.get("candidates", []))
         findings = 0
         findings_path = gen_dir / "findings.json"
         if findings_path.exists():
-            document = json.loads(findings_path.read_text(encoding="utf-8"))
+            document = read_json_object(findings_path, "Findings 工件")
             findings = len(document.get("findings", []))
         return RunSummary(
             generation=name, gen_dir=gen_dir, created=created, status=status,

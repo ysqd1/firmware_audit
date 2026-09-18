@@ -63,6 +63,24 @@ def _version(value: dict, field: str, expected: int) -> None:
         raise StoreError(f"{field} 不兼容；请创建新运行世代，保留原目录供检查")
 
 
+def read_json_object(
+    path: Path, label: str, *, guidance: str = "请检查原运行目录",
+) -> dict:
+    """读取 JSON 文件并要求顶层为 object;损坏按 Store 语义拒绝。
+
+    世代 manifest/run_state、活动锁、recon 检查点、Candidate Store 等运行
+    元数据的共用解码形状;结构/版本校验仍归各调用方,此处只保证"能拿到
+    一个 object"。guidance 是损坏时的下一步动作指引(错误文案即文档)。
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError, OSError) as exc:
+        raise StoreError(f"{label}损坏;{guidance}: {path} ({exc})") from exc
+    if not isinstance(payload, dict):
+        raise StoreError(f"{label}必须是 JSON object;{guidance}: {path}")
+    return payload
+
+
 def sync_directory(directory: Path) -> None:
     """On POSIX, persist directory entries as well as file contents."""
     if os.name == "posix":

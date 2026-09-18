@@ -29,7 +29,13 @@ from typing import Any, Literal
 
 from .budget import BudgetExhaustedError
 from .json_values import JsonValueError, clone_json_value
-from .store import CANDIDATE_ID_PATTERN, InvestigationStore, StoreError, atomic_json
+from .store import (
+    CANDIDATE_ID_PATTERN,
+    InvestigationStore,
+    StoreError,
+    atomic_json,
+    read_json_object,
+)
 
 # Claim Profile 枚举(ADR-0012):Profile 内容与 Claim 门槛由后续工单实现,
 # 此处只作为 fingerprint 输入与语义比较门控维度。
@@ -1065,11 +1071,8 @@ class CandidateStore:
     def _load(self) -> dict[str, Any] | None:
         if not self.store_path.exists():
             return None
-        try:
-            payload = json.loads(self.store_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeError) as exc:
-            raise StoreError(f"Candidate Store 损坏;请检查原运行目录: {exc}") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("candidates"), list):
+        payload = read_json_object(self.store_path, "Candidate Store")
+        if not isinstance(payload.get("candidates"), list):
             raise StoreError("Candidate Store 结构损坏;请检查原运行目录")
         version = payload.get("schema_version")
         if version not in (_V1_STORE_SCHEMA_VERSION, CANDIDATE_STORE_SCHEMA_VERSION):

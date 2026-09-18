@@ -46,7 +46,7 @@ from .session import (
     ValidationIssue,
     revalidate_proposal,
 )
-from .store import StoreError, atomic_json
+from .store import StoreError, atomic_json, read_json_object
 from .tooling import execute_tool, normalize_tool_arguments, regeneration_feedback
 
 DEFAULT_RECON_MAX_ROUNDS = 30
@@ -496,13 +496,8 @@ class HostReconRunner:
         path = self._checkpoint_path()
         if not path.exists():
             return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeError) as exc:
-            raise StoreError(
-                f"Recon 检查点损坏；请检查原运行目录: {exc}") from exc
-        if (not isinstance(payload, dict)
-                or type(payload.get("schema_version")) is not int
+        payload = read_json_object(path, "Recon 检查点")
+        if (type(payload.get("schema_version")) is not int
                 or payload["schema_version"] != RECON_STATE_SCHEMA_VERSION
                 or payload.get("status") not in self._CHECKPOINT_STATUSES
                 or type(payload.get("rounds_used")) is not int
@@ -917,13 +912,8 @@ class HostReconRunner:
         if store_path.exists():
             # 已升级的权威 Candidate Store(v2)绝不被 recon 的原始 proposal
             # 工件(v1)降级覆盖(票 11 接缝:恢复不得丢去重/评分/映射)。
-            try:
-                existing = json.loads(store_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, UnicodeError) as exc:
-                raise StoreError(
-                    f"Candidate Store 损坏;请检查原运行目录: {exc}") from exc
-            if (isinstance(existing, dict)
-                    and existing.get("schema_version") == CANDIDATE_STORE_SCHEMA_VERSION):
+            existing = read_json_object(store_path, "Candidate Store")
+            if existing.get("schema_version") == CANDIDATE_STORE_SCHEMA_VERSION:
                 raise StoreError(
                     "Candidate Store 已完成去重升级;拒绝把已升级的库降级写回,"
                     "请检查原运行目录或创建新运行世代")
