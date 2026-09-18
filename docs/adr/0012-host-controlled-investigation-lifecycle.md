@@ -97,6 +97,13 @@ Related Candidate 只继承相关 Investigation State、Evidence References 与�
 3. **上下文压缩**：由 Host 显式检查并触发上下文压缩，压缩请求进入运行预算、token/活动时间统计与 Transcript；Agent Session 的 `step` 保持一次模型请求的契约。压缩只能改变模型上下文，不改写权威 Investigation State、原始 Evidence 或已保存 Transcript。公开入口切换前完成接线，不能把额外 LLM 请求隐藏在 Session 内。
 4. **独立检查计划**：Host 根据冻结 Verification Case 形成并持久化逐 Claim 检查清单和证据入口，Verifier 在正常响应中表达并执行下一步检查，不增加专门规划 LLM 轮次。计划继承案卷的上下文隔离要求，原 Evidence 只用于重新定位；恢复时能读取既有计划。只有案卷摘要的 brief 不视为已交付检查计划。
 
+## 2026-09-18 实现期语义确认（票 12）
+
+用户确认 severity 矩阵在 ADR 未定义处的两条补白规则；实现为 `host/severity.py`，工单 12 保留来源记录。
+
+1. **关键信息缺失按最重档代入**：结构化 facet 缺失时，影响范围按"系统级或信任边界"、触发条件按"宽松"代入矩阵计算，计算后仍封顶不得 critical——未知信息不降低严重度，但最高档必须建立在完整事实之上（承接 L59 的"关键字段缺失时不得给出 critical"）。
+2. **前置条件不适用即宽松触发**：`preconditions` 判 `not_applicable` 视为"无前置条件"，按宽松触发计且属完整信息，不算缺失。
+
 ## 代价与影响
 
 - 当前 LLM orchestrator 在迁移期间只作为兼容入口,不再拥有 finish、阶段跳转或 confirmed 接受权。
