@@ -667,7 +667,8 @@ class SessionScript:
         self.verification_factory = verification or SmartVerificationSession
         self.created: list[tuple[str, str | None]] = []
 
-    def __call__(self, role: str, candidate_id: str | None = None):
+    def __call__(self, role: str, candidate_id: str | None = None,
+                 run_dir: Path | None = None):
         self.created.append((role, candidate_id))
         if role == "recon":
             return self.recon

@@ -36,7 +36,7 @@ DEFAULT_BUDGET_CONFIG: dict[str, float] = {
 }
 
 # 本机环境覆盖层的键名单一出处;角色轮次旋钮沿用各 runner 既同名变量
-# (STEP5_*_MAX_ITERS,含 legacy 层同名双消费),max_candidates 沿用票 07
+# (STEP5_*_MAX_ITERS,票 14 后单一消费方为 Host),max_candidates 沿用票 07
 # 的 STEP5_CANDIDATE_SLOTS——同一旋钮不造第二个名字。
 ENV_KEYS: dict[str, str] = {
     "recon_max_rounds": "STEP5_RECON_MAX_ITERS",

@@ -67,7 +67,7 @@ def truncate_text(text: str, limit: int = MAX_TEXT_CHARS) -> str:
     """Observation 入上下文截断(学 DeepAudit:截断必告知总量,头尾保留)。
 
     头 75% + 尾 20%(头部有 JSON/代码结构,尾部常有结论行);提示注明
-    省略字符数与全文总长,并指引全文位置(obs/ 目录,见 react_loop._save_obs),
+    省略字符数与全文总长,并指引全文位置(obs/ 目录,见 Transcript.save_obs),
     LLM 可据此改用分页参数重读。
     """
     if len(text) <= limit:

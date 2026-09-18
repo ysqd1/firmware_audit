@@ -1,17 +1,16 @@
-"""Step5 上下文集成测试:Observation→ContextManager 完整性。
+"""Step5 上下文单测:ContextManager 四分区结构与压缩路径。
 
-react 循环守卫/截断回读已由 test_step5_react.py 覆盖;
-本文件专测 ContextManager 四分区结构与压缩路径(agents.md §上下文):
+票 14 公开切换后,Host 的逐步 Agent Session 直接消费 ContextManager
+(Host 显式触发压缩,接线测试见 test_step5_host_budget.py 的 D3 段);
+本文件专测四分区与压缩的纯行为:
   1. 四分区布局:system/init 不动,summary 单条 user,recent 交替
   2. 压缩触发:阈值判定 → recent 减半对齐 assistant 边界 → 摘要并入 summary
   3. 压缩失败还原(LLM 异常不丢历史)
   4. 多轮压缩累积
-  5. 真实循环中 Observation 前缀与交替完整性
 """
 from __future__ import annotations
 
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -19,20 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from firmware_audit.step5_agent.engine.context import (
     ContextManager, est_tokens,
 )
-from firmware_audit.step5_agent.engine.react_loop import run_react_agent
-from firmware_audit.test.scripted_llm import ScriptedLLM
-from firmware_audit.step5_agent.providers.tools.base import (
-    AgentTool, ToolContext, ToolResult,
-)
-
-
-class EchoTool(AgentTool):
-    name = "echo"
-    description = "test"
-    params_doc = ""
-
-    def _run(self, **kw) -> ToolResult:
-        return ToolResult(ok=True, text=f"echo:{kw}")
 
 
 class SummaryLLM:
@@ -175,42 +160,6 @@ def test_multiple_compactions_accumulate() -> list[str]:
     return fails
 
 
-def test_observation_prefix_and_alternation_in_loop() -> list[str]:
-    """真实循环:所有 Observation 以固定前缀入上下文,assistant/user 严格交替。"""
-    fails: list[str] = []
-    llm = ScriptedLLM([
-        "Thought: t1\nAction: echo\nAction Input: {\"q\": 1}",
-        "Thought: t2\nAction: echo\nAction Input: {\"q\": 2}",
-        "Final Answer: done",
-    ])
-    ctx = ToolContext(process_dir=Path("."))
-    tools = {"echo": EchoTool(ctx)}
-    cm = ContextManager("SYS", "INIT")
-    with tempfile.TemporaryDirectory() as td:
-        run_react_agent(llm, tools, "SYS", "INIT", max_iters=5,
-                        transcript=Path(td) / "t.jsonl", context=cm)
-        # recent 结构:assistant/user ×2 + final assistant = 5 条
-        roles = [m["role"] for m in cm.recent]
-        if roles != ["assistant", "user", "assistant", "user", "assistant"]:
-            fails.append(f"recent 应严格交替, got {roles}")
-        for i, m in enumerate(cm.recent):
-            if m["role"] == "user" and not m["content"].startswith("Observation: "):
-                fails.append(f"recent[{i}] user 消息缺 Observation 前缀: {m['content'][:60]}")
-        # 完整消息链给 LLM 的形态:system+init+[round_note 进度 system]+交替 recent
-        full = cm.build_messages()
-        if len(full) != 2 + (1 if cm.round_note else 0) + len(cm.recent):
-            fails.append("build_messages 应为 system+init+[进度]+recent 全量")
-        # 每轮进度提示:非空且含总轮数(总数由 max_iters 实参注入,不硬编码)
-        if not cm.round_note:
-            fails.append("round_note 应为每轮注入的非空进度提示")
-        elif "共 5 轮" not in cm.round_note:
-            fails.append(f"round_note 应含总轮数(max_iters), got: {cm.round_note[:60]}")
-        # 第 2 次 LLM 调用能看到第 1 次 Observation(echo 结果在上下文)
-        if not any("echo:" in m["content"] for m in llm.calls[1]):
-            fails.append("工具结果未进入第 2 轮上下文")
-    return fails
-
-
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -220,7 +169,6 @@ def test_main() -> int:
         ("compact_llm_failure_restore", test_compact_llm_failure_restore),
         ("compact_min_rounds_and_no_need", test_compact_min_rounds_and_no_need),
         ("multiple_compactions_accumulate", test_multiple_compactions_accumulate),
-        ("observation_prefix_and_alternation", test_observation_prefix_and_alternation_in_loop),
     ]:
         fl = fn()
         if fl:

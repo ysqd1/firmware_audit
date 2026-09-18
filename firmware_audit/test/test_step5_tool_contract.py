@@ -292,7 +292,10 @@ def test_blind_discovery_role_contract() -> list[str]:
         "imports_query", "checksec", "semgrep_scan", "gitleaks_scan",
         "binwalk_rescan",
     }
+    # find_decompiled_function 读已有反编译边车(不发起 Ghidra),授权深挖
+    # 角色、拒绝 recon(ADR-0012 2026-09-16 D1)。
     deep = shallow | {
+        "find_decompiled_function",
         "r2_list_functions", "r2_disassemble_function", "r2_xref_query",
         "ghidra_decompile", "sandbox_verify",
     }
@@ -331,7 +334,8 @@ def test_role_contract_rejects_unauthorized_action() -> list[str]:
     if missing_api:
         return [f"工具注册表缺授权判定 API: {missing_api}"]
 
-    for tool_name in ("r2_list_functions", "ghidra_decompile", "web_search"):
+    for tool_name in ("r2_list_functions", "ghidra_decompile", "web_search",
+                      "find_decompiled_function"):
         try:
             tools_module.authorize_tool("recon", tool_name)
         except tools_module.ToolAuthorizationError as exc:
@@ -343,9 +347,55 @@ def test_role_contract_rejects_unauthorized_action() -> list[str]:
         else:
             fails.append(f"recon 越权动作应被契约拒绝: {tool_name}")
 
+    # D1:find_decompiled_function 对深挖角色合法授权(读边车,不发起 Ghidra)。
+    for role in ("analysis", "verification"):
+        allowed = tools_module.authorize_tool(role, "find_decompiled_function")
+        if allowed.name != "find_decompiled_function":
+            fails.append(f"{role} 应能授权 find_decompiled_function: {allowed}")
+    verification_tools = ", ".join(tools_module.tool_names_for_role("verification"))
+    analysis_tools = ", ".join(tools_module.tool_names_for_role("analysis"))
+    if "find_decompiled_function" not in verification_tools:
+        fails.append("verification 有效工具目录应含 find_decompiled_function")
+    if "find_decompiled_function" not in analysis_tools:
+        fails.append("analysis 有效工具目录应含 find_decompiled_function")
+    recon_tools = ", ".join(tools_module.tool_names_for_role("recon"))
+    if "find_decompiled_function" in recon_tools:
+        fails.append("recon 有效工具目录不得含 find_decompiled_function")
+
     allowed = tools_module.authorize_tool("analysis", "ghidra_decompile")
     if allowed.name != "ghidra_decompile":
         fails.append(f"合法授权应返回对应注册契约: {allowed}")
+    return fails
+
+
+def test_role_prompts_match_tool_contract() -> list[str]:
+    """D1:模型可见的角色提示词与实际工具权限一致——recon 不见深挖工具,
+    analysis/verification 明示 find_decompiled_function(读边车,不发起 Ghidra)。"""
+    fails: list[str] = []
+    from firmware_audit.step5_agent.host.analysis import ANALYSIS_SESSION_SYSTEM
+    from firmware_audit.step5_agent.host.recon import RECON_SESSION_SYSTEM
+    from firmware_audit.step5_agent.host.verification import (
+        VERIFICATION_SESSION_SYSTEM,
+    )
+
+    for name, prompt in (("analysis", ANALYSIS_SESSION_SYSTEM),
+                         ("verification", VERIFICATION_SESSION_SYSTEM)):
+        if "find_decompiled_function" not in prompt:
+            fails.append(f"{name} 提示词应列明 find_decompiled_function")
+    if "find_decompiled_function" in RECON_SESSION_SYSTEM:
+        fails.append("recon 提示词不得出现 find_decompiled_function")
+    # recon 提示词对深挖工具只允许"不可见"纪律式提及,不得宣传为可用
+    for deep_tool in ("ghidra_decompile", "sandbox_verify"):
+        if deep_tool in RECON_SESSION_SYSTEM and "不可见" not in RECON_SESSION_SYSTEM:
+            fails.append(f"recon 提示词提及 {deep_tool} 时必须声明不可见")
+    if "不可见" not in RECON_SESSION_SYSTEM:
+        fails.append("recon 提示词应声明深挖工具不可见(纪律句)")
+    # recon 提示词宣传的浅层清单与注册表一致(抽样锚定)
+    for shallow_tool in ("list_files", "read_file", "search_code",
+                         "strings_query", "imports_query", "checksec",
+                         "semgrep_scan", "gitleaks_scan", "binwalk_rescan"):
+        if shallow_tool not in RECON_SESSION_SYSTEM:
+            fails.append(f"recon 提示词应列明授权工具 {shallow_tool}")
     return fails
 
 
@@ -366,6 +416,7 @@ def test_main() -> int:
         ("tools_declare_replay_policy", test_tools_declare_replay_policy),
         ("blind_discovery_role_contract", test_blind_discovery_role_contract),
         ("role_contract_rejects_unauthorized_action", test_role_contract_rejects_unauthorized_action),
+        ("role_prompts_match_tool_contract", test_role_prompts_match_tool_contract),
     ]:
         fl = fn()
         if fl:

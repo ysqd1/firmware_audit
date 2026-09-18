@@ -34,6 +34,9 @@ from firmware_audit.step5_agent.host.budget import (
     CONFIG_SCHEMA_VERSION,
 )
 from firmware_audit.step5_agent.host.store import StoreError
+from firmware_audit.step5_agent.engine.context import ContextManager
+from firmware_audit.step5_agent.host.analysis import ANALYSIS_SESSION_SYSTEM
+from firmware_audit.step5_agent.host.session import AgentSession
 from firmware_audit.step5_agent.providers.llm_client import LLMError
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
 from firmware_audit.test.test_step5_host_analysis import (
@@ -53,6 +56,7 @@ from firmware_audit.test.test_step5_host_recon import (
 from firmware_audit.test.test_step5_host_verification import (
     FakeSession as FakeVerificationSession,
 )
+from firmware_audit.test.scripted_llm import ScriptedLLM
 from firmware_audit.test.test_step5_host_verification import (
     _prepared_tracer,
     _result,
@@ -382,6 +386,73 @@ def test_verification_protocol_error_never_confirms_even_with_full_results(
     ]))
 
     assert (outcome.verdict, outcome.stop_reason) == ("inconclusive", "protocol_error")
+    assert outcome.finding_id is None
+    assert not (tmp_path / "findings.json").exists()
+
+
+# ---- D2(ADR-0012 2026-09-16):轮次耗尽按已持久化 Claim Result 聚合 ----
+# 预算耗尽不要求额外收到 complete_verification;结论与停止原因分别表达
+# 证据判断与执行过程。
+
+
+def test_round_exhaustion_confirms_full_support_without_complete(tmp_path: Path) -> None:
+    """已提交完整独立支持、未发 complete_verification → confirmed + budget_exhausted。"""
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(
+        tmp_path, {"read_file": tool}, tracer, max_rounds=1, budget=_budget(tmp_path))
+    # 唯一一轮:动作携带全部必填 Claim 的独立 supported 结果(引用本次 ev-000002)。
+    session = FakeVerificationSession([
+        _v_action({"claim_results": {
+            name: _result("supported", "ev-000002", claim=name)
+            for name in GENERIC_REQUIRED}}),
+    ])
+
+    outcome = runner.run_case(candidate_id, session)
+
+    assert (outcome.verdict, outcome.stop_reason) == ("confirmed", "budget_exhausted")
+    assert outcome.finding_id == "f-0001"
+    findings = json.loads((tmp_path / "findings.json").read_text(encoding="utf-8"))
+    assert [f["candidate_id"] for f in findings["findings"]] == [candidate_id]
+    investigation = tracer.investigation_for(candidate_id)
+    assert (investigation.disposition, investigation.stop_reason) == (
+        "confirmed", "budget_exhausted")
+
+
+def test_round_exhaustion_with_missing_claims_is_inconclusive(tmp_path: Path) -> None:
+    """缺项(仅部分必填有结果)→ inconclusive,不生成 Finding。"""
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(
+        tmp_path, {"read_file": tool}, tracer, max_rounds=1, budget=_budget(tmp_path))
+    session = FakeVerificationSession([
+        _v_action({"claim_results": {
+            "target_exists": _result("supported", "ev-000002", claim="target_exists")}}),
+    ])
+
+    outcome = runner.run_case(candidate_id, session)
+
+    assert (outcome.verdict, outcome.stop_reason) == ("inconclusive", "budget_exhausted")
+    assert set(outcome.unsupported) == set(GENERIC_REQUIRED) - {"target_exists"}
+    assert outcome.finding_id is None
+    assert not (tmp_path / "findings.json").exists()
+
+
+def test_round_exhaustion_with_decisive_refutation_is_rejected(tmp_path: Path) -> None:
+    """决定性 Claim 被独立反证 → rejected,即使其余必填全部 supported。"""
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(
+        tmp_path, {"read_file": tool}, tracer, max_rounds=1, budget=_budget(tmp_path))
+    results = {name: _result("supported", "ev-000002", claim=name)
+               for name in GENERIC_REQUIRED}
+    results["root_cause"] = _result("refuted", "ev-000002", claim="root_cause")
+    session = FakeVerificationSession([_v_action({"claim_results": results})])
+
+    outcome = runner.run_case(candidate_id, session)
+
+    assert (outcome.verdict, outcome.stop_reason) == ("rejected", "budget_exhausted")
+    assert "root_cause" in outcome.decisive_refuted
     assert outcome.finding_id is None
     assert not (tmp_path / "findings.json").exists()
 
@@ -721,3 +792,126 @@ def test_run_total_active_time_exhaustion_mid_run_saves_state(tmp_path: Path) ->
         budget=_budget(tmp_path, clock=clock, max_active_seconds=100.0))
     finished = resumed.run_analysis(candidate.candidate_id, FakeSession([_close()]))
     assert finished.disposition == "closed"
+
+
+# ---- D3(ADR-0012 2026-09-16):Host 显式触发的上下文压缩 ----
+# 真 AgentSession + ScriptedLLM:超阈值触发、预算/Transcript 留痕、后续动作
+# 继续、预算不足不多发请求、压缩失败还原且不影响权威状态。
+
+
+def _session_reply(state_delta: dict, kind: str) -> str:
+    """构造 AgentSession 协议的原始 JSON 回复(与 ScriptedLLM 配套)。"""
+    nxt = ({"kind": "tool_action", "tool": "read_file",
+            "arguments": {"path": "extracted/etc/device.conf"}}
+           if kind == "tool_action" else {"kind": kind})
+    return json.dumps({"decision_summary": "推进调查", "state_delta": state_delta,
+                       "next": nxt}, ensure_ascii=False)
+
+
+def _compaction_script() -> list[str]:
+    """两步取证(全 Claim supported 引用 ev-000001)→ 压缩 → 提交案卷。"""
+    return [
+        _session_reply({"hypothesis": {"statement": "配置暴露固定令牌"}},
+                       "tool_action"),
+        _session_reply({"claims": {
+            name: {"status": "supported", "evidence_ids": ["ev-000001"]}
+            for name in GENERIC_REQUIRED}}, "tool_action"),
+        "压缩摘要:已确认事实:配置暴露固定令牌;未决:影响面。",
+        _session_reply({"admission_reason": "ready"}, "submit_case"),
+    ]
+
+
+def test_host_compacts_over_threshold_context_with_real_session(
+        tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="token=literal", raw="token=literal"))
+    budget = _budget(tmp_path)
+    tracer = HostAnalysisTracer(tmp_path, {"read_file": tool}, budget=budget)
+    candidate = tracer.add_candidate({"target": "extracted/etc/device.conf"})
+    transcript = tmp_path / "transcripts" / "transcript.jsonl"
+    # 低阈值:两轮动作后上下文超阈,Host 在第三次 step 前显式压缩。
+    context = ContextManager(
+        ANALYSIS_SESSION_SYSTEM, "", max_est_tokens=200, trigger_ratio=0.5)
+    session = AgentSession(
+        "analysis", ScriptedLLM(_compaction_script()), context,
+        transcript=transcript)
+
+    investigation = tracer.run_analysis(candidate.candidate_id, session)
+
+    # 压缩只改模型上下文;调查正常推进到案卷提交
+    assert investigation.lifecycle_status == "ready_for_verification"
+    assert context.compactions == 1
+    assert context.recent and context.recent[0]["role"] == "assistant"
+    # 权威状态与 Evidence 不受压缩影响
+    assert len(investigation.evidence) == 2
+    assert set(investigation.state["claims"]) == set(GENERIC_REQUIRED)
+
+    # Transcript 留痕:host_compaction 事件带 usage
+    events = [json.loads(line) for line
+              in transcript.read_text(encoding="utf-8").splitlines()]
+    compaction = [e for e in events if e["phase"] == "host_compaction"]
+    assert len(compaction) == 1
+    assert "压缩" in compaction[0]["content"]
+
+    # 预算:llm_calls = 3 个语义步 + 1 次压缩;压缩不计 validated_rounds
+    document = _ledger_document(tmp_path)
+    assert document["llm_calls"] == 4
+    assert document["validated_rounds"] == 3
+
+
+def test_compaction_blocked_by_budget_saves_scene_without_extra_request(
+        tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    budget = _budget(tmp_path, max_llm_calls=2)
+    tracer = HostAnalysisTracer(tmp_path, {"read_file": tool}, budget=budget)
+    candidate = tracer.add_candidate({"target": "extracted/etc/device.conf"})
+    transcript = tmp_path / "transcripts" / "transcript.jsonl"
+    context = ContextManager(
+        ANALYSIS_SESSION_SYSTEM, "", max_est_tokens=200, trigger_ratio=0.5)
+    session = AgentSession(
+        "analysis", ScriptedLLM(_compaction_script()), context,
+        transcript=transcript)
+
+    with pytest.raises(BudgetExhaustedError, match="llm_calls"):
+        tracer.run_analysis(candidate.candidate_id, session)
+
+    # 预算不足不多发请求:两个语义步之后压缩请求被拒,无第三次模型调用
+    document = _ledger_document(tmp_path)
+    assert document["llm_calls"] == 2
+    investigation = tracer.investigation_for(candidate.candidate_id)
+    assert investigation.lifecycle_status == "investigating"
+    events = [json.loads(line) for line
+              in transcript.read_text(encoding="utf-8").splitlines()]
+    assert not [e for e in events if e["phase"] == "host_compaction"]
+
+
+def test_compaction_failure_restores_context_and_run_continues(
+        tmp_path: Path) -> None:
+    class CompactionBoomLLM(ScriptedLLM):
+        """压缩请求(带 max_tokens=4096)失败,语义步正常。"""
+
+        def chat(self, messages, **kw):
+            if kw.get("max_tokens") == 4096:
+                self.calls.append(list(messages))
+                raise RuntimeError("压缩请求失败")
+            return super().chat(messages, **kw)
+
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    budget = _budget(tmp_path)
+    tracer = HostAnalysisTracer(tmp_path, {"read_file": tool}, budget=budget)
+    candidate = tracer.add_candidate({"target": "extracted/etc/device.conf"})
+    context = ContextManager(
+        ANALYSIS_SESSION_SYSTEM, "", max_est_tokens=200, trigger_ratio=0.5)
+    session = AgentSession(
+        "analysis",
+        CompactionBoomLLM(_compaction_script()[:2] + [
+            _session_reply({"admission_reason": "ready"}, "submit_case")]),
+        context, transcript=None)
+
+    investigation = tracer.run_analysis(candidate.candidate_id, session)
+
+    # 压缩失败还原保留区(前两轮完整保留,第三轮照常追加),调查照常收尾
+    assert investigation.lifecycle_status == "ready_for_verification"
+    assert context.compactions == 0
+    assert len(context.recent) == 6  # 两轮动作 + 第三轮观察/回复,零丢失
+    document = _ledger_document(tmp_path)
+    assert document["llm_calls"] == 3  # 失败的压缩请求不记账

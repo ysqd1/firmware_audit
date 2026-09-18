@@ -1,26 +1,28 @@
-"""Step5 入口:Orchestrator 统一编排三 Agent + 断点续跑 + 无 key/API 失败立即终止。
+"""Step5 入口:Host 控制的逐 Candidate 调查生命周期(ADR-0012,票 14 公开切换)。
 
-控制流(v3,2026-08-28,参考 deepaudit OrchestratorAgent 精简版):
-    Orchestrator(轻量 LLM 驱动,ReAct 循环)
-      → dispatch recon → survey.json(v3) → dispatch analysis
-      → findings.json → dispatch verification → verified_findings.json
-      → summarize(取报告素材)→ Final Answer = 最终报告 → orchestrator/report.md
+控制流(RunDriver,唯一真实循环):
+    世代选择/活动锁/配置快照/共享预算
+      → Recon(攻击面 survey + Candidate proposals + coverage gaps)
+      → Candidate Store(精确指纹去重 + 语义比较 + 评分双队列)
+      → 逐 Candidate Analysis(独立 Investigation,Claim/假设门槛,案卷冻结)
+      → Verification(独立复核会话,逐 Claim Result,Host 聚合 verdict)
+      → confirmed → Finding → 确定性事实报告 → manifest seal → completed
 
-编排痕迹:
-    process/agent/orchestrator/  {transcript, dispatch_log, handoff_*, report.md, result.json}
-    process/agent/<seq>_<type>/   子 Agent 的 transcript/obs/工件(如 0_recon/)
+工件根:工作区 generations/gen-XXXX/(manifest/run_state/config/candidates/
+investigations/<cand>/、verifications/<cand>/、findings.json、report.md)。
+旧版 survey.json / findings.json / verified_findings.json 语义不迁移也不读取;
+旧工作区显式新建运行世代重跑(AC:新流程不读写旧三种结果工件)。
 
-最终报告: 由 orchestrator 的 summarize 动作产出(orchestrator/report.md);
-未产出时明确告警,不静默降级(原 render_report 已删除)。
-
-断点续跑:某子 Agent .json 工件存在即跳过;仅 .md 降级工件 → degraded(默认重跑,
-STEP5_RESUME_DEGRADED=0 关闭);上游缺件时下游被链路守卫拒绝(不空转)。
+断点续跑:默认恢复唯一未完成世代(running/finalizing);completed 只读;
+--force = 创建新运行世代(兼容既有操作习惯,不再原地覆盖)。
 
 用法:
     python -m firmware_audit.step5_agent.run_step5 <dir> [--force]
     <dir> 可以是 target/<N>(内含 process/)或工作区本身(process/ 等价目录)
-环境变量:见 llm_client(FIRMWARE_AUDIT_LLM_API_KEY 等;无 key 或 API 调用失败均立即终止,不做降级)。
-密钥文件:firmware_audit/.env(LLMClient 构造时自动加载,环境变量优先于文件)。
+环境变量:模型见 llm_client(FIRMWARE_AUDIT_LLM_*);预算/轮次见 host/budget
+(STEP5_RECON/ANALYSIS/VERIFICATION_MAX_ITERS、STEP5_MAX_LLM_CALLS 等)。
+无 API key 或 API 调用失败立即终止,不产出降级工件、不做 CVE 缓存预检
+(Blind Discovery,ADR-0012)。
 """
 from __future__ import annotations
 
@@ -28,9 +30,23 @@ import argparse
 import sys
 from pathlib import Path
 
-from .orchestration.orchestrator import Orchestrator
+from .engine.context import ContextManager
+from .host import ANALYSIS_SESSION_SYSTEM, RunDriver, RunSummary
+from .host.recon import RECON_SESSION_SYSTEM
+from .host.session import AgentSession
+from .host.verification import VERIFICATION_SESSION_SYSTEM
 from .providers.llm_client import LLMClient, LLMError
-from .providers.tools.cve_bin_tool_scan import cve_cache_preflight_warning
+from .providers.tools import make_tools
+from .providers.tools.base import ToolContext
+
+# 角色 → (系统提示词, transcript 所在权威树)。目录形状与各 runner 的
+# Investigation/Verification 布局同构:recon → investigations/recon/;
+# analysis → investigations/<cand>/;verification → verifications/<cand>/。
+_ROLE_WIRING = {
+    "recon": (RECON_SESSION_SYSTEM, "investigations"),
+    "analysis": (ANALYSIS_SESSION_SYSTEM, "investigations"),
+    "verification": (VERIFICATION_SESSION_SYSTEM, "verifications"),
+}
 
 
 def resolve_workspace(path: Path) -> Path:
@@ -68,75 +84,84 @@ def _no_key_error() -> LLMError:
         f"保存后直接重跑即可(自动加载,无需手动导出环境变量)")
 
 
-def _tool_counts(tool_calls: list) -> dict[str, int]:
-    """子 Agent 工具调用统计:{工具名: 次数}(无工具给空表)。"""
-    counts: dict[str, int] = {}
-    for c in tool_calls:
-        counts[c.get("tool", "?")] = counts.get(c.get("tool", "?"), 0) + 1
-    return counts
+def _transcript_path(run_dir: Path | None, role: str,
+                     candidate_id: str | None) -> Path | None:
+    """各 Session 的 transcript 落在各自权威目录内(与 Evidence 同根;
+    ADR-0012:复核目录保存 Transcript)。recon 无 candidate_id,固定
+    investigations/recon/。"""
+    if run_dir is None:
+        return None
+    _, tree = _ROLE_WIRING[role]
+    owner = candidate_id if candidate_id is not None else "recon"
+    return Path(run_dir) / tree / owner / "transcript.jsonl"
+
+
+def _session_factory(llm):
+    """生产 Session 工厂:角色系统提示词 + 世代内 transcript 路径。
+
+    每个 Candidate/案卷一个独立 Agent Session(上下文隔离铁律);
+    工具授权由 Host 按角色契约逐动作把关,工厂不做权限过滤。"""
+    def factory(role: str, candidate_id: str | None = None,
+                run_dir: Path | None = None) -> AgentSession:
+        system, _ = _ROLE_WIRING[role]
+        return AgentSession(
+            role, llm,
+            ContextManager(system, ""),
+            transcript=_transcript_path(run_dir, role, candidate_id),
+        )
+    return factory
+
+
+def _print_summary(summary: RunSummary, report: Path) -> None:
+    lines = [
+        f"[step5] 世代 {summary.generation}({summary.gen_dir})",
+        f"[step5] 状态: {summary.status}"
+        + (f"(停止原因: {summary.stop_reason})" if summary.stop_reason else ""),
+        f"[step5] Candidate {summary.candidates} 条,Finding {summary.findings} 条",
+    ]
+    if summary.status == "completed":
+        lines.append(f"[step5] 完成,报告: {report}")
+    print("\n".join(lines))
 
 
 def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
-    """跑完整 Step5(Orchestrator 统一编排)。返回摘要 dict(stages/report/
-    cve_cache_warning,后者为 CVE 缓存预检结论,缓存就绪时为 None)。
-    无 API key 或 API 调用失败时抛 LLMError(立即终止,不做降级)。
+    """跑完整 Step5(Host 控制生命周期)。返回摘要 dict(mode/generation/
+    status/stop_reason/report/findings/candidates);判读细节以世代目录内
+    工件为准。无 API key 或 API 调用失败时抛 LLMError(立即终止,不降级);
     llm 用于测试注入(ScriptedLLM);None 时按环境变量建 LLMClient。
-    唯一路径=LLM 编排(ADR-0006:pipeline 快速模式已删,所有运行都产报告)。"""
+
+    Blind Discovery(ADR-0012):启动不做 CVE 缓存预检,不带 cve_cache_warning。
+    """
     process_dir = resolve_workspace(Path(target_dir))
     # 启动门(ADR-0011):只需解包产物——Agent 直接面向解包树工作,反编译
     # 边车由 ghidra_decompile 按需产出;老工作区已有 analysis/ 照样放行(当缓存)
     if not (process_dir / "extracted").is_dir():
         raise FileNotFoundError(f"工作区无 extracted/ 解包产物: {process_dir}(先跑 Step1 解包)")
 
-    # 启动预检(2026-09-11 票01,票19 回归修复):当前公开入口仍是带 CVE 工具的
-    # legacy orchestrator,缓存库缺失只告警不阻断;不告警时 recon 会在码 40
-    # "Database does not exist" 三连败后静默放弃,全审计无 CVE 数据且结束也无人
-    # 知晓。Host 公开切换(票 14)时随盲发现规则一并移除,不保留双模式。
-    cache_warn = cve_cache_preflight_warning(process_dir)
-    if cache_warn:
-        print(f"[step5] {cache_warn}", file=sys.stderr)
-
     base = llm or LLMClient()
     if not base.available:
         raise _no_key_error()
 
-    orch = Orchestrator(process_dir, base, force=force)
-    orch.run()
-
-    stages = {
-        name: {
-            "ok": sub.ok,
-            "error": sub.error,
-            "steps": sub.steps,
-            "tool_calls": _tool_counts(sub.tool_calls),
-        } for name, sub in orch.agent_results.items()
-    }
-
-    # LLM 用量:编排器与子 Agent 共享 base_llm,total_usage 已累计全部调用
-    # (2026-08-29 B2:此前仅按 sub.usage 累加,skipped/degraded 实例 usage 为空,
-    # 且 orchestrator 自身轮次从不计入——打印误导为 0)
-    usage_total = dict(getattr(base, "total_usage", {}))
-    tool_total: dict[str, int] = {}
-    for sub in orch.dispatches:  # 全部实际执行的调度(含同类型多次调用)均计入
-        for tool, n in _tool_counts(sub.tool_calls).items():
-            tool_total[tool] = tool_total.get(tool, 0) + n
-
-    report = orch.report_path
-    if report is None:
-        print("[step5] 警告: 编排未产出总结报告(orchestrator 未调用 summarize "
-              "或 Final Answer 为空);报告生成不完整。findings 与各阶段统计已完整"
-              "保留在 process/agent/orchestrator/result.json,可补跑再编排",
-              file=sys.stderr)
-    else:
-        print(f"[step5] 完成,报告: {report}"
-              f"(LLM 用量: {usage_total},工具调用: {tool_total})")
+    driver = RunDriver(
+        process_dir,
+        tools=make_tools(ToolContext(process_dir=process_dir)),
+        session_factory=_session_factory(base),
+        llm=base,
+        process_dir=process_dir,
+    )
+    summary = driver.run(force=force)
+    report = summary.gen_dir / "report.md"  # 报告路径单一出处(host/reporting 布局)
+    _print_summary(summary, report)
     return {
-        "mode": "llm",
-        "stages": stages,
-        "usage": usage_total,
-        "tool_calls": tool_total,
-        "report": str(report) if report else None,
-        "cve_cache_warning": cache_warn,
+        "mode": "host",
+        "generation": summary.generation,
+        "gen_dir": str(summary.gen_dir),
+        "created": summary.created,
+        "status": summary.status,
+        "stop_reason": summary.stop_reason,
+        "report": str(report) if report.exists() else None,
+        "findings": summary.findings,
+        "candidates": summary.candidates,
     }
 
 
@@ -144,7 +169,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Step5 Agent 审计(可独立于 Step1-4 复跑)")
     ap.add_argument("target_dir", type=Path,
                     help="target/<N> 目录或工作区目录(含 process/ 或本身即 process 等价)")
-    ap.add_argument("--force", action="store_true", help="忽略已有工件,全部重跑")
+    ap.add_argument("--force", action="store_true",
+                    help="创建新运行世代(默认恢复未完成世代,已完成世代只读)")
     args = ap.parse_args(argv)
 
     try:
@@ -155,7 +181,8 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as e:
         print(f"[step5] 无法启动: {e}", file=sys.stderr)
         return 2
-    print(f"[step5] mode={summary['mode']} report={summary['report']}")
+    print(f"[step5] mode={summary['mode']} generation={summary['generation']} "
+          f"report={summary['report']}")
     return 0
 
 

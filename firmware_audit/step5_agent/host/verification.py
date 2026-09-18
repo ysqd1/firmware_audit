@@ -68,6 +68,7 @@ from .store import (
     store_error_boundary,
 )
 from .tooling import (
+    compact_session_context,
     execute_tool,
     json_clone_or_reject,
     normalize_tool_arguments,
@@ -564,6 +565,85 @@ def build_case_brief(
     return clone_json_value(brief, "复核简报")
 
 
+# ---- 逐 Claim 检查清单(ADR-0012 2026-09-16 D4)----
+
+CHECKLIST_SCHEMA_VERSION = 1
+
+
+def checklist_path(run_dir: Path, candidate_id: str) -> Path:
+    return Path(run_dir) / "verifications" / candidate_id / "checklist.json"
+
+
+def build_case_checklist(case_payload: dict[str, Any]) -> dict[str, Any]:
+    """从冻结案卷确定性生成逐 Claim 检查清单与证据入口(零模型请求)。
+
+    清单条目只携带 Profile 的结构性事实(名称/决定性/释义/supported 时必填
+    的 severity facet),不透出 analysis 的判定或说明;证据入口沿用简报的
+    重定位字段并附明示用途。同一案卷重复生成结果逐字节一致(幂等)。
+    """
+    profile = case_payload["claim_profile"]
+    entries = [
+        {key: deepcopy(reference[key]) for key in
+         ("evidence_id", "tool", "arguments", "location", "summary", "digest")
+         if isinstance(reference, dict) and key in reference}
+        for reference in case_payload.get("evidence_references", [])
+        if isinstance(reference, dict)
+    ]
+    items = []
+    for name in required_claims(profile):
+        facet_rules = CLAIM_RESULT_FACETS.get(name, {})
+        item: dict[str, Any] = {
+            "claim": name,
+            "decisive": is_decisive(profile, name),
+            "check": (
+                "独立取证后提交该 Claim 的 Claim Result(judgment/observed/"
+                "method/evidence_ids);supported 与 refuted 必须引用本次复核"
+                "Evidence"),
+        }
+        if facet_rules:
+            item["facets_required_on_supported"] = {
+                facet: list(allowed) for facet, allowed in facet_rules.items()}
+        items.append(item)
+    return clone_json_value({
+        "schema_version": CHECKLIST_SCHEMA_VERSION,
+        "candidate_id": case_payload["candidate_id"],
+        "investigation_id": case_payload["investigation_id"],
+        "claim_profile": profile,
+        "admission_reason": case_payload["admission_reason"],
+        "items": items,
+        "evidence_entries": entries,
+        "evidence_entries_note": (
+            "证据入口只用于重新定位原始材料,不可作为 Verification 的支持证据"),
+        "blocking_gaps": deepcopy(case_payload.get("blocking_gaps", [])),
+    }, "复核检查清单")
+
+
+def load_case_checklist(run_dir: Path, candidate_id: str) -> dict[str, Any] | None:
+    """读取检查清单;缺失返回 None,损坏或身份失约按 Store 语义拒绝。"""
+    path = checklist_path(run_dir, candidate_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise StoreError(
+            f"复核检查清单损坏；请检查原运行目录: {path} ({exc})") from exc
+    if (not isinstance(payload, dict)
+            or payload.get("schema_version") != CHECKLIST_SCHEMA_VERSION
+            or payload.get("candidate_id") != candidate_id
+            or not isinstance(payload.get("items"), list)
+            or not isinstance(payload.get("evidence_entries"), list)):
+        raise StoreError("复核检查清单结构或身份损坏；请检查原运行目录")
+    return payload
+
+
+def save_case_checklist(run_dir: Path, candidate_id: str, checklist: dict[str, Any]) -> Path:
+    """原子落盘检查清单;确定性产物,重复写入幂等。"""
+    path = checklist_path(run_dir, candidate_id)
+    atomic_json(path, checklist)
+    return path
+
+
 def load_findings_document(run_dir: Path) -> dict[str, Any]:
     """读取 findings.json(缺失给空文档);结构损坏按 Store 语义拒绝。
 
@@ -807,6 +887,9 @@ class HostVerificationRunner:
             self._stores[candidate_id] = InvestigationStore(
                 self._run_dir, candidate_id, root="verifications")
         self.tracer.begin_verification(candidate_id)
+        # D4:开复核会话前生成并持久化逐 Claim 检查清单(确定性,零模型请求);
+        # 已存在则校验身份后复用——恢复读取的是同一份清单。
+        self._ensure_case_checklist(candidate_id, case)
 
         verification_id = f"verify-{case['investigation_id']}"
         input_message: str | None = self._case_context_message(candidate_id)
@@ -833,6 +916,9 @@ class HostVerificationRunner:
                         # budget_exhausted 收束,聚合已有结果(缺项→inconclusive)。
                         if runtime["rounds_used"] >= runtime["max_rounds"]:
                             return self._finalize(candidate_id, stop_reason="budget_exhausted")
+                        # Host 显式上下文压缩(ADR-0012 D3):与 analysis 同款,
+                        # 过预算闸、计入台账与 Transcript,不占语义轮次。
+                        compact_session_context(session, self._budget)
                         self._budget.require_llm()
                         if needs_recovery_context:
                             input_message = self._case_context_message(candidate_id)
@@ -1181,11 +1267,25 @@ class HostVerificationRunner:
             observation_view=runtime["observation_view"],
             remaining_rounds=runtime["max_rounds"] - runtime["rounds_used"],
         )
+        checklist = self._ensure_case_checklist(candidate_id, case)
         return (
             "Verification Case（本 Session 只复核此案卷；独立重新取证,"
-            "不依赖 analysis 结论）:\n"
-            + json.dumps(brief, ensure_ascii=False, sort_keys=True)
+            "不依赖 analysis 结论。随附 Host 生成的逐 Claim 检查清单:"
+            "沿正常响应逐项完成检查,不需要专门规划轮次）:\n"
+            + json.dumps({"brief": brief, "checklist": checklist},
+                         ensure_ascii=False, sort_keys=True)
         )
+
+    def _ensure_case_checklist(
+        self, candidate_id: str, case: dict[str, Any],
+    ) -> dict[str, Any]:
+        """检查清单的读取-校验-生成单一出口;缺失时确定性补建并落盘。"""
+        checklist = load_case_checklist(self._run_dir, candidate_id)
+        if checklist is not None:
+            return checklist
+        checklist = build_case_checklist(case)
+        save_case_checklist(self._run_dir, candidate_id, checklist)
+        return checklist
 
     def _validate_action(
         self,
@@ -1268,9 +1368,10 @@ Reference 只用于重新定位原始材料,不能作为你的支持证据。最
 按固定规则聚合,不接受你直接给出的任何总结论。
 
 ## 2 工具纪律
-- 可用与 analysis 同类的取证工具:读盘、搜索、字符串、导入、r2 工具族、
-  按需 Ghidra 与受控沙箱验证;每次工具调用都会形成本次复核的独立 Evidence
-  (Observation View 中的 ev-xxxxxx)。
+- 可用与 analysis 同类的取证工具:读盘、搜索、字符串、导入、
+  find_decompiled_function(读已有反编译边车,毫秒级,不发起 Ghidra)、
+  r2 工具族、按需 Ghidra 与受控沙箱验证;每次工具调用都会形成本次复核的
+  独立 Evidence(Observation View 中的 ev-xxxxxx)。
 - 只有这些本次 Evidence 能支撑 Claim Result;引用其他 ID 会被整份拒绝。
 - 单个工具失败是正常 Observation;判 unresolved 要写明限制,不要编造结果。
 

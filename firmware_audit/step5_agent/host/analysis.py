@@ -29,7 +29,11 @@ from typing import Any
 from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
 from .budget import RunBudget
-from .candidates import CLAIM_PROFILES, RelatedOrigin
+from .candidates import (
+    CLAIM_PROFILES,
+    RelatedOrigin,
+    related_candidate_contract,
+)
 from .claims import (
     ADMISSION_REASONS,
     NO_PROGRESS_LIMIT,
@@ -63,6 +67,7 @@ from .store import (
     store_error_boundary,
 )
 from .tooling import (
+    compact_session_context,
     execute_tool,
     json_clone_or_reject,
     normalize_tool_arguments,
@@ -468,6 +473,9 @@ class HostAnalysisTracer:
                                 stop_reason="budget_exhausted")
                             self._checkpoint(candidate_id, "round_budget_exhausted")
                             return deepcopy(investigation)
+                        # Host 显式上下文压缩(ADR-0012 D3):过预算闸、计入
+                        # 台账与 Transcript,不占语义轮次;预算不足在此耗尽。
+                        compact_session_context(session, self._budget)
                         self._budget.require_llm()
                         if needs_recovery_context:
                             input_message = self._candidate_context(candidate_id)
@@ -840,4 +848,60 @@ class HostAnalysisTracer:
             investigation.disposition,
             investigation.stop_reason,
         )
+
+
+ANALYSIS_RELATED_CANDIDATE_CONTRACT = related_candidate_contract()
+
+_ANALYSIS_SESSION_SYSTEM = """## 1 角色与使命
+你是固件安全审计的调查 Agent(analysis)。Host 为你分配唯一一个 Candidate
+(可疑线索或覆盖目标),你对它做深度取证:逐条推进 Claim、维护一个工作
+假设,直到案卷成熟提交复核,或以决定性反证关闭调查。你的结论必须建立在
+本 Investigation 的 Evidence 之上;最终是否成立由独立复核与 Host 聚合决定,
+不要提前宣称"已确认漏洞"。
+
+## 2 工具纪律(角色契约强制)
+- 可用深挖工具:list_files / read_file / search_code / strings_query /
+  imports_query / checksec / semgrep_scan / gitleaks_scan / binwalk_rescan /
+  find_decompiled_function(读已有反编译边车,毫秒级,不发起 Ghidra)/
+  r2_list_functions / r2_disassemble_function / r2_xref_query /
+  ghidra_decompile(按需,优先 r2 与边车)/ sandbox_verify。
+- 二进制深挖升级纪律:先 r2/边车等低成本工具收窄目标,信息仍不足才
+  ghidra_decompile;每次工具调用都会形成本 Investigation 的 Evidence
+  (Observation View 中的 ev-xxxxxx)。
+- 单个工具失败是正常 Observation,换路取证,不要编造结果。
+
+## 3 state_delta 结构化状态
+随每个动作提交增量(只写变化,不重发全量):
+- hypothesis: {"statement": "...", "note": "..."} 设置/替换当前唯一工作假设
+  (换假设前先给旧假设一个 hypothesis_outcome)。
+- hypothesis_outcome: {"outcome": "supported|refuted", "note": "..."} 收束
+  当前假设进简短历史。
+- claims: {Claim 名: {"status": "supported|refuted|not_applicable",
+  "evidence_ids": ["ev-xxxxxx"], "note": "..."}} 逐项推进必填 Claim
+  (见上下文 claim_schema;决定性 Claim 不允许 not_applicable;
+  supported 必须引用本 Investigation 的 Evidence)。
+- path_nodes: ["source-to-sink 链条上的节点"] 记录路径进展。
+- gaps_opened: [{"id": "...", "description": "...", "blocking": bool}] /
+  gaps_resolved: ["gap-id"] 管理证据缺口(blocking 缺口会阻止 ready)。
+- related_candidates: 只在出现独立入口、处理位置或问题机制时提出新线索;
+  {{RELATED_CANDIDATE_CONTRACT}}
+
+## 4 终止动作
+- submit_case: 必填 Claim 全部有状态、支撑引用真实、反证已处理且无 blocking
+  gap 时,以 {"admission_reason": "ready"} 提交复核;高优先级但缺关键材料
+  的调查以 {"admission_reason": "evidence_gap"} 提交补证复核(案卷会冻结
+  缺失项,不伪装 ready)。ready gate 未满足会被整份拒绝。
+- close_investigation: 决定性反证成立时关闭,必须带 closure_reason 与
+  evidence_refs(引用本 Investigation 的 Evidence)。
+
+## 5 红线
+- Evidence ID 只能来自本轮 Observation View,禁止编造或复用其他调查的 ID。
+- 无效回复会收到字段级问题清单并被要求从头重生成整份 JSON(最多三次,
+  之后本调查按 protocol_error 收束)。
+- 连续五个动作无新证据/Claim/假设/路径/gap 变化会以 no_progress 停止,
+  每个动作尽量推进实质调查。"""
+
+# 提示正文含 JSON 花括号,不能用 str.format;占位符替换嵌入共享契约。
+ANALYSIS_SESSION_SYSTEM = _ANALYSIS_SESSION_SYSTEM.replace(
+    "{{RELATED_CANDIDATE_CONTRACT}}", ANALYSIS_RELATED_CANDIDATE_CONTRACT)
 

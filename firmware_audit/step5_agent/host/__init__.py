@@ -13,6 +13,7 @@ overlay;公开入口切换由后续工单继续内聚在本包。
 """
 
 from .analysis import (
+    ANALYSIS_SESSION_SYSTEM,
     DEFAULT_ANALYSIS_MAX_ROUNDS,
     Candidate,
     HostAnalysisTracer,
@@ -130,6 +131,7 @@ from .session import (
     revalidate_proposal,
 )
 from .verification import (
+    CHECKLIST_SCHEMA_VERSION,
     CLAIM_RESULT_JUDGMENTS,
     DEFAULT_VERIFICATION_MAX_ROUNDS,
     FINDING_SCHEMA_VERSION,
@@ -142,11 +144,14 @@ from .verification import (
     aggregate_verdict,
     apply_verification_delta_plan,
     build_case_brief,
+    build_case_checklist,
     build_finding_payload,
+    load_case_checklist,
     load_cases,
     load_findings_document,
     plan_verification_queue,
     resolve_verification_max_rounds,
+    save_case_checklist,
     validate_verification_delta,
 )
 
@@ -157,6 +162,7 @@ __all__ = [
     "ADMISSION_REASONS",
     "AgentSession",
     "aggregate_verdict",
+    "ANALYSIS_SESSION_SYSTEM",
     "ANALYST_NOTES_HEADING",
     "apply_verification_delta_plan",
     "assert_lifecycle_transition",
@@ -165,6 +171,7 @@ __all__ = [
     "BudgetExhaustedError",
     "BudgetLedger",
     "build_case_brief",
+    "build_case_checklist",
     "build_case_payload",
     "build_evidence_index",
     "build_fact_report",
@@ -207,6 +214,7 @@ __all__ = [
     "is_decisive",
     "LIFECYCLE_STATUSES",
     "list_generations",
+    "load_case_checklist",
     "load_cases",
     "load_config_snapshot",
     "load_findings_document",
@@ -245,10 +253,12 @@ __all__ = [
     "REVIEW_SCHEMA_VERSION",
     "ReviewError",
     "ReviewOverlay",
+    "CHECKLIST_SCHEMA_VERSION",
     "RUN_STATE_SCHEMA_VERSION",
     "RunBudget",
     "RunDriver",
     "RunSummary",
+    "save_case_checklist",
     "save_run_state",
     "seal_run",
     "SealError",

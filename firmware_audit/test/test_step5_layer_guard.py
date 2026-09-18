@@ -1,22 +1,20 @@
-"""step5_agent 依赖分层守护测试(ADR-0009:分层规则机器化)。
+"""step5_agent 依赖分层守护测试(ADR-0009 起源;ADR-0012 公开切换后收敛)。
 
-"engine/data/providers 互不 import、依赖只准向下"原是 AGENTS.md 里的
-文档约定,靠自觉;本文件用 AST 扫描 step5_agent 全部 .py 的 import 边
-(含函数级延迟导入),把规则升级为断言,违规即红:
+"engine/providers 互不 import、依赖只准向下"原是 AGENTS.md 里的文档约定,
+靠自觉;本文件用 AST 扫描 step5_agent 全部 .py 的 import 边(含函数级延迟
+导入),把规则升级为断言,违规即红:
 
-    入口(run_step5 / 包根 __init__ / demos 演示子包)
-      → orchestration(编排层包)
-      → runner / aggregator(单实例执行 / 聚合纯逻辑)
-      → engine / data / providers(叶子三包:互不 import、不向上)
+    入口(run_step5 / 包根 __init__)
+      → host(ADR-0012 Host 控制层,唯一控制边界)
+      → engine / providers(叶子两包:互不 import、不向上)
 
 - 跨单元边只准向下(目标层级序严格大于源);同单元(包内)边不受限;
   入口层是顶层,可引任意单元
-- 票面点名两条红线单独断言,失败信息直白:runner 永不 import
-  orchestration;叶子三包两两互不依赖
+- 叶子两包两两互不依赖单独断言,失败信息直白
 - 新顶层模块必须先在 TIER 登记层级,否则守护直接红——层级图变更应是
   显式决策(改本文件),不是悄悄发生
-- 守护范围是 step5_agent 全依赖图,不限于 orchestration 新包;
-  跨子系统引用(firmware_audit.docker/file_rules 等共享工具)不在本图内
+- 旧 orchestration/runner/aggregator/data 已随票 14 公开切换删除:
+  守护反向断言它们不得复活(不留 shim、不双写)
 
 先例:tool_permissions_and_threshold(权限矩阵机器化)。
 """
@@ -32,20 +30,18 @@ PKG_ROOT = Path(__file__).resolve().parents[1] / "step5_agent"
 _PREFIX = ["firmware_audit", "step5_agent"]
 
 # 单元 → 层级序(越小越上层)。'' 是包根 __init__。
-# 层级图来源:ADR-0009;改动这里 = 显式架构决策。
+# 层级图来源:ADR-0009 起,ADR-0012 票 14 收敛;改动这里 = 显式架构决策。
 TIER: dict[str, int] = {
     "": 0,               # step5_agent/__init__(对外只暴露 step5_run)
     "run_step5": 0,      # CLI 入口
-    "demos": 0,          # 演示脚本子包(入口同层;T6 自顶层 demo_display 迁入)
-    "host": 1,           # ADR-0012 Host 控制层(迁移期与 legacy 编排并列)
-    "orchestration": 1,  # 编排层包(ADR-0009)
-    "runner": 2,         # 单 Agent 执行
-    "aggregator": 2,     # findings 聚合纯逻辑
-    "engine": 3,
-    "data": 3,
-    "providers": 3,
+    "host": 1,           # ADR-0012 Host 控制层(唯一控制边界)
+    "engine": 2,
+    "providers": 2,
 }
-_LEAVES = ("engine", "data", "providers")
+_LEAVES = ("engine", "providers")
+
+# 票 14 公开切换删除的 legacy 单元:不得以任何形态复活(不含 __pycache__)。
+_RETIRED_UNITS = ("orchestration", "runner", "aggregator", "data", "demos")
 
 
 def _module_parts(py: Path) -> list[str]:
@@ -111,7 +107,7 @@ def test_dependency_layering() -> list[str]:
         src = _unit(_module_parts(py))
         if src not in TIER:
             fails.append(f"{py.relative_to(PKG_ROOT)}: 未知顶层单元 {src!r}——"
-                         f"先在本文件 TIER 登记层级再引入(ADR-0009)")
+                         f"先在本文件 TIER 登记层级再引入")
             continue
         graph.setdefault(src, set()).update(_import_units(py))
 
@@ -125,58 +121,34 @@ def test_dependency_layering() -> list[str]:
                 continue  # 入口层在顶,可引任意单元
             if dst_tier <= src_tier:
                 fails.append(f"{src or '<pkg>'}(层{src_tier}) → {dst}(层{dst_tier}): "
-                             f"依赖只准向下(ADR-0009 分层),禁止同层/反向")
+                             f"依赖只准向下,禁止同层/反向")
 
-    # 红线一:runner 永不 import orchestration(单实例执行不知道编排的存在)
-    if "orchestration" in graph.get("runner", set()):
-        fails.append("runner 不得 import orchestration(编排只准从入口进入,ADR-0009)")
-
-    # 红线二:叶子三包两两互不依赖
+    # 红线一:叶子两包两两互不依赖
     for a in _LEAVES:
         for b in _LEAVES:
             if a != b and b in graph.get(a, set()):
-                fails.append(f"{a} 不得 import {b}(叶子三包互不依赖,ADR-0009)")
+                fails.append(f"{a} 不得 import {b}(叶子两包互不依赖)")
 
-    # 接线存在性:入口必须经 orchestration 编排(防迁移中悄悄断链)
-    if "orchestration" not in graph.get("run_step5", set()):
-        fails.append("run_step5 应 import orchestration(入口 → 编排层接线,ADR-0009)")
+    # 红线二:入口必须经 host 控制层接线(防公开入口绕过 Host 直连叶子循环)
+    if "host" not in graph.get("run_step5", set()):
+        fails.append("run_step5 应 import host(公开入口 → Host 控制层接线,ADR-0012)")
     return fails
 
 
-def test_no_legacy_top_level_orchestrator() -> list[str]:
-    """旧顶层编排器模块不复活:不留兼容 shim,单一 import 路径(ADR-0009)。"""
+def test_retired_legacy_units_stay_deleted() -> list[str]:
+    """票 14 公开切换删除的 legacy 单元不得复活:不留 shim、不双写、不双模式。"""
     fails: list[str] = []
-    if (PKG_ROOT / "orchestrator.py").exists():
-        fails.append("firmware_audit/step5_agent/orchestrator.py 不应存在——"
-                     "编排器已整体迁入 orchestration/ 包,不设顶层 shim(ADR-0009)")
-    if not (PKG_ROOT / "orchestration" / "orchestrator.py").is_file():
-        fails.append("orchestration/orchestrator.py 缺失——T1 整体迁移被破坏")
-    if not (PKG_ROOT / "orchestration" / "__init__.py").is_file():
-        fails.append("orchestration/__init__.py 缺失——包不成立")
-    return fails
-
-
-def test_orchestration_internal_edges() -> list[str]:
-    """编排包内边守护(T4/T5):state/dispatch_log/handoff/actions/verify_phase
-    不得 import 编排主体 orchestrator——orchestrator 装配动作类、被动作回调,
-    环由 state 切断,import 必须单向 orchestrator → actions/verify_phase →
-    handoff → state(ADR-0009)。"""
-    fails: list[str] = []
-    for name in ("state", "dispatch_log", "handoff", "actions", "verify_phase"):
-        py = PKG_ROOT / "orchestration" / f"{name}.py"
-        if not py.is_file():
-            continue  # 未到票的模块尚不存在,不空守护
-        tree = ast.parse(py.read_text(encoding="utf-8-sig"))
-        for node in ast.walk(tree):
-            targets = []
-            if isinstance(node, ast.ImportFrom) and node.module:
-                targets = [node.module]
-            elif isinstance(node, ast.Import):
-                targets = [a.name for a in node.names]
-            for t in targets:
-                if t.split(".")[-1] == "orchestrator":
-                    fails.append(f"orchestration/{name}.py 不得 import orchestrator"
-                                 "(包内依赖无环:环由 state 切断,反向边即环复活,ADR-0009 T4)")
+    for unit in _RETIRED_UNITS:
+        if (PKG_ROOT / unit).exists():
+            fails.append(
+                f"step5_agent/{unit} 不应存在——旧控制流已随票 14 公开切换删除,"
+                f"不保留兼容 shim 或双模式(ADR-0012)")
+    for name in ("runner.py", "aggregator.py", "orchestrator.py"):
+        if (PKG_ROOT / name).exists():
+            fails.append(f"step5_agent/{name} 不应存在——legacy 单文件不得复活")
+    if (PKG_ROOT / "engine" / "react_loop.py").exists():
+        fails.append("engine/react_loop.py 不应存在——内藏完整循环的旧 ReAct "
+                     "状态机已由 Host 逐步 Agent Session 取代(ADR-0012)")
     return fails
 
 
@@ -184,8 +156,7 @@ def test_main() -> int:
     failures = 0
     for name, fn in (
         ("dependency_layering", test_dependency_layering),
-        ("no_legacy_top_level_orchestrator", test_no_legacy_top_level_orchestrator),
-        ("orchestration_internal_edges", test_orchestration_internal_edges),
+        ("retired_legacy_units_stay_deleted", test_retired_legacy_units_stay_deleted),
     ):
         fl = fn()
         if fl:

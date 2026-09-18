@@ -137,8 +137,9 @@ class RunDriver:
     ):
         self.root = Path(root)
         self.tools = dict(tools)
-        # session_factory(role, candidate_id=None) -> 全新 Session;每个
-        # Candidate/案卷一个独立 Session(上下文隔离铁律)。
+        # session_factory(role, candidate_id=None, run_dir=None) -> 全新
+        # Session;每个 Candidate/案卷一个独立 Session(上下文隔离铁律),
+        # run_dir 为当前世代目录(公开入口按它放置 transcript)。
         self._session_factory = session_factory
         self._llm = llm
         self.process_dir = Path(process_dir)
@@ -148,6 +149,8 @@ class RunDriver:
         self._clock = clock or time.monotonic
         self._phase: str | None = None
         self._finalizing = False
+        # 当前运行世代目录;session_factory 按它放置各 Session 的 transcript。
+        self._run_dir: Path | None = None
 
     # ---- 公开入口 ----
 
@@ -236,6 +239,7 @@ class RunDriver:
         fresh_config = resolve_effective_config(
             explicit=self._explicit, env=self._env, profile=self._profile)
         name, gen_dir, created = self._select_generation(force)
+        self._run_dir = gen_dir
         state = load_run_state(gen_dir)
         if state is not None and state["status"] not in ("running", "finalizing"):
             raise StoreError(
@@ -413,7 +417,10 @@ class RunDriver:
         save_run_state(gen_dir, status="running", phase=phase)
 
     def _session(self, role: str, candidate_id: str | None = None):
-        return self._session_factory(role, candidate_id)
+        # run_dir 一并下发:生产 factory 按世代目录放置 transcript(公开
+        # 切换,票 14);测试替身按需忽略。
+        return self._session_factory(
+            role, candidate_id, run_dir=self._run_dir)
 
     def _register_selected(
         self, tracer: HostAnalysisTracer, payload: dict[str, Any],

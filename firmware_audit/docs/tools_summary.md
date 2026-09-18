@@ -2,6 +2,8 @@
 
 > **⚠ 过时声明（2026-09-09）**：本文按 Step0–Step4 批量流水线时代编写。ADR-0010/0011 落地后：Step2/3/4 相关章节（过滤/分类/批量反编译/分诊/fileinfo）已随代码删除；xref_query 更名 r2_xref_query，新增 r2_list_functions / r2_disassemble_function / ghidra_decompile；strings_query/imports_query 为"边车优先 + r2 兜底"混合型（"不触发重分析"等旧表述作废）。现役工具以代码注册表（providers/tools/）与 CONTEXT.md 术语表为准，本文仅存档。
 
+> **⚠ Step5 章节过时声明（2026-09-18，ADR-0012 票 14 公开切换）**：本文关于 Step5 的章节（三 Agent 权限表、`Orchestrator` 编排、`run_agent`/`AgentRunResult`、`data/prompts.py` 简报、`process/agent/` 工件链、`STEP5_RESUME_DEGRADED`/`STEP5_VERIFY_K`/`STEP5_ORCHESTRATOR_MAX_ITERS` 等变量）全部描述已删除的 legacy 控制流。现行架构：`step5_run` 接 `step5_agent/host/` RunDriver（Recon → Candidate Store → 逐 Candidate Analysis → Verification → Finding → 确定性报告 → 封存，工件根 `process/generations/gen-XXXX/`）；工具权限以 `providers/tools/` 注册契约（`tool_names_for_role`）为准。以 ADR-0012 与 CONTEXT.md 为准。
+
 > 覆盖 `firmware_audit/` 全流水线（Step0–Step5）的可执行工具与核心函数。
 > 本文档逐节对应真实源码，字段/参数/错误码均以代码为准（2026-08-23 核对）。
 > 阅读入口：`main.py` 是流水线总调度；`docker/docker_utils.py` 是全部容器调用的基座。

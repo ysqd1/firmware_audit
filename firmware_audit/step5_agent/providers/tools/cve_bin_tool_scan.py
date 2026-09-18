@@ -48,22 +48,6 @@ def _cache_has_cvedb(cache_dir: Path) -> bool:
     return root.is_dir() and any(root.glob("*.db"))
 
 
-def cve_cache_preflight_warning(process_dir: Path, env=None) -> str | None:
-    """Step5 启动预检(2026-09-11 票01):CVE 缓存无库时返回一行警告,有库返回 None。
-
-    只告警不阻断、不改工具行为(工单定稿:不做自动回退共享库,写并发另议)。
-    没有它,recon 会在码 40 "Database does not exist" 三连败后静默放弃,
-    survey.components=0 全审计无 CVE 数据且运行结束无人知晓(target/5 基线实测)。
-    """
-    cache = resolve_cve_cache_dir(process_dir, env)
-    if _cache_has_cvedb(cache):
-        return None
-    return (f"预检告警: CVE 缓存库缺失({cache}),cve_bin_tool_scan 将报 "
-            f"'Database does not exist' 且 recon 拿不到任何 CVE 数据。"
-            f"修法: 设 {CVE_CACHE_ENV}=firmware_audit/.cve_cache 指向预热共享库"
-            f"(预热命令见 README)")
-
-
 class CveBinToolScanTool(AgentTool):
     name = "cve_bin_tool_scan"
     description = "对单个 ELF 或目录跑已知漏洞扫描(cve-bin-tool,按产品名+版本特征匹配 400+ 检查器)。首跑要下载 CVE 库,较慢。"

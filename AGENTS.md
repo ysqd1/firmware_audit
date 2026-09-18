@@ -10,7 +10,9 @@
 
 > **⚠ 架构现状(2026-09-09,ADR-0010/0011 已落地)**:流水线为 **Step0 → Step1 → Step5**(Step2 过滤/Step3 分类/Step4 批量反编译已删除,`--max-elf`/`--max-workers` 退役)。二进制分析由 Step5 的 r2 工具族(r2_list_functions / r2_disassemble_function / r2_xref_query)与唯一 Ghidra 入口 `ghidra_decompile`(幂等缓存 + sha256 去重)按需完成,升级纪律("先 r2,信息不够才反编译")写入提示词与缺件文案。**本文第一章(Step1-4 流水线角色)与第三章中"读 Step4 产出"的表述已过时,以 [ADR-0010](./docs/adr/0010-step5-r2-ghidra-escalation.md)、[ADR-0011](./docs/adr/0011-remove-step2-3-4.md) 与 CONTEXT.md 术语表为准**(全文重写另行安排)。requirements.md 已删除。
 
-固定 5 步流水线(现 3 步,见上方架构现状)。Step5 架构(2026-08-28 起):**LLM orchestrator 编排**三个子 Agent(recon → analysis → verification),见 [ADR-0001](./docs/adr/0001-step5-orchestrator.md) 与正文"Step5 Agent 审计"章节。早期(2026-08-16)"三 Agent 串行、无 orchestrator、控制流硬编码"的设计已演进。
+> **⚠ Step5 现状(2026-09-18,ADR-0012 票 14 公开切换已落地)**:Step5 公开入口(`step5_run`)已一次切换到 **Host 控制的逐 Candidate 调查生命周期**(Recon → Candidate Store → 逐 Candidate Analysis → Verification → Finding → 确定性报告 → 封存),工件根为 `process/generations/gen-XXXX/`。旧 `orchestration/` 包、`runner.py`、`aggregator.py`、`data/`、`engine/react_loop.py` 已删除;`STEP5_ORCHESTRATOR_MAX_ITERS` / `STEP5_VERIFY_K` / `STEP5_RESUME_DEGRADED` 与 CVE 启动预检已退役。**本文第一章之外,凡描述 LLM orchestrator 编排、survey/findings/verified_findings 三工件、top-K 复核、`process/agent/` 布局的章节均已过时,以 [ADR-0012](./docs/adr/0012-host-controlled-investigation-lifecycle.md)、`step5_agent/host/` 与 CONTEXT.md 术语表为准**。
+
+固定 5 步流水线(现 3 步,见上方架构现状)。
 
 ## 一、【已退役 2026-09-09,ADR-0011】Step1-4 流水线角色(仅存档,代码已删除)
 

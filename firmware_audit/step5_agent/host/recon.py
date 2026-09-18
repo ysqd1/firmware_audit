@@ -47,7 +47,12 @@ from .session import (
     revalidate_proposal,
 )
 from .store import StoreError, atomic_json, read_json_object
-from .tooling import execute_tool, normalize_tool_arguments, regeneration_feedback
+from .tooling import (
+    compact_session_context,
+    execute_tool,
+    normalize_tool_arguments,
+    regeneration_feedback,
+)
 
 DEFAULT_RECON_MAX_ROUNDS = 30
 
@@ -702,6 +707,9 @@ class HostReconRunner:
             while rounds < self.max_rounds:
                 try:
                     if pending is None:
+                        # Host 显式上下文压缩(ADR-0012 D3):与 analysis 同款,
+                        # 过预算闸、计入台账与 Transcript,不占语义轮次。
+                        compact_session_context(session, self._budget)
                         self._budget.require_llm()
                         rounds += 1
                         ctx["rounds"] = rounds

@@ -1,10 +1,12 @@
 """终端监控显示(Claude Code 风格,非流式)。
 
-ReAct 循环的可选观察层:react_loop 在各事件点喂本模块,这里只做格式化
+事件流的可选观察层:控制循环在各事件点喂本模块,这里只做格式化
 与打印,不参与控制流;display=None / NullDisplay 完全 no-op,零侵入
 (铁律:监控不影响执行;显示失败也不改变 Agent 行为)。
+票 14 公开切换后接线对象待 Host 显示工单接入;格式化契约由
+test_step5_display.py 守护。
 
-六类事件(与 react_loop 钩子一一对应):
+六类事件:
   stage(name,label,tools,model,max_iters)   阶段横幅(起计时)
   assistant(step,reply)                     LLM 回复 → 自动拆"思考/调用"行
   observation(step,tool,text,ok,elapsed,truncated,obs_file)
@@ -114,7 +116,7 @@ class TerminalDisplay:
     def _tag(self, step: int, color: str, label: str) -> str:
         return self._c(_DIM, f"[{step:02d}]") + " " + self._c(color, label)
 
-    # ---- 事件方法(react_loop 钩子) ----
+    # ---- 事件方法(观察者契约;Host 显示接线另行工单) ----
 
     def stage(self, name: str, label: str, tools: int, model: str,
               max_iters: int) -> None:

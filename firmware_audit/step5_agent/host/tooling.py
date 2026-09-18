@@ -88,6 +88,29 @@ def regeneration_feedback(detail: str) -> str:
     }, ensure_ascii=False)
 
 
+def compact_session_context(session: object, budget) -> bool:
+    """Host 在语义 step 之间显式检查并触发上下文压缩(ADR-0012 2026-09-16 D3)。
+
+    压缩请求过运行预算闸并计入 llm_calls 与 token(active time 由调用方的
+    活动段覆盖);预算不足时不发起额外请求,由 ``require_llm`` 按运行级耗尽
+    收束。压缩失败(LLM 异常)由 ContextManager 还原保留区,失败请求不记账,
+    调查继续。无 context/compact_context 能力的 Session(测试替身)直接跳过。
+    """
+    context = getattr(session, "context", None)
+    if (context is None
+            or not callable(getattr(context, "needs_compaction", None))
+            or not context.needs_compaction()):
+        return False
+    compact = getattr(session, "compact_context", None)
+    if not callable(compact):
+        return False
+    budget.require_llm()
+    if compact():
+        budget.record_llm_call(getattr(session, "last_usage", None))
+        return True
+    return False
+
+
 def recover_cached_tool(tool: object, arguments: dict[str, Any]) -> ToolResult | None:
     """Cache-aware adapters must explicitly support both probe and safe retry."""
     try:

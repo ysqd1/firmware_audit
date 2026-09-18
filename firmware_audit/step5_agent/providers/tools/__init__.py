@@ -69,7 +69,9 @@ class ToolAuthorizationError(ValueError):
 # 单一审计表：顺序沿用原注册表，角色集合严格来自 ADR-0012。CVE/公开查询
 # 工具保留实现供未来独立模式设计，但 Blind Discovery 三角色均不可见。
 _TOOL_CONTRACTS: tuple[ToolContract, ...] = (
-    ToolContract(FindDecompiledFunctionTool, _NO_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    # find_decompiled_function 读已有反编译边车、不发起 Ghidra(ADR-0012
+    # 2026-09-16 D1):授权 analysis/verification 深挖角色,recon 仍不可见。
+    ToolContract(FindDecompiledFunctionTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(ImportsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(StringsQueryTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(ReadFileTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),

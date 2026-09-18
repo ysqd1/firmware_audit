@@ -7,7 +7,7 @@ Transcript 封装一个 Agent 运行的全部磁盘痕迹:
 
 路径约定:transcript.jsonl 位于 process/agent/<name>/ 下,obs/ 与其同层;
 obs 文件返回相对 process/ 的路径,与 read_file 白名单同根(LLM 可自主分页回读)。
-行为等价自 react_loop 原 _log/_save_obs/_wrap_long_lines(2026-08-18 纯搬迁)。
+行为等价自旧 react_loop 的 _log/_save_obs/_wrap_long_lines(2026-08-18 纯搬迁)。
 """
 from __future__ import annotations
 
@@ -33,9 +33,8 @@ def wrap_long_lines(text: str, width: int = 4000) -> str:
 def reset_transcript(path: Path) -> None:
     """跑前清空 transcript(T6 收编的统一入口):重跑覆盖旧记录。
 
-    runner(子 Agent)与编排层(orchestrator transcript)共用的同源知识——
-    父目录一并创建,清空后由 Transcript.log 以追加模式写事件。
-    """
+    transcript 目录布局(会话自身目录)与 obs/ 同层;obs 文件返回相对
+    process/ 的路径,与 read_file 白名单同根。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("", encoding="utf-8")
 

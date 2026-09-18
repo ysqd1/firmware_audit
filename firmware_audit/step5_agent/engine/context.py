@@ -43,6 +43,9 @@ class ContextManager:
         self.max_est_tokens = max_est_tokens
         self.trigger_ratio = trigger_ratio
         self.compactions = 0
+        # 最近一次压缩请求的用量(prompt/completion tokens);Host 台账消费。
+        # 放在 ContextManager 而非调用方:压缩 LLM 调用发生在这里(ADR-0012 D3)。
+        self.last_compact_usage: dict | None = None
 
     # ---- 消息构建与追加 ----
 
@@ -79,7 +82,7 @@ class ContextManager:
 
         transcript = "\n".join(f"{m['role']}: {m['content']}" for m in old)
         try:
-            summary, _ = llm.chat([
+            summary, usage = llm.chat([
                 {"role": "system", "content": COMPACT_PROMPT},
                 {"role": "user", "content": transcript[-30000:]},
             ], max_tokens=4096)
@@ -89,6 +92,7 @@ class ContextManager:
             return False
         self.summaries.append(summary.strip())
         self.compactions += 1
+        self.last_compact_usage = dict(usage) if isinstance(usage, dict) else None
         return True
 
     def maybe_compact(self, llm) -> bool:

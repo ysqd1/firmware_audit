@@ -443,6 +443,30 @@ class AgentSession:
             trigger_ratio=previous.trigger_ratio,
         )
 
+    def compact_context(self) -> bool:
+        """Host 显式发起的单次上下文压缩请求(ADR-0012 2026-09-16 D3)。
+
+        压缩是独立的一次模型请求:只改写模型上下文(保留区最老一半经 LLM
+        概括并入概括区),不改权威 Investigation State、Evidence 或已保存
+        Transcript;``step`` 的"一次请求一个 Proposal"契约不变。LLM 失败时
+        ContextManager 原样还原保留区并返回 False。用量经
+        ``context.last_compact_usage`` 透出,调用方(Host)负责预算记账。
+        """
+        compacted = self.context.compact(self.llm)
+        if not compacted:
+            return False
+        usage = dict(getattr(self.context, "last_compact_usage", None) or {})
+        self.last_usage = usage
+        self.transcript.log(
+            self.request_count,
+            "host_compaction",
+            "[host] 上下文压缩已执行(第 "
+            f"{self.context.compactions} 次):保留区最老一半已概括并入概括区;"
+            "权威状态与 Evidence 不受影响",
+            usage=usage,
+        )
+        return True
+
     def step(self, input_message: str | None = None) -> ProposalResult:
         """可选回填上一 Observation View/协议错误，再请求一个 Proposal 后暂停。"""
         if input_message is not None:

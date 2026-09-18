@@ -19,8 +19,8 @@ Step1 把固件解包出的文件目录树(`process/extracted/`),只读,是后�
 _Avoid_: 解包根, extracted
 
 **工件 (artifact)**:
-Agent 阶段在 `process/agent/<seq>_<type>/` 下落盘的产物——`survey.json`、`findings.json`、`verified_findings.json`,以及编排痕迹。JSON 解析失败时降级为同名 `.md`。
-_Avoid_: 产出文件, 中间文件
+当前指运行世代目录(`process/generations/gen-XXXX/`)下的机器产物:manifest、run_state、config、Candidate Store、Investigation/Verification 目录、findings.json、report.md 与 Evidence。旧版 `process/agent/<seq>_<type>/` 下的 `survey.json`、`findings.json`、`verified_findings.json` 属旧语义工件,新流程不读取也不迁移,旧工作区需显式新建运行世代重跑。
+_Avoid_: 产出文件, 中间文件, 把旧三工件当作现行输入
 
 **调查工作区产物 (analysis sidecar)**:
 ghidra_decompile 在 `process/analysis/` 下按文件相对路径产出的**边车三件套**(`.c / .strings.json / .imports.json`)——strings_query/imports_query 的边车优先数据源、find_decompiled_function 的读源、semgrep 双扫的 analysis/*.c 路。由 Step5 工具按需产出并幂等缓存(ADR-0010),不再是流水线批量产物;functions.json/meta.json 无工具消费者,不落盘。
@@ -44,47 +44,160 @@ _Avoid_: 把它们当现状说明书
 固定顺序的规则化处理阶段:Step0 预解压/磁盘镜像分区提取 → Step1 引导式解包。纯代码,不依赖 LLM。原 Step2 过滤/Step3 分类/Step4 反编译已决定删除(ADR-0011),反编译降为 Step5 的按需工具(ADR-0010)。
 
 **Step5 (Agent 审计)**:
-LLM 驱动的审计阶段,由一个 orchestrator 编排三个子 Agent(recon→analysis→verification)对解包树与反编译边车做侦查、取证、复核,产出最终报告。
+面向解包树的 LLM 辅助审计阶段。Host 控制 Candidate 到 Investigation、Verification Case 和 Finding 的状态转换,recon、analysis 与 verification 只承担各自的语义研判角色。
+
+**宿主控制层 (Host)**:
+承载 Agent 的确定性控制边界,拥有调查生命周期、预算、工具执行、证据留存与最低证据门槛。LLM 可以提出调查结论,但 Host 会拒绝证据不完整的 confirmed,并在无法继续时保留为 inconclusive。
+_Avoid_: orchestrator(当前由 LLM 参与控制的具体角色), Agent, 工具
 
 **子 Agent (sub-agent)**:
-Step5 的三个执行角色之一,由 orchestrator 通过 `dispatch_agent` 调度。三者在代码里是 `AgentConfig` 的**不同配置实例,非子类**。
+Step5 的三个语义研判角色之一,由 Host 在确定性生命周期内调度。三者是不同角色配置,不是各自拥有控制权的独立层级。
 _Avoid_: 阶段, 子任务(会与 pipeline 阶段混淆)
 
 **recon(侦查 Agent)**:
-第一个子 Agent。对解包固件做中立广度调查,产出攻击面清单(`survey.json`)——只铺面、不深挖、不判级。不授 r2 工具族与 ghidra_decompile(ADR-0010)。
+第一个子 Agent。对解包固件做广度调查与一跳安全研判,在明确调查目标、可疑依据和起始动作后形成 Candidate;多层调用链证明、最终影响和严重度留给后续调查。
 _Avoid_: 侦察, 铺面阶段
 
 **analysis(深度分析 Agent)**:
-第二个子 Agent。基于 recon 的 survey 逐条取证,对疑点下判级并附证据链,产出候选漏洞清单(`findings.json`)。
+围绕一个 Candidate 持续推进 Investigation 的推理角色,负责修正假设、选择下一项取证动作并提出待独立复核的 Claim;它不产生最终复核结论。
 _Avoid_: 取证 Agent(职责是取证但名是 analysis)
 
 **verification(复核 Agent)**:
-第三个子 Agent。最后一道质量闸门:复核 analysis 的每条候选,过滤误报,产出经人工可复验的结论(`verified_findings.json`)。**每疑点一实例**:对排序后前 K 条(K 默认 10)各派一个独立实例、每条 max_iters 降到 8,逐条产 verified finding 聚合回 verified_findings.json;未进入前 K 的疑点进报告独立区段(⚠ 未复核)。ADR-0003。
+独立检查 Investigation 提交的 Claim 与原始工件、Evidence Reference 是否吻合的推理角色,是最终复核结论的唯一产生者。它不继承 analysis 的最终判断、严重度或说服性描述。
 _Avoid_: 复核阶段
 
-**orchestrator(编排器)**:
-Step5 顶层的 LLM 协调层(`orchestration/` 包,ADR-0009;主体在 `orchestration/orchestrator.py`),用 `dispatch_agent`/`summarize`/`finish` 三个动作调度子 Agent,校验顺序门与调度上限,并在 verification 完成后汇总素材、产出最终报告 `orchestrator/report.md`。
-_Avoid_: 协调器, 总调度
+**旧版 orchestrator (legacy orchestrator)**:
+ADR-0012 之前由 LLM 参与阶段推进、结束和报告生成的编排角色。已随票 14 公开切换整体删除(`orchestration/` 包、runner/aggregator 与 top-K/verify-K/LLM 事实报告行为),不保留 shim、双模式或旧行为开关。
+_Avoid_: 把 orchestrator 当作目标架构的控制层, 迁移期兼容入口(已不存在)
 
-**实例 (instance)**:
+**独立复核 (independent verification)**:
+verification 根据待验证 Claim、目标工件和 Evidence Reference 重新取得关键事实,不继承 analysis 的 verdict、severity、confidence 或说服性描述。
+_Avoid_: 二次阅读 finding, 完全盲扫
+
+**旧版实例 (legacy instance)**:
 一次真实执行的子 Agent 运行,落盘在 `process/agent/<seq>_<type>/`(如 `0_recon`),带递增序号 seq 与独立 transcript/obs/工件。
-_Avoid_: 运行, 调用
+_Avoid_: 用它表达目标模型的 Agent Session 或 Investigation
 
 ### 发现链
 
+**调查候选 (Candidate)**:
+足以启动一次独立调查的可证伪疑点,主要由 recon 形成;Investigation 或 verification 发现独立问题时提交候选建议,由 Host 去重并正式创建。它必须包含明确 target、攻击面信号、初始证据与下一步动作,possible source/sink 可以暂时为空,尚不是 finding。
+_Avoid_: 候选漏洞(暗示已经构成漏洞), candidate finding(指 analysis 的旧工件条目)
+
+**信号 Candidate (signal Candidate)**:
+由具体配置、代码、字符串、导入或输入路径信号触发的 Candidate,必须引用形成该信号的初始证据。
+_Avoid_: confirmed issue, finding
+
+**覆盖 Candidate (coverage Candidate)**:
+缺少具体问题信号时,为高价值攻击面建立的深度检查目标。它必须说明目标的入口或安全相关角色,但不声称已经存在缺陷。
+_Avoid_: 弱信号 Candidate, 强制 finding
+
+**攻击面调查 (survey)**:
+单个 recon 对解包树形成的广度记录,包含已检查范围、coverage gaps 与 Candidate proposals。它描述调查覆盖和后续入口,不是 Candidate 的权威存储。
+_Avoid_: inventory(已被 ADR-0011 否决的独立流水线产物), finding
+
+**Candidate Store**:
+Host 校验、去重并分配稳定身份后的 Candidate 权威集合。signal Candidate 的确定性 fingerprint 由目标路径、位置锚点、Claim Profile 与问题机制组成;coverage Candidate 则由目标路径、组件或入口与检查目标组成。只有目标与 Profile 相同但 fingerprint 不同时才做一次语义比较;结果为 same / different / uncertain,只有 same 合并并保留原 proposal 作为 alias。
+_Avoid_: survey.json 内嵌列表, Agent 私有队列
+
+**Candidate ID**:
+Candidate 在单个运行世代内的递增稳定身份,如 `cand-0001`。它不由可变内容或 fingerprint 生成,候选信息补充或 proposal 合并后也不改变。
+_Avoid_: fingerprint(只用于去重), 全局跨运行 ID
+
+**调查 (Investigation)**:
+围绕一个 Candidate 持续追踪假设、证据、反证与待补证据的完整生命周期。一次 Investigation 只负责一个 Candidate,直到确认、排除、证据不足或预算耗尽。
+_Avoid_: analysis 实例(当前实现一次可处理多个疑点), 调度
+
+**工作假设 (working hypothesis)**:
+Investigation 对当前问题机制的可证伪解释,可以为空,同一时刻只保留一个活跃项;被支持、反驳或替换的旧解释进入简短历史。它指导下一项调查动作,不属于最终 Claim。
+_Avoid_: Candidate(调查对象), Claim(待正式证明的主张), 多 Agent 辩论
+
+**调查生命周期 (Investigation Lifecycle)**:
+一个 Investigation 的处理进度,值域为 queued / investigating / ready_for_verification / verifying / finished。它只表达进度,不承担最终 disposition 或 stop reason;高优先级未决调查可从 investigating 经 evidence_gap 案卷直接进入 verifying。
+_Avoid_: Agent 轮次, Candidate Queue
+
+**调查处置 (Investigation Disposition)**:
+Investigation 结束时的结果分类:confirmed / rejected / inconclusive / closed / unresolved / not_started。服务临时中断不产生 disposition,未完成 Investigation 保留原生命周期状态等待恢复。
+_Avoid_: lifecycle status, stop reason
+
+**停止原因 (stop reason)**:
+说明 Investigation 为什么停止的独立字段,如 completed / decisive_refutation / budget_exhausted / no_progress / input_failure。它不替代 disposition 或 verification verdict。
+_Avoid_: 最终结果, 生命周期状态
+
+**关联调查候选 (related Candidate)**:
+调查中发现的独立入口、独立 sink 或独立影响所形成的新 Candidate,保留其来源 Investigation;同一根因或同一攻击路径继续留在原 Investigation。
+_Avoid_: 子 Investigation, 新 finding
+
+**复核案卷 (Verification Case)**:
+Investigation 提交给 verification 的冻结待审对象,由 Candidate 身份、admission reason、待验证 Claim、Evidence Reference、已探索路径、前置条件与预期影响组成。admission reason 区分已满足门槛的 ready 与需补齐材料的 evidence_gap;Verifier 不修改原案卷。
+_Avoid_: 裸 Candidate(证据不足以复核), candidate finding
+
+**补证复核案卷 (evidence-gap case)**:
+高优先级未决调查在正常完整度门槛之外进入独立复核的 Verification Case,必须显式列出缺失 Claim 与已知限制。Verifier 如用本次独立取得的 Evidence Reference 支持全部必填 Claim,仍可得到 confirmed;否则为 inconclusive。
+_Avoid_: 普通 ready 案卷, 自动降级结论
+
+**调查状态 (Investigation State)**:
+跨 LLM 对话保存的结构化调查记忆,包含工作假设、Claim、Evidence Reference、已探索路径、缺失证据与下一项动作。Related Candidate 只继承相关状态、证据和来源关系,不复制旧聊天记录。
+_Avoid_: Transcript(完整留痕但不作为工作记忆), 对话上下文
+
+**Investigation Store**:
+每个 Investigation 的追加事件历史与当前状态投影。追加事件是权威历史,状态快照记录 last_event_seq 并可由后续事件重建;二者不并列充当相互冲突的真值。
+_Avoid_: 数据库(第一版不需要), 只保存最终结果
+
+**运行世代 (run generation)**:
+同一工作区内一次完整审计的独立结果边界。未完成世代默认恢复,已完成世代保持不变;重新审计必须显式创建新世代。
+_Avoid_: 覆盖重跑, 把运行标识当作 Candidate 身份
+
+**封存运行 (sealed run)**:
+所有 Candidate 均有处理记录、必需复核已完成、事实报告与工件 digest 已生成的已完成运行世代。封存后机器工件不可修改,后续人工或 Codex 复核只能通过独立覆盖层表达。
+_Avoid_: 仅 Agent 执行结束, 可原地修改的结果
+
+**复核覆盖层 (review overlay)**:
+对封存运行中的 machine result 追加的独立复核记录,保存复核者、时间、目标字段、原值、新值、理由与 Evidence Reference。它不改写原始机器结果。
+_Avoid_: 直接编辑封存 JSON, machine result
+
+**主张 (Claim)**:
+Investigation 中需要由 Evidence Reference 支持或反驳的可证伪陈述,状态为 unassessed / supported / refuted / not_applicable。所有调查使用通用 Claim,并按问题类型选择额外的 Claim Profile。
+_Avoid_: hypothesis(指导当前调查方向), finding(复核后的最终问题)
+
+**主张结果 (Claim Result)**:
+Verifier 对单项 Claim 的独立复核记录,包含 supported/refuted/unresolved/not_applicable 评价、实际观察、复核证据、验证方法与限制。Host 由全部必填 Claim Results 聚合最终 verdict。
+_Avoid_: finding, 自由文本 rationale
+
+**主张模板 (Claim Profile)**:
+Host 用来检查 Investigation 完整度的固定 Claim 集合。第一版只有数据传播、配置、凭据处理、内存处理四类与受限 `generic`;目标、根因、触发或暴露关系及实际影响是共同决定性 Claim,前置条件与缓解因素是非决定性必填 Claim。
+_Avoid_: 固定 source/sink 表, LLM 自由字段
+
+**证据引用 (Evidence Reference)**:
+指向某次真实工具 Observation 及其原始工件的运行内递增稳定标识,如 `ev-000001`。每次工具调用都有独立身份,即使返回内容相同也不合并;原文 SHA-256 用于完整性校验,不作为身份。原始 Observation 与摘要分离且写入后不可修改,摘要和 Claim 关联可以更新。
+_Avoid_: evidence 文本(当前 finding 中的自由文本摘要), 文件路径
+
 **发现 (finding)**:
-Agent 阶段对某个可疑点的结构化结论,字段含 title/severity/file/func/addr/evidence/cve/confidence/verified/rationale/source_agent/instance_seq(`data/artifacts.py`)。
-_Avoid_: 漏洞(漏洞是结论,不是候选), 可疑点
+verification 确认复核案卷成立后形成的最终安全问题。已排除和未决调查分别留在调查记录中,不属于 finding。
+_Avoid_: candidate finding(旧 analysis 工件条目), verified finding(在新模型中重复表达)
 
-**候选漏洞 (candidate finding)**:
-analysis 产出的、未经复核的 finding,集中在 `findings.json`。
-_Avoid_: 发现, 漏洞
+**旧版候选漏洞 (legacy candidate finding)**:
+当前实现中 analysis 产出的未经复核条目,集中在 `findings.json`;目标模型将其拆为复核案卷、已关闭调查或未决调查。
+_Avoid_: 作为新模型的正式术语
 
-**已验证发现 (verified finding)**:
-verification 复核后的 finding(verified=true/false/存疑),集中在 `verified_findings.json`——编排器总结报告的唯一素材。
+**旧版已验证发现 (legacy verified finding)**:
+当前实现中 verification 复核后的 finding 容器条目;目标模型中 finding 本身已表示确认成立,不再需要 verified 前缀。
+_Avoid_: 作为新模型的正式术语
+
+**调查关闭 (investigation closure)**:
+Investigator 因决定性反证而停止某个 Candidate 的处理,必须保留关闭原因与 Evidence Reference。它不是 verification 产生的 rejected verdict。
+_Avoid_: reject_candidate(会与独立复核的 rejected 混淆), 误报
+
+**未决调查 (unresolved investigation)**:
+因预算、环境或关键材料不足而无法满足普通复核门槛的 Investigation。高优先级项可以补证复核案卷进入 verification,其余保留为可恢复记录。
+_Avoid_: finding, 已排除调查
+
+**已确认问题 (confirmed issue)**:
+输入来源、传播路径、敏感操作、可达条件、限制条件与实际影响均有可追溯证据支持的调查结论。仅证明敏感函数或危险配置存在时仍属于证据不足。
+_Avoid_: verified=true(当前字段可能只表示局部静态事实成立), 高置信度 finding
 
 **误报 (false positive)**:
-verification 判定 verified=false 的候选,必须带 rationale 说明为何是误报,不许静默丢弃。
+Verification Case 因决定性 Claim 被独立反驳而得到 rejected verdict 的评估分类。它必须保留 Claim Result、Evidence Reference 与限制说明,不许静默丢弃。
 
 **疑点 (suspicion / lead)**:
 有待查证的线索:recon 的 `high_risk_areas`(观察点,无判级)、analysis 的候选、被引用的函数/导入/字符串命中。与 finding 不同,疑点是"待查",finding 是"有结论"。
@@ -95,25 +208,34 @@ recon 的 `high_risk_areas` 数组里的条目——一个"高危区域标记,�
 _Avoid_: 发现, 判断(它有判级含义)
 
 **Observation(A 大写,保留英文)**:
-ReAct 循环里工具返回的、入上下文的一段文本(成功时是截断后的 text,失败是 Error 前缀)。这是 Agent 判定的唯一证据来源;其全文落盘在 `obs/step<N>_<tool>.txt`,截断时附 read_file 回读路径。
-_Avoid_: 观察结果, 工具返回(会与 ToolResult 混淆)
+一次真实工具执行产生的有界原始结果,是 Evidence Reference 的来源。Host 在上下文截断前保存其完整文本和结构化数据;大型或二进制产物单独落盘,引用只记路径、大小与 digest。
+_Avoid_: 上下文截断版, 无界容器输出
+
+**Observation View**:
+从原始 Observation 派生、送入 Agent 上下文的有界文本视图。它可以截断并附回读指针,但保留原始字面值,且不是权威证据存储。
+_Avoid_: 原始 Observation, 证据原文
 
 **报告 (report)**:
-orchestrator 在 verification 完成后经 summarize 取素材,由 Final Answer 原样落盘的最终总结报告 `process/agent/orchestrator/report.md`。verification 本身不产报告。
-_Avoid_: 审计结论(那是 result.json), 渲染报告(render_report 已删除)
+Host 从 Finding、复核案卷、未决调查、coverage gaps、Evidence Reference 与运行统计确定性生成的事实文档。固定事实章节后可有独立标注的 Analyst Notes;LLM 说明不能改变结构化结论,缺失时也不影响报告完成。
+_Avoid_: LLM Final Answer 原样落盘, 自由生成的事实表
 
 ### Agent 交互与状态
 
 **ReAct 循环 (ReAct loop)**:
-子 Agent 与 orchestrator 内部的思考-行动循环:Thought → Action → Observation → 下一步;每轮从 LLM 拿回复,经 `protocol.py` 解析为 action/final/fail,再分发工具。设迭代上限、解析失败容忍、同参循环拦截、零工具 Final 拒绝等守卫。
+子 Agent 的逐步协议:decision summary → Action Proposal → Observation View → 下一步。Agent Session 每次产生一个动作建议后暂停,Host 负责校验、执行、持久化原始 Observation,再将视图送回会话。
 _Avoid_: 对话循环, Agent 循环
+
+**Agent Session**:
+一个可逐步驱动的 Agent 语义会话,每次以结构化文本产生 state delta 和唯一 next proposal,不自行执行工具或推进 Investigation Lifecycle。Host 完整校验后才应用该回复,不接受部分状态更新。
+_Avoid_: 完整自主运行器, Host
 
 **轮 (round/step)**:
 ReAct 循环的一次 LLM 调用迭代,记入 transcript 并编号(step 1..max_iters)。
 _Avoid_: 步(step 已用于索引)
 
 **Transcript**:
-一次 Agent 执行的完整留痕 `transcript.jsonl`(输入输出/工具调用/耗时/用量),编排层还有 orchestrator 自己的 transcript。可追溯审计用,不进上下文。
+一次 Agent Session 的完整留痕,包含输入输出、动作建议、耗时与用量。它用于追溯,不是 Investigation State 也不作为恢复时的工作记忆。
+_Avoid_: Investigation State, 恢复快照
 
 **工具 (tool)**:
 Agent 在 Action 里调用的能力,统一 `AgentTool.execute(**kw) → ToolResult` 接口,返回 `{ok, text, data, error, elapsed, raw}`。按数据来源分三类:读盘类(读工作区/边车,毫秒级)、CLI 类(subprocess 调容器内 CLI)、API 类(urllib 调 HTTP);另有唯一的**产物生产工具** ghidra_decompile(调容器并把边车落盘,ADR-0010)。
@@ -136,6 +258,8 @@ _Avoid_: 本地工具, 便宜工具
 **TaskResult(ToolResult 专用名)**:
 工具的通用返回结构,ReAct 循环只消费它,不感知数据来源。字段 `ok/text/data/error/elapsed/raw`(`providers/tools/base.py`)。
 _Avoid_: 工具返回, 结果(太泛)
+
+#### 旧版编排术语(仅用于解释迁移前代码)
 
 **上游工件 (upstream artifact)**:
 交接给某子 Agent 的前序阶段工件:analysis 的上游是 survey.json,verification 的上游是 findings.json。orchestrator 用 `latest_upstream`(orchestration/actions.py 守卫函数)取最近一次已完成调度的工件。缺件时下游调度被拒。
@@ -164,28 +288,83 @@ _Avoid_: 状态, 执行状态
 某类型子 Agent 最新实例的迭代预算快照 `{agent, exhausted, steps, max_iters, pending_count, pending_focuses, overlap_ratio}`,注入 dispatch/summarize 的 Observation 与 dispatch_log/result.json,供 orchestrator 做是否补跑的动态决策。
 _Avoid_: 预算, 剩余轮次(仅含 steps/max_iters)
 
+#### Host 调查术语
+
+**调查预算 (Investigation Budget)**:
+分配给单个 Investigation 的资源边界。模型请求、工具实际尝试、token 与活动执行时间按真实消耗计数,同时单独记录 validated rounds 与 logical tool calls 便于解释。第一版各 Candidate 使用相同固定额度,同时受案例级总额度限制。
+_Avoid_: budget state(当前按 Agent 类型统计), LLM 自定轮数
+
+**调查优先级 (Investigation Priority)**:
+有限预算下安排 Candidate 处理顺序的值,不是问题严重度。signal 与 coverage Candidate 分队排序;前者按外部可达性、输入可控性、高影响操作、路径进展、材料强度减预计成本计分,后者按组件价值、外部暴露程度、尚未检查程度减预计成本计分。各项只取 0/1/2,LLM 提供分项判断与依据,Host 计算总分。
+_Avoid_: severity(仅适用于确认后的问题), LLM 直接输出 high/medium/low
+
+#### 旧版补跑术语(仅用于解释迁移前代码)
+
 **补跑 (re-run / supplementary dispatch)**:
 同一类型子 Agent 的第 2/3 次调度,仅当结果明显不完整(如 analysis 预算耗尽仍有未覆盖疑点)时用**不同的任务描述**发起;简报追加已覆盖清单(前 30 条)与差分任务提示,禁止重复提交已存在标题的 finding。
 
 **降级 (degraded)**:
 两处含义,均在术语表内不冲突:① 工件解析失败(JSON → `.md`),调度状态记为 degraded;② 工具失败降级兜底("失败不崩"原则)——返回 ok=False 并记录失败原因,不中断整体流程。
 
+#### Host 恢复术语
+
 **断点续跑 (resume / checkpoint)**:
-已存在 `.json` 工件且非 force 时,对应子 Agent 调度标记为 skipped,加载已有工件直接跳过;仅 `.md` 降级工件则默认重跑(可由 `STEP5_RESUME_DEGRADED=0` 关闭)。上游缺件时下游调度被拒。边车侧的对应机制是 ghidra_decompile 的幂等缓存(ADR-0010)。
+从未完成运行世代的权威状态快照和追加事件继续执行。恢复不以“某个最终 JSON 是否存在”为判据,也不覆盖已完成运行世代。
+_Avoid_: 跳过已有阶段工件, force 覆盖
 
 ### 审计判定
 
+**Benchmark**:
+由公开案例输入、与 Agent 隔离的 Ground Truth、固定运行配置和评价指标组成的研究测试集。公开案例不含参考答案;Evaluator 只在运行结果冻结后读取独立 Ground Truth 根目录。
+_Avoid_: 固件集合(缺少答案与评价规则), CVE 扫描
+
+**Ground Truth**:
+Benchmark 案例的隐藏参考答案,包含公开编号、根因位置、输入入口、关键处理关系、前置条件与影响。它位于 Agent 工具访问边界之外的独立根目录,路径不进入 Step5 参数、简报或运行快照,只由结果冻结后的 Evaluator 读取。
+_Avoid_: Recon 输入, 公开文章全文
+
+**盲发现 (blind discovery)**:
+发现阶段与已知 CVE 编号、问题描述、版本匹配结果及 Benchmark Ground Truth 隔离的审计模式。通用文件、代码、二进制与受控验证工具继续可用;CVE 扫描、公开问题查询和外部检索不进入 Agent 权限,调查结果冻结后才允许对照评估。
+_Avoid_: 未知漏洞扫描(盲发现也可以重发现公开问题), 无先验分析
+
+**已知问题辅助 (known-issue assist)**:
+允许把公开缺陷资料作为分析先验的审计模式,其结果必须标记外部知识来源,并与盲发现结果分开评价。
+_Avoid_: benchmark 模式, 盲发现
+
+**对照评估 (ground-truth evaluation)**:
+在盲发现结果封存后,先由确定性程序生成候选对应,再由 Codex 对 Ground Truth 与 Finding/Investigation 做字段级语义裁定并计算研究指标的过程。它不要求路径、函数名或描述文本完全相同。
+_Avoid_: CVE 扫描, 发现阶段
+
+**语义裁定 (semantic adjudication)**:
+Codex 在封存运行之后,按固定量表比较 Ground Truth 与机器输出的根因、入口或触发条件、关键处理关系、实际影响和 disposition。裁定必须保存字段级结果、双方引用、理由、评审模型与输入 digest。
+_Avoid_: 字符串相等匹配, 无依据的自动分类
+
+**未匹配 Finding (unmatched Finding)**:
+无法与 Benchmark Ground Truth 自动对应的 confirmed Finding,需要人工判断是新增有效结果还是错误结论,不能自动计入 false positive。
+_Avoid_: false positive, 自动忽略
+
+**重发现 (rediscovery)**:
+在不读取 Ground Truth 的条件下重建参考问题的 Benchmark 结果。根因、关键处理关系与影响语义对应且形成 confirmed Finding 为 full;可确认在调查同一问题但链路、影响或最终确认仍有缺口为 partial;没有可信对应 Investigation 为 miss。
+_Avoid_: 输出相同公开编号, 版本匹配
+
 **严重度 (severity)**:
-finding 的严重度等级,值域 `critical / high / medium / low / info`(`data/artifacts.py:SEVERITIES`,排序权重表 `SEVERITY_RANK` 由它派生的单一出处),orchestrator 汇总与复核取前 K 时按此排序。
+confirmed Finding 的影响等级,由 Host 将结构化影响范围与触发条件代入固定二维矩阵生成 `info / low / medium / high / critical`。缓解因素只能下调,关键字段缺失时不得给出 critical;人工调整必须保留理由。
 _Avoid_: 等级, 风险等级(风险有可利用性含义)
 
-**置信度 (confidence)**:
-finding 的证据充分度,值域 `high / medium / low`。verification 对存疑项降 confidence 保留,并区分"静态成立但无法动态验证"与"证据不足待查"。
-_Avoid_: 可信度
+**旧版置信度 (legacy confidence)**:
+旧 finding 模型的 high / medium / low 证据概括值。目标模型用 Claim Result、verdict 与 evidence completeness 分别表达事实,不再用 confidence 承担最终结论。
+_Avoid_: 用 confidence 替代 verdict 或证据完整度
 
 **复核结论 (verdict / rationale)**:
-verification 对每条候选的判定:verified=true(成立)/ false(误报)/ 存疑(降 confidence 保留)。判定的理由写在 rationale 字段,证据要与本次 Observation 逐字吻合。
-_Avoid_: 结论, 判定(severity 也算判定)
+verification 对待复核 Claim 的最终判定,值域为 confirmed / rejected / inconclusive;进入复核前为空值。结论与验证方法、证据完备度分开表达。
+_Avoid_: verified 布尔值(无法表达存疑), status(还可能指生命周期状态)
+
+**验证方法 (verification method)**:
+复核结论所采用的方法类别:static_analysis / behavior_model / target_execution。方法只说明如何检查,不暗示检查结果成立或被排除。
+_Avoid_: reproduced(暗含成功复现), proof level
+
+**证据完备度 (evidence completeness)**:
+某项 Claim 当前证据覆盖程度:observation_only / partial_chain / complete_chain;尚无证据时为空值。它描述材料是否闭合,不替代复核结论。
+_Avoid_: confidence(是另一种概括性估计), 验证方法
 
 **可利用性 (exploitability)**:
 基于二进制保护属性的漏洞被利用的难易程度,由 checksec 的 NX/PIE/RELRO/Canary/Fortify 等属性评估。NX 关闭 + 无 PIE → 可利用性上调。是 LLM 的评估输入,不是 finding 的字段。
@@ -292,4 +471,3 @@ _Avoid_: 垃圾文件, 未知格式
 **profile**:
 固件机型名单文件(`profiles/<name>.yaml`)。ADR-0011 后只剩 `SEARCH_EXCLUDE_DIRS` 一段——Step5 工具(list_files/search_code/semgrep)与简报现场概览消费的 SDK 搜索排除名单;`main.run_pipeline` 经 `file_rules.configure(--profile)` 切换。换机型只需改 profile 不改代码。当前默认 `nano-ubuntu`。
 _Avoid_: 配置(与固件 config 文件混淆), 机型
-

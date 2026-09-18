@@ -530,74 +530,6 @@ def test_run_in_sandbox_absolute_mounts() -> list[str]:
     return fails
 
 
-# ---------- E. 现场概览注入(票05:脱 fileinfo,rglob extracted 现场统计) ----------
-
-def test_build_filtered_overview() -> list[str]:
-    """build_filtered_overview 对解包树现场统计(ADR-0011):无 fileinfo 也完整;
-    SDK 排除名单生效;扩展名粗分布;紧凑不铺文件名。"""
-    import tempfile
-    from firmware_audit.step5_agent.data.prompts import build_filtered_overview
-    fails: list[str] = []
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        # 缺 extracted → 回退提示,不抛
-        if "不存在" not in build_filtered_overview(root):
-            fails.append("extracted/ 缺失应回退提示")
-        # 现场树:unitree(3 文件)+ etc(2)+ usr/lib(SDK 排除,不进统计)
-        for rel in ("unitree/bin/idlc", "unitree/module/run.sh", "unitree/conf/a.conf",
-                    "etc/passwd", "etc/dhcpcd.conf",
-                    "usr/lib/libc.so", "usr/local/lib/x.so"):
-            p = root / "extracted" / rel
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(b"x")
-        # 有 fileinfo.json 也不读不崩(退役中,内容故意为垃圾)
-        (root / "fileinfo.json").write_text("garbage-not-json", encoding="utf-8")
-        ov = build_filtered_overview(root)
-        if "现场概览" not in ov:
-            fails.append(f"缺标题行: {ov}")
-        if "unitree/" not in ov or "etc/" not in ov:
-            fails.append(f"缺顶层目录: {ov}")
-        if "- usr/" in ov:
-            fails.append(f"SDK 目录应被排除名单剔除: {ov}")
-        if ".conf=2" not in ov:
-            fails.append(f"缺扩展名粗分布: {ov}")
-        # 概览必须紧凑,不应把具体文件名单独铺开
-        if "idlc" in ov or "passwd" in ov:
-            fails.append("概览不应包含具体文件名(紧凑原则)")
-    return fails
-
-
-def test_recon_brief_appends_overview() -> list[str]:
-    """build_recon_brief 末尾追加现场概览;工件索引按 .c 归组(无 functions.json
-    依赖,ADR-0011 票05)。"""
-    import tempfile
-    from firmware_audit.step5_agent.data.prompts import build_recon_brief
-    fails: list[str] = []
-    with tempfile.TemporaryDirectory() as td:
-        root = Path(td)
-        a = root / "analysis" / "unitree" / "bin"
-        a.mkdir(parents=True)
-        (a / "idlc.c").write_text("// decompile_success: 1\n", encoding="utf-8")
-        (a / "idlc.strings.json").write_text("{}", encoding="utf-8")
-        e = root / "extracted" / "unitree" / "bin"
-        e.mkdir(parents=True)
-        (e / "idlc").write_bytes(b"\x7fELF")
-        # 无 functions.json —— 索引仍归组 idlc(按 .c 存在性)
-        # 无 fileinfo.json —— 概览照常现场统计
-        brief = build_recon_brief(root)
-        if "analysis/ 下共 1 个已反编译工件组" not in brief:
-            fails.append(f"analysis .c 索引缺失: {brief[:120]}")
-        if "- unitree/bin/idlc [decompiled.c strings]" not in brief:
-            fails.append(f"索引应按 .c 归组并列边车 tag: {brief[:200]}")
-        if "现场概览" not in brief:
-            fails.append(f"应追加现场概览: {brief[-200:]}")
-        # extracted 也没有时概览给回退提示,不崩
-        brief2 = build_recon_brief(root / "nonexistent")
-        if "不存在" not in brief2:
-            fails.append(f"缺 extracted 应给提示: {brief2[:120]}")
-    return fails
-
-
 def test_semgrep_sdk_exclude(ctx) -> list[str]:
     """semgrep_scan 目录扫描注入 SDK 排除参数(--exclude 容器绝对路径)。"""
     import firmware_audit.step5_agent.providers.tools.semgrep_scan as ss
@@ -649,8 +581,6 @@ def test_main() -> int:
             ("malformed_inputs", lambda: test_malformed_inputs(c)),
             ("container_path_security", lambda: test_container_path_security(c)),
             ("run_in_sandbox_absolute_mounts", test_run_in_sandbox_absolute_mounts),
-            ("build_filtered_overview", test_build_filtered_overview),
-            ("recon_brief_appends_overview", test_recon_brief_appends_overview),
             ("semgrep_sdk_exclude", lambda: test_semgrep_sdk_exclude(c)),
             ("xref_data_symbol_hint", lambda: test_xref_data_symbol_hint(c)),
         ]

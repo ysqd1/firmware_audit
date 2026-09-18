@@ -1542,3 +1542,93 @@ def test_illegal_related_candidate_rejects_the_whole_verification_action(tmp_pat
     assert [item.evidence_id for item in outcome.evidence] == ["ev-000002"]
     assert len(outcome.related_candidates) == 1
     assert outcome.related_candidates[0]["origin"]["relation"] == "verification_related"
+
+
+# ---- D4(ADR-0012 2026-09-16):冻结案卷的逐 Claim 检查清单 ----
+
+
+def test_case_checklist_is_persisted_deterministic_and_restorable(
+        tmp_path: Path) -> None:
+    from firmware_audit.step5_agent.host.verification import (
+        CHECKLIST_SCHEMA_VERSION,
+        build_case_checklist,
+        checklist_path,
+        load_case_checklist,
+        save_case_checklist,
+    )
+
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    case = load_cases(tmp_path)[0]
+
+    # 确定性:同一案卷重复生成逐字节一致;零模型请求(纯函数)
+    first = build_case_checklist(case)
+    second = build_case_checklist(case)
+    assert first == second
+
+    # 会话开跑即落盘(run_case 起点写入)
+    runner.run_case(candidate_id, FakeSession([
+        _v_action({"claim_results": {
+            name: _result("supported", "ev-000002", claim=name)
+            for name in GENERIC_REQUIRED}}),
+        _v_complete(),
+    ]))
+    path = checklist_path(tmp_path, candidate_id)
+    assert path.is_file()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == CHECKLIST_SCHEMA_VERSION
+    assert saved["candidate_id"] == candidate_id
+    assert [item["claim"] for item in saved["items"]] == list(GENERIC_REQUIRED)
+    # 逐项检查清单携带结构化事实:决定性与 supported 必填 facet
+    decisive = {item["claim"]: item["decisive"] for item in saved["items"]}
+    assert decisive["target_exists"] is True
+    facets = {item["claim"]: item.get("facets_required_on_supported")
+              for item in saved["items"]}
+    assert "impact_scope" in (facets["actual_impact"] or {})
+    # 证据入口仅定位用途,且不透出 analysis 判定
+    assert saved["evidence_entries"]
+    assert "定位" in saved["evidence_entries_note"]
+    dumped = json.dumps(saved, ensure_ascii=False)
+    assert '"status"' not in dumped and '"note"' not in dumped
+
+    # 恢复可读取:新实例读到同一份清单
+    assert load_case_checklist(tmp_path, candidate_id) == saved
+
+    # 损坏拒绝静默恢复;身份失约拒绝
+    path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(StoreError, match="检查清单"):
+        load_case_checklist(tmp_path, candidate_id)
+    save_case_checklist(tmp_path, candidate_id, first)
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document["candidate_id"] = "cand-9999"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(StoreError, match="身份"):
+        load_case_checklist(tmp_path, candidate_id)
+
+
+def test_case_context_message_carries_checklist_for_resumed_verifier(
+        tmp_path: Path) -> None:
+    """恢复简报携带检查清单:Verifier 沿正常响应推进,不需要专门规划轮次。"""
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+
+    class CapturingSession(FakeSession):
+        def step(self, input_message: str | None = None):
+            self.inputs.append(input_message)
+            return next(self.proposals)
+
+    session = CapturingSession([
+        _v_action({"claim_results": {
+            name: _result("supported", "ev-000002", claim=name)
+            for name in GENERIC_REQUIRED}}),
+        _v_complete(),
+    ])
+    runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    runner.run_case(candidate_id, session)
+
+    first_input = session.inputs[0] or ""
+    assert "checklist" in first_input
+    assert "逐 Claim 检查清单" in first_input
+    # 检查清单内容实际进入上下文(逐项 claim 条目可见)
+    assert '"claim"' in first_input

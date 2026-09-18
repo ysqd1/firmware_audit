@@ -1,15 +1,11 @@
 """ReAct 纯文本协议解析(L3 纯函数层,零 IO 可独测)。
 
-协议(agents.md 已定,不用 function calling):
-  Thought: ...
-  Action: tool_name
-  Action Input: {"k": "v"}
-  (Python 执行工具,回喂)
-  Observation: ...
-  Final Answer: ...
+旧 ReAct 文本协议(Thought/Action/Final Answer)的解析纯函数。旧完整循环
+已随 ADR-0012 公开切换删除;本模块保留供 display 的思考/调用行拆解与独立
+协议回查,Host 的现行协议见 host/session.py(纯 JSON proposal)。
 
 本模块只回答两个问题:这条回复是什么块(kind)、Action Input 是什么参数(dict)。
-不关心循环、不落盘、不碰 LLM。react_loop 是唯一调用方(测试直接测这里)。
+不关心循环、不落盘、不碰 LLM。
 """
 from __future__ import annotations
 
@@ -28,10 +24,6 @@ FINAL_MARK = re.compile(r"(?m)^\s*Final Answer\s*:")
 # (re.S 贪婪会把后续块全吞进首个 match,finditer 无法逐块,故分两步)
 FINAL_RE = re.compile(r"^\s*Final Answer\s*:\s*(.+)", re.S)
 JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.S)
-MAX_PARSE_FAILS = 4  # 连续解析失败达到此数即强制 Final Answer(react_loop 消费)
-# 2026-08-22 从 2 放宽到 4: verification 的系统提示词长(防幻觉纪律多),模型
-# 首轮概率性输出纯计划散文,连错 2 次就把整个复核阶段灭掉(实测 3 次运行 2 次崩);
-# 放宽到 4 给自纠机会,死循环风险仍由同参守卫(MAX_REPEAT_CALLS)与迭代上限兜底。
 
 # XML 角括号格式漂移归一化(2026-08-20 verification 实发,崩掉整个复核阶段):
 # 推理模型偶发把协议块包成 <Action>x</Action> 形态(function calling 风格串扰),

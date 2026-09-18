@@ -412,7 +412,7 @@ def test_analyst_notes_appended_after_facts_without_touching_digest(
 class _ExplodingSessionFactory:
     """finalizing 恢复不得驱动任何 Session;一旦被调用即失败。"""
 
-    def __call__(self, role, candidate_id=None):  # pragma: no cover
+    def __call__(self, role, candidate_id=None, run_dir=None):  # pragma: no cover
         raise AssertionError(f"finalizing 恢复不得创建 {role} Session")
 
 
