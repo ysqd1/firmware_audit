@@ -41,6 +41,15 @@ from .generation import (
     save_run_state,
 )
 from .locking import LockActiveError, acquire_lock
+from .review import (
+    REVIEW_PROJECTION_SCHEMA_VERSION,
+    REVIEW_SCHEMA_VERSION,
+    ReviewError,
+    ReviewOverlay,
+    SEVERITY_LEVELS,
+    load_review_projection,
+    project_review_report,
+)
 from .candidates import (
     CANDIDATE_STORE_SCHEMA_VERSION,
     CLAIM_PROFILES,
@@ -172,6 +181,7 @@ __all__ = [
     "LIFECYCLE_STATUSES",
     "list_generations",
     "load_cases",
+    "load_review_projection",
     "load_config_snapshot",
     "load_run_state",
     "LockActiveError",
@@ -180,6 +190,7 @@ __all__ = [
     "normalize_intake",
     "normalize_target_path",
     "parse_proposal",
+    "project_review_report",
     "persist_config_snapshot",
     "plan_verification_queue",
     "PolicyError",
@@ -190,6 +201,10 @@ __all__ = [
     "protocol_instruction",
     "read_manifest",
     "ReconRunResult",
+    "REVIEW_PROJECTION_SCHEMA_VERSION",
+    "REVIEW_SCHEMA_VERSION",
+    "ReviewError",
+    "ReviewOverlay",
     "related_candidate_contract",
     "RELATED_CANDIDATE_FIELDS",
     "related_candidate_records",
@@ -209,6 +224,7 @@ __all__ = [
     "select_for_processing",
     "Selection",
     "SemanticComparator",
+    "SEVERITY_LEVELS",
     "signal_fingerprint",
     "STOP_REASONS",
     "stored_related_proposals",
