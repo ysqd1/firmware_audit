@@ -87,13 +87,25 @@ def _case_payload(
     }
 
 
-def _result(judgment: str, evidence_id: str | None = "ev-000001") -> dict:
+# 三个 facet claim 的 supported 记录自动附分档(票 12:supported 必填 facet)。
+_FACET_BY_CLAIM = {
+    "actual_impact": ("impact_scope", "component"),
+    "preconditions": ("trigger_condition", "limited"),
+    "mitigations": ("mitigation_effect", "partial"),
+}
+
+
+def _result(judgment: str, evidence_id: str | None = "ev-000001",
+            claim: str | None = None) -> dict:
     record = {
         "judgment": judgment,
         "observed": "重新读取配置确认字段真实存在",
         "method": "read_file 独立复核",
         "evidence_ids": [evidence_id] if evidence_id else [],
     }
+    if judgment == "supported" and claim in _FACET_BY_CLAIM:
+        facet, value = _FACET_BY_CLAIM[claim]
+        record[facet] = value
     if judgment == "unresolved":
         record["limitations"] = "沙箱解释器不可用,无法动态验证"
     return record
@@ -312,7 +324,8 @@ def test_apply_plan_accumulates_related_and_dedups_by_proposal_id() -> None:
 
 
 def _all_supported(results: dict | None = None) -> dict:
-    return results or {name: _result("supported") for name in GENERIC_REQUIRED}
+    return results or {name: _result("supported", claim=name)
+                      for name in GENERIC_REQUIRED}
 
 
 def test_aggregate_confirmed_when_all_required_independently_supported() -> None:
@@ -672,7 +685,7 @@ def test_confirmed_case_produces_finding_and_finished_lifecycle(tmp_path: Path) 
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     session = FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ])
 
@@ -715,7 +728,7 @@ def test_verification_evidence_is_namespaced_and_run_unique(tmp_path: Path) -> N
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     session = FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ])
 
@@ -740,7 +753,7 @@ def test_verifier_brief_is_independent_of_analysis_conclusions(tmp_path: Path) -
         _v_action({"claim_results": {
             "root_cause": _result("supported", "ev-000002")}}),
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000003")
+            name: _result("supported", "ev-000003", claim=name)
             for name in GENERIC_REQUIRED if name != "root_cause"}}),
         _v_complete(),
     ])
@@ -759,7 +772,7 @@ def test_rejected_case_records_refutation_without_finding(tmp_path: Path) -> Non
     tracer, (candidate_id,) = _prepared_tracer(tmp_path)
     tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
-    results = {name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}
+    results = {name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}
     results["root_cause"] = _result("refuted", "ev-000002")
     session = FakeSession([_v_action({"claim_results": results}), _v_complete()])
 
@@ -779,7 +792,7 @@ def test_inconclusive_case_does_not_return_to_analysis(tmp_path: Path) -> None:
     tracer, (candidate_id,) = _prepared_tracer(tmp_path)
     tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
-    results = {name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}
+    results = {name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}
     results["actual_impact"] = _result("unresolved", None)
     session = FakeSession([_v_action({"claim_results": results}), _v_complete()])
 
@@ -802,7 +815,7 @@ def test_evidence_gap_case_shares_the_same_aggregation(tmp_path: Path) -> None:
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     session = FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ])
 
@@ -824,7 +837,7 @@ def test_citing_frozen_analysis_evidence_is_rejected_without_residue(tmp_path: P
         _v_action({"claim_results": {
             "root_cause": _result("supported", "ev-000001")}}),
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ])
 
@@ -850,7 +863,7 @@ def test_complete_verification_requires_all_required_results(tmp_path: Path) -> 
             "root_cause": _result("supported", "ev-000002")}}),
         _v_complete(),
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ])
 
@@ -869,7 +882,7 @@ def test_related_candidates_are_grounded_and_carried_into_finding(tmp_path: Path
     session = FakeSession([
         _v_action({
             "claim_results": {
-                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED},
+                name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED},
             "related_candidates": [_related_entry(evidence_id="ev-000002")],
         }),
         _v_complete(),
@@ -905,7 +918,7 @@ def test_runner_guards_role_session_reuse_and_missing_case(tmp_path: Path) -> No
 
     shared = FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000003") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000003", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ])
     runner.run_case(ids[0], shared)
@@ -955,7 +968,7 @@ def _interrupt_after_one_action(
     with pytest.raises(RuntimeError, match="模型服务中断"):
         runner.run_case(candidate_id, OneThenInterrupt([
             _v_action({"claim_results": {
-                name: _result("supported", evidence_id) for name in names}}),
+                name: _result("supported", evidence_id, claim=name) for name in names}}),
         ]))
 
 
@@ -970,7 +983,7 @@ def test_findings_accumulate_across_confirmed_cases(tmp_path: Path) -> None:
     for candidate_id, evidence_id in zip(ids, evidence):
         outcome = runner.run_case(candidate_id, FakeSession([
             _v_action({"claim_results": {
-                name: _result("supported", evidence_id) for name in GENERIC_REQUIRED}}),
+                name: _result("supported", evidence_id, claim=name) for name in GENERIC_REQUIRED}}),
             _v_complete(),
         ]))
         finding_ids.append(outcome.finding_id)
@@ -994,7 +1007,7 @@ def test_verification_resumes_after_session_interruption(tmp_path: Path) -> None
     resumed_runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     resumed = FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000003")
+            name: _result("supported", "ev-000003", claim=name)
             for name in GENERIC_REQUIRED[3:]}}),
         _v_complete(),
     ])
@@ -1016,7 +1029,7 @@ def test_finalize_replay_after_results_write_is_idempotent(tmp_path: Path) -> No
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     session = FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ])
     first = runner.run_case(candidate_id, session)
@@ -1048,7 +1061,7 @@ def test_crash_between_finding_and_results_resumes_pending_proposal(
     with pytest.raises(RuntimeError, match="results 写入前"):
         runner.run_case(candidate_id, FakeSession([
             _v_action({"claim_results": {
-                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+                name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
             _v_complete(),
         ]))
 
@@ -1134,7 +1147,7 @@ def test_restore_rejects_claim_results_citing_unknown_evidence(tmp_path: Path) -
 
     def mutate(saved):
         saved["session"]["claim_results"] = {
-            name: _result("supported", "ev-999999") for name in GENERIC_REQUIRED}
+            name: _result("supported", "ev-999999", claim=name) for name in GENERIC_REQUIRED}
 
     _inject_verification_projection(
         tmp_path, candidate_id, mutate, "injected_unknown_evidence")
@@ -1157,7 +1170,7 @@ def test_restore_rejects_claim_results_citing_analysis_evidence(tmp_path: Path) 
 
     def mutate(saved):
         saved["session"]["claim_results"] = {
-            name: _result("supported", "ev-000001") for name in GENERIC_REQUIRED}
+            name: _result("supported", "ev-000001", claim=name) for name in GENERIC_REQUIRED}
 
     _inject_verification_projection(
         tmp_path, candidate_id, mutate, "injected_analysis_evidence")
@@ -1201,7 +1214,7 @@ def _confirmed_results(tmp_path: Path):
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     outcome = runner.run_case(candidate_id, FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ]))
     assert outcome.verdict == "confirmed"
@@ -1219,7 +1232,7 @@ def _tamper_results(tmp_path: Path, candidate_id: str, mutate) -> None:
     lambda payload: payload.update({"verdict": "confirmed", "claim_results": {
         name: _result("unresolved", None) for name in GENERIC_REQUIRED}}),
     lambda payload: payload.update({"claim_results": {
-        name: _result("supported", "ev-999999") for name in GENERIC_REQUIRED}}),
+        name: _result("supported", "ev-999999", claim=name) for name in GENERIC_REQUIRED}}),
     lambda payload: payload.update({"claim_profile": "memory"}),
     lambda payload: payload.update({"investigation_id": "inv-9999"}),
     lambda payload: payload.update({"finding_id": "f-9999"}),
@@ -1281,7 +1294,7 @@ def test_evidence_ids_stay_unique_across_interleaved_trees(tmp_path: Path) -> No
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     runner.run_case(first, FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ]))
     assert (tmp_path / "verifications" / first / "evidence"
@@ -1315,7 +1328,7 @@ def test_evidence_ids_stay_unique_across_interleaved_trees(tmp_path: Path) -> No
     _submit_ready_case(tracer, third.candidate_id, evidence_id="ev-000004")
     outcome = runner.run_case(third.candidate_id, FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000005") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000005", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ]))
     assert outcome.verdict == "confirmed"
@@ -1337,7 +1350,7 @@ def test_finish_verification_rejects_mismatched_replay(tmp_path: Path) -> None:
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     runner.run_case(candidate_id, FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ]))
 
@@ -1365,7 +1378,7 @@ def test_replay_rejects_corrupted_results(tmp_path: Path) -> None:
     runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
     outcome = runner.run_case(candidate_id, FakeSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ]))
     payload = json.loads(outcome.results_path.read_text(encoding="utf-8"))
@@ -1398,7 +1411,7 @@ def test_append_finding_rejects_corrupted_entry(tmp_path: Path) -> None:
     with pytest.raises(StoreError, match="Finding 条目损坏"):
         runner.run_case(candidate_id, FakeSession([
             _v_action({"claim_results": {
-                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+                name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
             _v_complete(),
         ]))
 
@@ -1428,7 +1441,7 @@ def test_verification_related_candidate_is_origin_stamped_and_persisted(tmp_path
     session = FakeSession([
         _v_action({
             "claim_results": {
-                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED},
+                name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED},
             "related_candidates": [_related_entry(
                 proposal_id="rel-cand-0001-1", evidence_id="ev-000002")],
         }),
@@ -1516,7 +1529,7 @@ def test_illegal_related_candidate_rejects_the_whole_verification_action(tmp_pat
         }),
         _v_action({
             "claim_results": {
-                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED},
+                name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED},
             "related_candidates": [_related_entry(evidence_id="ev-000002")],
         }),
         _v_complete(),

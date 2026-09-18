@@ -23,15 +23,12 @@ import time
 from typing import Any
 
 from .generation import load_run_state
+from .severity import SEVERITY_LEVELS
 from .store import StoreError, atomic_json, read_json_object
-from .verification import FINDING_SCHEMA_VERSION
+from .verification import load_findings_document as _load_findings_document
 
 REVIEW_SCHEMA_VERSION = 1
 REVIEW_PROJECTION_SCHEMA_VERSION = 1
-
-# Severity 人工调整的合法取值;与 ADR-0012 severity 矩阵四档影响范围 × 三档
-# 触发条件的输出词汇一致(票 12 落地矩阵时应与此处共享同一出处)。
-SEVERITY_LEVELS = ("info", "low", "medium", "high", "critical")
 
 # 可复核目标字段注册表:机器工件可被 overlay 调整的字段白名单,未知字段一律
 # 拒绝。v1 只开放 Finding.severity(ADR-0012 故事 129);扩展字段是 schema
@@ -43,18 +40,6 @@ _EVIDENCE_ID_PATTERN = re.compile(r"ev-[0-9]{6}")
 
 class ReviewError(ValueError):
     """复核决定被明确拒绝;机器工件与既有 overlay 原样保留。"""
-
-
-def _load_findings_document(gen_dir: Path) -> dict[str, Any]:
-    """读取 findings.json(缺失给空文档);结构损坏按 Store 语义拒绝。"""
-    findings_path = gen_dir / "findings.json"
-    if not findings_path.exists():
-        return {"schema_version": FINDING_SCHEMA_VERSION, "findings": []}
-    document = read_json_object(findings_path, "Findings 工件")
-    if (document.get("schema_version") != FINDING_SCHEMA_VERSION
-            or not isinstance(document.get("findings"), list)):
-        raise StoreError("Findings 结构损坏；请检查原运行目录")
-    return document
 
 
 def _evidence_exists(gen_dir: Path, evidence_id: str) -> bool:

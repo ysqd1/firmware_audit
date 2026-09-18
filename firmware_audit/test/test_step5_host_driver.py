@@ -632,7 +632,7 @@ class SmartVerificationSession:
         if len(self.inputs) == 2:
             evidence = _EV_IN_INPUT.search(self.inputs[-1] or "").group(1)
             return _v_action({"claim_results": {
-                name: _v_result("supported", evidence)
+                name: _v_result("supported", evidence, claim=name)
                 for name in GENERIC_REQUIRED}})
         return _v_complete(
             {"related_candidates": [self.related]} if self.related else None)
@@ -707,12 +707,14 @@ def test_driver_full_chain_creates_generation_and_seals_processing(
     summary = driver.run()
     assert summary.created is True
     assert summary.generation == "gen-0001"
-    assert summary.status == "finalizing"
-    assert summary.stop_reason == "processing_complete"
+    assert summary.status == "completed"
+    assert summary.stop_reason == "sealed"
     assert summary.candidates == 2
     assert summary.findings == 2  # 两个案卷都独立支持 → confirmed
     state = load_run_state(summary.gen_dir)
-    assert state["status"] == "finalizing"
+    assert state["status"] == "completed"
+    assert "seal" in json.loads(
+        (summary.gen_dir / "manifest.json").read_text(encoding="utf-8"))
     # 配置快照随世代冻结,且与 runner 实际轮次同源
     snapshot = json.loads(
         (summary.gen_dir / "config.json").read_text(encoding="utf-8"))
@@ -723,12 +725,13 @@ def test_driver_full_chain_creates_generation_and_seals_processing(
     assert [cid for role, cid in sessions.created if role == "analysis"] == [
         "cand-0001", "cand-0002"]
     # 去重/评分的模型请求也过预算台账:总计数 = recon 2 + analysis 3×2
-    # + verification 3×2 + 去重/评分 llm.calls
+    # + verification 3×2 + 去重/评分 llm.calls;封存期注记请求被假 LLM
+    # 拒收(JSON 解析失败)→ 只告警跳过,失败请求不记账
     ledger = json.loads(
         (summary.gen_dir / "budget.json").read_text(encoding="utf-8"))
     llm = driver._llm  # noqa: SLF001 -- 断言台账与真实调用数一致
-    assert llm.calls >= 2  # 两个 Candidate 各评分一次
-    assert ledger["llm_calls"] == 2 + 3 * 2 + 3 * 2 + llm.calls
+    assert llm.calls >= 3  # 两个 Candidate 各评分一次 + 一次失败的注记请求
+    assert ledger["llm_calls"] == 2 + 3 * 2 + 3 * 2 + llm.calls - 1
 
 
 def test_driver_resumes_unfinished_generation_and_freezes_config(
@@ -763,7 +766,7 @@ def test_driver_resumes_unfinished_generation_and_freezes_config(
     summary = driver2.run()
     assert summary.created is False
     assert summary.generation == "gen-0001"
-    assert summary.status == "finalizing"
+    assert summary.status == "completed"
     snapshot = json.loads(
         (summary.gen_dir / "config.json").read_text(encoding="utf-8"))
     assert snapshot["sources"]["recon_max_rounds"] == "environment"
@@ -869,7 +872,7 @@ def test_driver_related_candidates_requeue_and_process_new_case(
                 evidence = _EV_IN_INPUT.search(self.inputs[-1] or "").group(1)
                 self._related = dict(related, evidence_id=evidence)
                 return _v_action({"claim_results": {
-                    name: _v_result("supported", evidence)
+                    name: _v_result("supported", evidence, claim=name)
                     for name in GENERIC_REQUIRED}})
             return _v_complete({"related_candidates": [self._related]})
 
@@ -878,7 +881,7 @@ def test_driver_related_candidates_requeue_and_process_new_case(
         else SmartVerificationSession())
     driver = _make_driver(tmp_path, sessions=sessions)
     summary = driver.run()
-    assert summary.status == "finalizing"
+    assert summary.status == "completed"
     # related 入库成为 cand-0003 且被完整处理(独立分析+复核)
     roles = [role for role, _ in sessions.created]
     assert roles.count("analysis") == 3
@@ -905,22 +908,34 @@ def test_driver_force_abandons_running_generation_and_starts_new(
     assert summary.generation == "gen-0002"
     assert summary.created is True
     assert load_run_state(first_dir)["status"] == "abandoned"
-    # 再次 force:finalizing 世代不动(非 running),直接新开 gen-0003
+    # 再次 force:gen-0002 已封存(completed 只读),force 直接新开 gen-0003
     sessions3 = _recon_sessions()
     driver3 = _make_driver(tmp_path, sessions=sessions3)
     summary3 = driver3.run(force=True)
     assert summary3.generation == "gen-0003"
-    assert load_run_state(summary.gen_dir)["status"] == "finalizing"
+    assert load_run_state(summary.gen_dir)["status"] == "completed"
 
 
-def test_driver_refuses_resume_of_readonly_generation(tmp_path: Path) -> None:
+def test_driver_treats_sealed_generation_as_readonly(tmp_path: Path) -> None:
+    """票 12:封存世代不被恢复或改写;后续运行开新世代。"""
     sessions = _recon_sessions()
-    driver = _make_driver(tmp_path, sessions=sessions)
-    summary = driver.run()
-    assert summary.status == "finalizing"  # 处理责任收束,等票 12 报告封存
+    summary = _make_driver(tmp_path, sessions=sessions).run()
+    assert summary.status == "completed"
+    gen_dir = summary.gen_dir
+    sealed = {
+        path.name: path.read_bytes() for path in (
+            gen_dir / "manifest.json", gen_dir / "findings.json",
+            gen_dir / "report.md", gen_dir / "run_state.json",
+        )
+    }
+
     sessions2 = _recon_sessions()
-    with pytest.raises(StoreError, match="只读"):
-        _make_driver(tmp_path, sessions=sessions2).run()
+    summary2 = _make_driver(tmp_path, sessions=sessions2).run()
+    assert summary2.generation == "gen-0002"  # 新世代,不恢复封存世代
+    assert summary2.status == "completed"
+    # 封存机器工件字节不变(sealed immutability)
+    for name, payload in sealed.items():
+        assert (gen_dir / name).read_bytes() == payload, name
 
 
 def test_driver_refuses_second_concurrent_run_via_lock(tmp_path: Path) -> None:
@@ -956,7 +971,7 @@ def test_driver_never_reads_legacy_semantic_artifacts(tmp_path: Path) -> None:
         "{}", encoding="utf-8")
     sessions = _recon_sessions()
     summary = _make_driver(tmp_path, sessions=sessions).run()
-    assert summary.status == "finalizing"
+    assert summary.status == "completed"
     # 旧工件原样保留,未被读取或迁移
     for name in ("survey.json", "findings.json", "verified_findings.json"):
         assert (legacy / "1_analysis" / name).read_text(
@@ -1035,7 +1050,7 @@ def test_multi_restart_keeps_ids_evidence_budget_and_queue_stable(
         recon=FakeReconSession([]))  # recon 已完成,不应被请求
     driver2 = _make_driver(tmp_path, sessions=second_sessions)
     summary = driver2.run()
-    assert summary.status == "finalizing"
+    assert summary.status == "completed"
     assert second_sessions.recon.inputs == []
     # 只补未收尾的复核;cand-0001 走幂等重放(results.json 已在),
     # 不再驱动 Session——队列顺序与第一段一致
@@ -1108,7 +1123,7 @@ def test_incompatible_generation_does_not_brick_workspace(tmp_path: Path) -> Non
     with pytest.warns(RuntimeWarning, match="跳过无法恢复的世代"):
         summary = _make_driver(tmp_path, sessions=_recon_sessions()).run()
     assert summary.generation == "gen-0002"
-    assert summary.status == "finalizing"
+    assert summary.status == "completed"
     # force 同样可行:指引"请创建新运行世代"经驱动真的能执行
     with pytest.warns(RuntimeWarning, match="跳过无法恢复的世代"):
         forced = _make_driver(tmp_path, sessions=_recon_sessions()).run(force=True)
@@ -1147,7 +1162,7 @@ def test_resume_completes_interrupted_investigation_with_disposition(
     assert mid["state"]["investigation"]["lifecycle_status"] == "investigating"
 
     summary = _make_driver(tmp_path, sessions=_recon_sessions()).run()
-    assert summary.status == "finalizing"
+    assert summary.status == "completed"
     assert summary.findings == 2  # 中断候选也被完整分析+复核
     final = json.loads((gen_dir / "investigations" / "cand-0002"
                         / "state.json").read_text(encoding="utf-8"))
@@ -1184,7 +1199,7 @@ def test_case_crash_gap_does_not_deadlock_generation(tmp_path: Path) -> None:
     events.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     summary = _make_driver(tmp_path, sessions=_recon_sessions()).run()
-    assert summary.status == "finalizing"  # 不再每次恢复都撞 begin_verification
+    assert summary.status == "completed"  # 不再每次恢复都撞 begin_verification
     assert summary.findings == 2
 
 

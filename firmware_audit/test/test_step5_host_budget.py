@@ -361,7 +361,7 @@ def test_verification_three_strikes_finalize_inconclusive_without_finding(
     # 不阻断后续队列:下一案卷正常复核并确认。
     followup = runner.run_case(ids[1], FakeVerificationSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000003") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000003", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ]))
     assert followup.verdict == "confirmed"
@@ -377,7 +377,7 @@ def test_verification_protocol_error_never_confirms_even_with_full_results(
     invalid = type("Invalid", (), {})
     outcome = runner.run_case(candidate_id, FakeVerificationSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         invalid, invalid, invalid,
     ]))
 
@@ -487,7 +487,7 @@ def test_verification_run_total_budget_exhaustion_keeps_case_verifying(
     with pytest.raises(BudgetExhaustedError, match="llm_calls"):
         runner.run_case(candidate_id, FakeVerificationSession([
             _v_action({"claim_results": {
-                name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+                name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
             _v_complete(),
         ]))
 
@@ -526,7 +526,7 @@ def test_verification_service_interruption_keeps_case_recoverable(
         tmp_path, {"read_file": tool}, tracer, budget=_budget(tmp_path))
     outcome = resumed.run_case(candidate_id, FakeVerificationSession([
         _v_action({"claim_results": {
-            name: _result("supported", "ev-000002") for name in GENERIC_REQUIRED}}),
+            name: _result("supported", "ev-000002", claim=name) for name in GENERIC_REQUIRED}}),
         _v_complete(),
     ]))
     assert (outcome.verdict, outcome.stop_reason) == ("confirmed", "completed")

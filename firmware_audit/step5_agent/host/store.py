@@ -91,18 +91,17 @@ def sync_directory(directory: Path) -> None:
             os.close(descriptor)
 
 
-def atomic_json(path: Path, payload: dict, *, exclusive: bool = False) -> None:
-    """Flush before publication; exclusive Evidence must never replace an existing file."""
+def _atomic_publish(path: Path, prefix: str, write, *, link: bool = False) -> None:
+    """Write to a same-directory temp file, fsync, then atomically publish."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".snapshot-", dir=path.parent)
+    descriptor, temporary = tempfile.mkstemp(prefix=prefix, dir=path.parent)
     temporary_path = Path(temporary)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
-            handle.write("\n")
+            write(handle)
             handle.flush()
             os.fsync(handle.fileno())
-        if exclusive:
+        if link:
             # Same-directory hard link publishes complete bytes atomically and
             # fails if the immutable Evidence name already exists.
             os.link(temporary_path, path)
@@ -111,6 +110,21 @@ def atomic_json(path: Path, payload: dict, *, exclusive: bool = False) -> None:
         sync_directory(path.parent)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def atomic_json(path: Path, payload: dict, *, exclusive: bool = False) -> None:
+    """Flush before publication; exclusive Evidence must never replace an existing file."""
+
+    def write(handle) -> None:
+        json.dump(payload, handle, ensure_ascii=False, allow_nan=False)
+        handle.write("\n")
+
+    _atomic_publish(path, ".snapshot-", write, link=exclusive)
+
+
+def atomic_text(path: Path, text: str) -> None:
+    """与 atomic_json 同机制的纯文本原子发布(事实报告等非 JSON 工件)。"""
+    _atomic_publish(path, ".report-", lambda handle: handle.write(text))
 
 
 class InvestigationStore:

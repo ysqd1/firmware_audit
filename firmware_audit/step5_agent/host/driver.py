@@ -10,9 +10,10 @@ runner,去重/评分的模型请求经同一预算闸计账。
 阶段编排:Recon(checkpoint 恢复)→ Candidate Store 去重评分 → 注册入选
 Candidate → 循环 {Analysis 队列 → Verification 案卷队列(ready 优先、
 evidence-gap 按优先级)→ Related Candidate 幂等回队} 至不动点 → 收尾
-(处理责任收束,status=finalizing,报告与封存归票 12)。预算耗尽按可解释
-停止收账(剩余 queued 标 not_started);模型服务中断保存现场并原样上抛;
-确定性报告/severity/封存与本票无关。
+(处理责任收束,status=finalizing)→ 封存(票 12:可选 LLM 注记 →
+确定性事实报告 → manifest seal → completed)。finalizing 世代的恢复只续
+封存、不重跑处理;封存失败保持 finalizing 可恢复;预算耗尽按可解释停止
+收账(剩余 queued 标 not_started);模型服务中断保存现场并原样上抛。
 """
 from __future__ import annotations
 
@@ -48,6 +49,11 @@ from .generation import (
 )
 from .locking import acquire_lock
 from .recon import HostReconRunner
+from .reporting import (
+    ANALYST_NOTES_SYSTEM_PROMPT,
+    build_fact_report,
+    seal_run,
+)
 from .store import StoreError, read_json_object
 from .verification import (
     HostVerificationRunner,
@@ -141,6 +147,7 @@ class RunDriver:
         self._env = os.environ if env is None else dict(env)
         self._clock = clock or time.monotonic
         self._phase: str | None = None
+        self._finalizing = False
 
     # ---- 公开入口 ----
 
@@ -230,7 +237,7 @@ class RunDriver:
             explicit=self._explicit, env=self._env, profile=self._profile)
         name, gen_dir, created = self._select_generation(force)
         state = load_run_state(gen_dir)
-        if state is not None and state["status"] != "running":
+        if state is not None and state["status"] not in ("running", "finalizing"):
             raise StoreError(
                 f"世代 {name} 处于 {state['status']},机器工件只读;"
                 "请显式 force 创建新世代")
@@ -241,6 +248,16 @@ class RunDriver:
         budget = RunBudget.load(
             gen_dir, clock=self._clock, config=resolved, persist=False)
         self._phase = None
+        # 恢复 finalizing 世代时处理责任早已收束,异常回写必须保持 finalizing。
+        self._finalizing = state is not None and state["status"] == "finalizing"
+        if self._finalizing:
+            # 票 12:finalizing 的恢复只续封存(报告/manifest/completed),
+            # 绝不重跑 Recon/Analysis/Verification。
+            try:
+                return self._seal(name, gen_dir, created, budget)
+            except Exception as exc:
+                self._record_failure(gen_dir, exc)
+                raise
         tracer = HostAnalysisTracer(
             gen_dir, self.tools,
             max_rounds=int(resolved["analysis_max_rounds"]), budget=budget)
@@ -258,8 +275,7 @@ class RunDriver:
         except Exception as exc:
             # 模型服务中断等异常:现场已由既有 checkpoint 保存,这里只补一个
             # 可解释的停止原因并原样上抛(StoreError 即票 17 的拒绝路径)。
-            save_run_state(gen_dir, status="running", phase=self._phase,
-                           stop_reason=f"interrupted:{type(exc).__name__}")
+            self._record_failure(gen_dir, exc)
             raise
 
     def _execute(
@@ -340,12 +356,55 @@ class RunDriver:
             if not self._register_selected(tracer, payload):
                 break  # 幂等不动点:没有新增入选 Candidate
 
-        # ---- 收尾:处理责任全部收束,交给票 12 的报告与封存 ----
+        # ---- 收尾:处理责任全部收束 → 事实报告与封存(票 12) ----
         self._set_phase(gen_dir, "accounting")
         save_run_state(gen_dir, status="finalizing", phase="accounting",
                        stop_reason="processing_complete")
-        return self._summary(name, gen_dir, created, "finalizing",
-                             "processing_complete")
+        self._finalizing = True
+        return self._seal(name, gen_dir, created, budget)
+
+    # ---- 封存(票 12) ----
+
+    def _record_failure(self, gen_dir: Path, exc: Exception) -> None:
+        """异常停止的状态回写:封存阶段保持 finalizing,其余保持 running。"""
+        if self._finalizing:
+            save_run_state(
+                gen_dir, status="finalizing", phase=self._phase,
+                stop_reason=f"seal_failed:{type(exc).__name__}")
+        else:
+            save_run_state(
+                gen_dir, status="running", phase=self._phase,
+                stop_reason=f"interrupted:{type(exc).__name__}")
+
+    def _seal(
+        self, name: str, gen_dir: Path, created: bool, budget: RunBudget,
+    ) -> RunSummary:
+        """封存阶段:可选 LLM 注记 → 确定性报告 → manifest seal → completed。"""
+        self._phase = "sealing"
+        notes = self._analyst_notes(gen_dir, budget)
+        seal_run(gen_dir, analyst_notes=notes)
+        return self._summary(name, gen_dir, created, "completed", "sealed")
+
+    def _analyst_notes(self, gen_dir: Path, budget: RunBudget) -> str | None:
+        """可选 LLM 注记:任何失败只告警跳过,绝不阻塞封存(ADR-0012 L81)。
+
+        注记请求只记账不过预算闸——它是封存期的可选说明段,预算耗尽不应
+        阻止一个处理责任已收束的运行完成封存。
+        """
+        if self._llm is None:
+            return None
+        try:
+            reply, usage = self._llm.chat([
+                {"role": "system", "content": ANALYST_NOTES_SYSTEM_PROMPT},
+                {"role": "user", "content": build_fact_report(gen_dir)},
+            ])
+            budget.record_llm_call(usage)
+            notes = reply.strip() if isinstance(reply, str) else ""
+            return notes or None
+        except Exception as exc:  # 可选段:任何失败都不阻塞封存(ADR-0012 L81)
+            warnings.warn(
+                f"Analyst Notes 生成失败,封存继续: {exc}", RuntimeWarning)
+            return None
 
     # ---- 辅助 ----
 

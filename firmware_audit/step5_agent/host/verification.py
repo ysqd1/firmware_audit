@@ -39,6 +39,7 @@ from .claims import (
     ADMISSION_REASONS,
     CASE_SCHEMA_VERSION,
     STOP_REASONS,
+    PolicyError,
     is_decisive,
     profile_claim_document,
     required_claims,
@@ -49,6 +50,10 @@ from .evidence import (
     EvidenceReference,
 )
 from .json_values import JsonValueError, clone_json_value
+from .severity import (
+    CLAIM_RESULT_FACETS,
+    severity_assessment,
+)
 from .session import (
     MAX_PROTOCOL_ATTEMPTS,
     ActionProposal,
@@ -163,8 +168,10 @@ def _validate_claim_result_updates(
                 f"(Profile {profile!r} 必填项之外不允许自由扩张 schema)")
         if not isinstance(value, dict):
             _reject(f"{path_prefix}.{name} 必须为 JSON object")
+        facet_rules = CLAIM_RESULT_FACETS.get(name, {})
         _known_keys(
-            value, {"judgment", "observed", "evidence_ids", "method", "limitations"},
+            value, {"judgment", "observed", "evidence_ids", "method",
+                    "limitations"} | set(facet_rules),
             f"{path_prefix}.{name}")
         judgment = value.get("judgment")
         if judgment not in CLAIM_RESULT_JUDGMENTS:
@@ -203,6 +210,24 @@ def _validate_claim_result_updates(
             value.get("limitations"), f"{path_prefix}.{name}.limitations")
         if limitations is not None:
             record["limitations"] = limitations
+        # 结构化 facet(票 12):只在对应 claim 上、且 judgment=supported 时
+        # 必填——severity 重算依赖它们,省略会让"已证实缓解左移一档"等规则
+        # 被静默绕过(ADR-0012 L47/L59);非法档位或越位冒用整份拒绝。
+        for facet, allowed in facet_rules.items():
+            if facet not in value:
+                if judgment == "supported":
+                    _reject(
+                        f"{path_prefix}.{name}.{facet} 是 supported Claim "
+                        "Result 的必填结构化 facet;severity 重算依赖该分档")
+                continue
+            if judgment != "supported":
+                _reject(
+                    f"{path_prefix}.{name}.{facet} 只能在 judgment=supported 的"
+                    " Claim Result 上提供")
+            if value[facet] not in allowed:
+                _reject(
+                    f"{path_prefix}.{name}.{facet} 只允许 {', '.join(allowed)}")
+            record[facet] = value[facet]
         planned.append((name, record))
     return tuple(planned)
 
@@ -389,6 +414,12 @@ def aggregate_verdict(
             if isinstance(refs, list) and refs:
                 continue
         unsupported.append(name)
+    # 完全阻断实际影响的已证实缓解反驳决定性 Claim(ADR-0012 L59):被阻断
+    # 的问题不生成 Finding,而不是只靠降级继续 confirmed。判定与 severity
+    # 重算共用单一出处(severity_assessment),脏 facet 口径一致。
+    if (severity_assessment(claim_results)["decisive_refutation"] is not None
+            and "actual_impact" not in decisive_refuted):
+        decisive_refuted.append("actual_impact")
     if decisive_refuted:
         return VerdictResult(
             verdict="rejected",
@@ -533,6 +564,26 @@ def build_case_brief(
     return clone_json_value(brief, "复核简报")
 
 
+def load_findings_document(run_dir: Path) -> dict[str, Any]:
+    """读取 findings.json(缺失给空文档);结构损坏按 Store 语义拒绝。
+
+    Finding 工件装载的单一出处:复核 runner、review overlay(票 13)与
+    事实报告(票 12)共用同一形状校验。
+    """
+    path = Path(run_dir) / "findings.json"
+    if not path.exists():
+        return {"schema_version": FINDING_SCHEMA_VERSION, "findings": []}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise StoreError(f"Findings 损坏；请检查原运行目录: {exc}") from exc
+    if (not isinstance(loaded, dict)
+            or loaded.get("schema_version") != FINDING_SCHEMA_VERSION
+            or not isinstance(loaded.get("findings"), list)):
+        raise StoreError("Findings 结构损坏；请检查原运行目录")
+    return loaded
+
+
 def build_finding_payload(
     *,
     finding_id: str,
@@ -541,12 +592,22 @@ def build_finding_payload(
     evidence_references: list[dict[str, Any]],
     related_candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """confirmed 案卷的唯一 Finding 载荷;Claim 按必填顺序确定性排列。"""
+    """confirmed 案卷的唯一 Finding 载荷;Claim 按必填顺序确定性排列。
+
+    severity 由 Claim Result 的结构化 facet 经固定矩阵重算(票 12);完全阻断
+   缓解反驳决定性 Claim,不应走到 Finding 生成——防御性拒绝而不是落一条
+    名义 confirmed 的 rejected 案卷。
+    """
     profile = case_payload["claim_profile"]
     claims = {
         name: deepcopy(claim_results[name])
         for name in required_claims(profile) if name in claim_results
     }
+    assessment = severity_assessment(claim_results)
+    if assessment["decisive_refutation"] is not None:
+        raise PolicyError(
+            "完全阻断的缓解已反驳决定性 Claim,案卷应聚合为 rejected,"
+            "不得生成 Finding")
     return clone_json_value({
         "schema_version": FINDING_SCHEMA_VERSION,
         "finding_id": finding_id,
@@ -555,6 +616,12 @@ def build_finding_payload(
         "claim_profile": profile,
         "admission_reason": case_payload["admission_reason"],
         "verdict": "confirmed",
+        "severity": assessment["severity"],
+        "severity_basis": {
+            key: assessment[key] for key in
+            ("impact_scope", "trigger_condition", "mitigation_effect",
+             "incomplete")
+        },
         "claims": claims,
         "evidence_references": deepcopy(evidence_references),
         "related_candidates": deepcopy(related_candidates),
@@ -1041,21 +1108,8 @@ class HostVerificationRunner:
                 f"{finding_id}；请检查原运行目录")
 
     def _load_findings_document(self) -> dict[str, Any]:
-        """读取 findings.json(尚未生成时给空文档);结构损坏按 Store 语义拒绝。"""
-        findings_path = self._run_dir / "findings.json"
-        document: dict[str, Any] = {
-            "schema_version": FINDING_SCHEMA_VERSION, "findings": []}
-        if not findings_path.exists():
-            return document
-        try:
-            loaded = json.loads(findings_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, UnicodeError) as exc:
-            raise StoreError(f"Findings 损坏；请检查原运行目录: {exc}") from exc
-        if (not isinstance(loaded, dict)
-                or loaded.get("schema_version") != FINDING_SCHEMA_VERSION
-                or not isinstance(loaded.get("findings"), list)):
-            raise StoreError("Findings 结构损坏；请检查原运行目录")
-        return loaded
+        """读取 findings.json;装载与形状校验单一出处见模块级函数。"""
+        return load_findings_document(self._run_dir)
 
     def _append_finding(
         self,
