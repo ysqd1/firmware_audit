@@ -38,7 +38,9 @@ from .verification import (
 
 GROUND_TRUTH_SCHEMA_VERSION = 1
 CANDIDATE_MAP_SCHEMA_VERSION = 1
-EVALUATION_REVIEW_SCHEMA_VERSION = 1
+# v2:run 块 disposition 分布换源(Candidate Store 队列投影 → Investigation
+# 终态投影,票 20);v1 工件的 run 块是错源统计,不兼容,重放审计按版本拒绝。
+EVALUATION_REVIEW_SCHEMA_VERSION = 2
 
 # 结果与 unmatched 分类的固定词汇(ADR-0012 L67/L69)。
 MATCH_RESULTS = ("full", "partial", "miss")
@@ -894,13 +896,19 @@ def compute_metrics(
 
 
 def _run_context(gen_dir: Path) -> dict[str, Any]:
-    """ADR-0012 L61 运行面统计:调查 disposition 分布与运行资源消耗。"""
-    store = read_json_object(gen_dir / "candidates.json", "Candidate Store")
-    records = [record for record in store.get("candidates", [])
-               if isinstance(record, dict)]
-    dispositions = Counter(
-        str(record.get("disposition")) for record in records
-        if record.get("disposition") is not None)
+    """ADR-0012 L61 运行面统计:调查 disposition 分布与运行资源消耗。
+
+    分布读各 Investigation 的终态投影(``investigations/<cand>/state.json``
+    的 disposition,经 ``_machine_views``),与事实报告第 8 节同一盘上数据源
+    但装载各自独立(报告走 reporting 的 ``_investigation_states``;缺失
+    disposition 第 8 节计作 "None" 桶、此处滤非字符串——completed 世代有
+    完成门兜底,两读法不会分叉)。该源能表达 confirmed/rejected/inconclusive
+    /closed/unresolved/not_started 全部词汇。Candidate Store 是错源:其队列
+    投影受票 11 不变量约束只有 None/not_started 两态,当数据源时生产世代上
+    分布永远退化为 not_started×N 或空(票 20)。
+    """
+    _findings, dispositions = _machine_views(gen_dir)
+    counts = Counter(value for value in dispositions.values() if value)
     budget_path = gen_dir / "budget.json"
     resources: dict[str, Any] | None = None
     if budget_path.exists():
@@ -909,7 +917,7 @@ def _run_context(gen_dir: Path) -> dict[str, Any]:
                      ("llm_calls", "prompt_tokens", "completion_tokens",
                       "tool_attempts", "logical_tool_calls", "active_seconds")}
     return {
-        "investigation_dispositions": dict(sorted(dispositions.items())),
+        "investigation_dispositions": dict(sorted(counts.items())),
         "resources": resources,
     }
 

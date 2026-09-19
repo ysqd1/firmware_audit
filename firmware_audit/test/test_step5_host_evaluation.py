@@ -12,6 +12,7 @@ machine/reviewed 指标并列、评审结果重放审计。
 """
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
 import hashlib
 import json
@@ -97,7 +98,8 @@ def _claims_document(observed: str) -> dict:
     }
 
 
-def _investigation_state(candidate_id: str, disposition: str) -> dict:
+def _investigation_state(candidate_id: str, disposition: str,
+                         stop_reason: str = "completed") -> dict:
     return {
         "schema_version": 1, "last_event_seq": 1,
         "state": {
@@ -108,7 +110,7 @@ def _investigation_state(candidate_id: str, disposition: str) -> dict:
                 "claim_profile": "generic",
                 "lifecycle_status": "finished",
                 "disposition": disposition,
-                "stop_reason": "completed",
+                "stop_reason": stop_reason,
             },
             "runtime": {},
         },
@@ -171,8 +173,15 @@ def _finding_document(finding_id: str, candidate_id: str, severity: str) -> dict
 
 
 def _store_document() -> dict:
+    """生产写入方形态的 Candidate Store(票 20 夹具契约)。
+
+    queue/disposition 是选取投影(票 11 口径):已入选 → disposition=None
+    (结局只在 Investigation),未入选 → "not_started"。真实 disposition 值
+    是 store 投影写不出的,只存在于 ``investigations/<cand>/state.json``。
+    """
+
     def record(candidate_id: str, target: str, *, selected: bool,
-               disposition: str | None, kind: str = "signal") -> dict:
+               kind: str = "signal") -> dict:
         return {
             "candidate_id": candidate_id, "kind": kind, "target": target,
             "signal": "待查信号", "claim_profile": "generic",
@@ -180,7 +189,8 @@ def _store_document() -> dict:
             "initial_evidence": "ev-000001",
             "queue": {"queue": "signal" if kind == "signal" else "coverage",
                       "rank": 0, "selected": selected},
-            "disposition": disposition, "priority": {"total": 5},
+            "disposition": None if selected else "not_started",
+            "priority": {"total": 5},
         }
 
     return {
@@ -189,16 +199,16 @@ def _store_document() -> dict:
                    "checked_scope": ["extracted/etc/*"],
                    "coverage_gaps": []},
         "candidates": [
-            record("cand-0001", "extracted/etc/shadow", selected=True,
-                   disposition="confirmed"),
+            record("cand-0001", "extracted/etc/shadow", selected=True),
             record("cand-0002", "extracted/unitree/bin/service",
-                   selected=True, disposition="inconclusive"),
+                   selected=True),
             record("cand-0003", "extracted/usr/lib/libhttpd.so",
-                   selected=True, disposition="confirmed"),
-            record("cand-0004", "extracted/etc/shadow", selected=True,
-                   disposition="confirmed"),
+                   selected=True),
+            record("cand-0004", "extracted/etc/shadow", selected=True),
             record("cand-0005", "extracted/opt/vendor", selected=False,
-                   disposition="not_started", kind="coverage"),
+                   kind="coverage"),
+            # 入选但预算耗尽未开跑:调查终态 not_started(票 20 混合词汇)。
+            record("cand-0006", "extracted/opt/daemon", selected=True),
         ],
     }
 
@@ -234,12 +244,17 @@ def _build_sealed_gen(
     _write_json(gen_dir / "candidates.json", _store_document())
 
     dispositions = {"cand-0001": "confirmed", "cand-0002": "inconclusive",
-                    "cand-0003": "confirmed", "cand-0004": "confirmed"}
+                    "cand-0003": "confirmed", "cand-0004": "confirmed",
+                    # 预算耗尽未开跑的入选调查:终态 not_started,无案卷。
+                    "cand-0006": "not_started"}
     if closed_investigation:
         dispositions["cand-0002"] = "closed"
     for candidate_id, disposition in dispositions.items():
         _write_json(gen_dir / "investigations" / candidate_id / "state.json",
-                    _investigation_state(candidate_id, disposition))
+                    _investigation_state(
+                        candidate_id, disposition,
+                        stop_reason="budget_exhausted"
+                        if disposition == "not_started" else "completed"))
     for evidence_id, candidate_id, arguments, summary in _EVIDENCE:
         _write_json(
             gen_dir / "investigations" / candidate_id / "evidence"
@@ -530,7 +545,9 @@ def test_evaluate_run_writes_auditable_review(tmp_path: Path) -> None:
     assert artifact["inputs"]["candidate_map_sha256"] == hashlib.sha256(
         canonical_json(artifact["candidate_map"]).encode("utf-8")).hexdigest()
     assert artifact["usage"] == {"prompt_tokens": 100, "completion_tokens": 40}
-    # 运行面统计(ADR-0012 L61:未决调查与资源消耗)。
+    # 运行面统计(ADR-0012 L61:未决调查与资源消耗)。分布读各 Investigation
+    # 终态(与事实报告第 8 节同源):盘上 confirmed×3 + inconclusive×1 +
+    # not_started×1(票 20);错源 Candidate Store 只能读出 {"not_started": 1}。
     assert artifact["run"]["investigation_dispositions"] == {
         "confirmed": 3, "inconclusive": 1, "not_started": 1}
     assert artifact["run"]["resources"]["llm_calls"] == 12
@@ -575,6 +592,29 @@ def test_evaluate_run_writes_auditable_review(tmp_path: Path) -> None:
     assert materials["verification_cases"]
     assert any(item["evidence_id"] == "ev-000001"
                for item in materials["evidence"])
+
+
+def test_run_dispositions_reflect_investigation_terminal_states(
+        tmp_path: Path) -> None:
+    """票 20 AC:run 块分布 = 各 Investigation 终态投影,含非 not_started 词汇。
+
+    夹具盘上终态为 confirmed/inconclusive/not_started 混合,断言逐词与盘上
+    state.json 一致;若数据源退回 Candidate Store(队列投影只有 None/
+    not_started,本夹具下只能读出 {"not_started": 1}),confirmed/inconclusive
+    消失、本断言即红——反证错源回归。
+    """
+    gen_dir = _build_sealed_gen(tmp_path)
+    terminal: list[str] = []
+    for path in sorted((gen_dir / "investigations").glob("cand-*/state.json")):
+        snapshot = json.loads(path.read_text(encoding="utf-8"))
+        terminal.append(snapshot["state"]["investigation"]["disposition"])
+    expected = Counter(terminal)
+
+    artifact = evaluate_run(gen_dir, _write_gt(tmp_path), ScriptedReviewer())
+    distribution = artifact["run"]["investigation_dispositions"]
+    assert distribution == dict(sorted(expected.items()))
+    assert set(distribution) - {"not_started"}, \
+        "分布必须含非 not_started 词汇(错源回归)"
 
 
 def test_reviewed_projection_reported_separately(tmp_path: Path) -> None:
@@ -777,11 +817,15 @@ def test_replay_audit_detects_tampering(tmp_path: Path) -> None:
     def mutate_map(artifact: dict) -> None:
         artifact["candidate_map"]["candidates"] = []
 
+    def mutate_run(artifact: dict) -> None:
+        # 票 20:run 块复算与写入同源(Investigation 终态投影)。
+        artifact["run"]["investigation_dispositions"] = {"not_started": 5}
+
     def drop_match(artifact: dict) -> None:
         artifact["matches"] = artifact["matches"][:2]
 
     cases = (mutate_result, mutate_prompt, mutate_prompt_digest,
-             mutate_machine, mutate_map, drop_match)
+             mutate_machine, mutate_map, mutate_run, drop_match)
     for index, mutate in enumerate(cases):
         ws = tmp_path / f"case-{index}"
         gen_dir = _build_sealed_gen(ws)
