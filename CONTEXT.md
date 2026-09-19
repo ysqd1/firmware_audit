@@ -117,7 +117,7 @@ _Avoid_: Candidate(调查对象), Claim(待正式证明的主张), 多 Agent 辩
 _Avoid_: Agent 轮次, Candidate Queue
 
 **调查处置 (Investigation Disposition)**:
-Investigation 结束时的结果分类:confirmed / rejected / inconclusive / closed / unresolved / not_started。服务临时中断不产生 disposition,未完成 Investigation 保留原生命周期状态等待恢复。
+Investigation 结束时的结果分类:confirmed / rejected / inconclusive / closed / unresolved / not_started。服务临时中断不产生 disposition,未完成 Investigation 保留原生命周期状态等待恢复;案例总预算耗尽是例外——进行中的 Investigation 以 unresolved 收束,运行随后正常封存(2026-09-19 确认)。
 _Avoid_: lifecycle status, stop reason
 
 **停止原因 (stop reason)**:
@@ -189,7 +189,7 @@ Investigator 因决定性反证而停止某个 Candidate 的处理,必须保留�
 _Avoid_: reject_candidate(会与独立复核的 rejected 混淆), 误报
 
 **未决调查 (unresolved investigation)**:
-因预算、环境或关键材料不足而无法满足普通复核门槛的 Investigation。高优先级项可以补证复核案卷进入 verification,其余保留为可恢复记录。
+因预算、环境或关键材料不足而无法满足普通复核门槛的 Investigation。高优先级项可以补证复核案卷进入 verification;因案例总预算耗尽而未决的 Investigation 是终态记录(随运行封存,不再恢复),且不作为 Benchmark 评估的 partial primary(2026-09-19 确认)。
 _Avoid_: finding, 已排除调查
 
 **已确认问题 (confirmed issue)**:

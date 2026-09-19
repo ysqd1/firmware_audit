@@ -10,10 +10,13 @@ Claim/假设/缺口等语义状态的门槛与案卷冻结策略见 ``claims`` �
 submit_case 以 trial 状态过 ready gate 再冻结 Verification Case，连续五个
 无进展的已完成动作以 no_progress 收束；无效回复整份重生成（连续三次按
 unresolved/protocol_error 收束，不阻断后续队列），局部轮次与运行总预算
-（票 10）经 ``budget.RunBudget`` 守卫，运行级耗尽保存现场不落终态。模块
-的公开 interface 刻意只有 ``add_candidate``、``investigation_for``、
+（票 10）经 ``budget.RunBudget`` 守卫，运行级耗尽在 runner 内保存现场不落
+终态——收束由运行驱动统一执行（票 21：剩余 queued 标 not_started，进行中
+调查按 unresolved/budget_exhausted 终结，随后正常封存）。模块的公开
+interface 刻意只有 ``add_candidate``、``investigation_for``、
 ``candidate_for``、``begin_verification``、``finish_verification``、
-``mark_not_started``、``queued_ids``、``runnable_ids`` 和 ``run_analysis``。
+``mark_not_started``、``in_flight_ids``、``close_budget_exhausted``、
+``queued_ids``、``runnable_ids`` 和 ``run_analysis``。
 Session 与工具
 都是注入的 adapter，测试和生产调用走同一 seam。
 """
@@ -36,6 +39,7 @@ from .candidates import (
 )
 from .claims import (
     ADMISSION_REASONS,
+    IN_FLIGHT_LIFECYCLES,
     NO_PROGRESS_LIMIT,
     PolicyError,
     action_progressed,
@@ -396,6 +400,45 @@ class HostAnalysisTracer:
         self._finish_investigation(
             investigation, disposition="not_started", stop_reason=stop_reason)
         self._checkpoint(candidate_id, "marked_not_started")
+        return deepcopy(investigation)
+
+    def in_flight_ids(self) -> tuple[str, ...]:
+        """按创建序返回进行中的 Candidate(investigating/ready/verifying)。
+
+        运行总预算耗尽的收束入口,与 queued_ids(not_started 收账)并列:
+        覆盖轮次中途、案卷已冻结未派发复核、复核中途三种现场(票 21)。
+        """
+        return tuple(
+            candidate_id for candidate_id, investigation in self._investigations.items()
+            if investigation.lifecycle_status in IN_FLIGHT_LIFECYCLES
+        )
+
+    def close_budget_exhausted(self, candidate_id: str) -> Investigation:
+        """运行总预算耗尽时进行中调查的收束原语:finished/unresolved/budget_exhausted。
+
+        三种现场(轮次中途 investigating、案卷已冻结未复核
+        ready_for_verification、复核中途 verifying)统一按票 21(ADR-0012
+        2026-09-19)收束;复核会话的既有 Claim Result 不在此聚合——运行级
+        耗尽不产生复核结论,与案卷轮次耗尽的聚合路径(verification 级
+        budget_exhausted)分属两条口径。同值重放幂等(恢复续跑可能再次收束);
+        queued 必须走 mark_not_started,不得计作已检查。
+        """
+        investigation = self._live_investigation(candidate_id)
+        if investigation.lifecycle_status == "finished":
+            if (investigation.disposition, investigation.stop_reason) != (
+                    "unresolved", "budget_exhausted"):
+                raise ValueError(
+                    f"Investigation {investigation.investigation_id} 已以 "
+                    f"{investigation.disposition}/{investigation.stop_reason} 收束,"
+                    "不得改按预算耗尽收束;请检查原运行目录")
+            return deepcopy(investigation)
+        if investigation.lifecycle_status not in IN_FLIGHT_LIFECYCLES:
+            raise ValueError(
+                f"Investigation {investigation.investigation_id} 处于 "
+                f"{investigation.lifecycle_status},只有进行中的调查才能按预算耗尽收束")
+        self._finish_investigation(
+            investigation, disposition="unresolved", stop_reason="budget_exhausted")
+        self._checkpoint(candidate_id, "budget_exhausted_closed")
         return deepcopy(investigation)
 
     def queued_ids(self) -> tuple[str, ...]:

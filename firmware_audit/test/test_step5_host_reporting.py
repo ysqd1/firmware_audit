@@ -241,6 +241,42 @@ def test_completion_gate_failures(tmp_path: Path, mutate: str) -> None:
     assert all(isinstance(item, str) for item in failures)
 
 
+def test_completion_gate_exempts_budget_exhausted_unreviewed_ready_case(
+        tmp_path: Path) -> None:
+    """票 21:所属调查已按 unresolved/budget_exhausted 收束的未复核 ready
+    案卷,复核责任视为已了结;世代可正常封存为 completed。"""
+    gen_dir = _build_gen(tmp_path, name_suffix="-exempt")
+    state_path = gen_dir / "investigations" / "cand-0001" / "state.json"
+    snapshot = json.loads(state_path.read_text(encoding="utf-8"))
+    snapshot["state"]["investigation"].update(
+        disposition="unresolved", stop_reason="budget_exhausted")
+    _write_json(state_path, snapshot)
+    (gen_dir / "verifications" / "cand-0001" / "results.json").unlink()
+
+    assert completion_gate(gen_dir) == []
+    seal_run(gen_dir, now=2000.0)
+    assert load_run_state(gen_dir)["status"] == "completed"
+
+
+def test_completion_gate_still_rejects_non_budget_unreviewed_ready_case(
+        tmp_path: Path) -> None:
+    """票 21:豁免必须精确——其余未复核 ready 案卷(含非 budget_exhausted
+    原因收束的调查)照旧拒绝封存。"""
+    gen_dir = _build_gen(tmp_path, name_suffix="-strict")
+    state_path = gen_dir / "investigations" / "cand-0001" / "state.json"
+    snapshot = json.loads(state_path.read_text(encoding="utf-8"))
+    snapshot["state"]["investigation"].update(
+        disposition="unresolved", stop_reason="no_progress")
+    _write_json(state_path, snapshot)
+    (gen_dir / "verifications" / "cand-0001" / "results.json").unlink()
+
+    failures = completion_gate(gen_dir)
+    assert any("cand-0001" in item and "尚未复核" in item for item in failures)
+    with pytest.raises(SealError, match="尚未复核"):
+        seal_run(gen_dir, now=2000.0)
+    assert load_run_state(gen_dir)["status"] == "finalizing"
+
+
 # ---- S2 报告:固定顺序、确定性、敏感值呈现纪律 ----
 
 

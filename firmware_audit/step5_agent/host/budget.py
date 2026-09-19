@@ -8,8 +8,9 @@ llm_calls 并累计 token,回复被应用才计 validated_rounds;每次真实工
 配置解析优先级固定:显式参数 > 本机环境 > 版本化 profile > 代码默认值;
 最终生效值与键级来源写入 ``config.json`` 快照,结果可按实际预算解释。
 ``RunBudget`` 把台账与上限打包成三角色 runner 共用的守卫 seam;耗尽抛
-``BudgetExhaustedError``(现场已由既有 checkpoint 保存,当前调查不落终态,
-未处理项由调用方标 not_started)。
+``BudgetExhaustedError``(runner 内现场已由既有 checkpoint 保存,当前调查
+不落终态;调用方按票 21 收束——剩余 queued 标 not_started,进行中调查以
+unresolved/budget_exhausted 终结,随后同一 run 内正常封存)。
 """
 from __future__ import annotations
 

@@ -130,6 +130,13 @@ LEGAL_LIFECYCLE_TRANSITIONS: dict[str, frozenset[str]] = {
     "finished": frozenset(),
 }
 
+# 运行总预算耗尽时"进行中"的现场集合(票 21):轮次中途、案卷已冻结未
+# 复核、复核中途;queued 不在内——未开始项走 not_started 收账,不得计作
+# 已检查。收束统一落 finished/unresolved/budget_exhausted。
+IN_FLIGHT_LIFECYCLES = (
+    "investigating", "ready_for_verification", "verifying",
+)
+
 
 class PolicyError(ValueError):
     """Host 内部违反固定策略;不是模型反馈,不应回喂 Agent。"""

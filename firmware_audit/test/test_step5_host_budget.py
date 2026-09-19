@@ -43,7 +43,10 @@ from firmware_audit.test.test_step5_host_analysis import (
     FakeSession,
     FakeTool,
     _action,
+    _claims_delta,
     _close,
+    _submit,
+    _supported,
     GENERIC_REQUIRED,
 )
 from firmware_audit.test.test_step5_host_recon import (
@@ -629,6 +632,87 @@ def test_mark_not_started_and_queued_ids_close_unprocessed_candidates(
                      / "events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert events[-1] == "marked_not_started"
+
+
+def test_close_budget_exhausted_finishes_in_flight_investigations(
+        tmp_path: Path) -> None:
+    """票 21:运行总预算耗尽的进行中调查收束原语——三现场统一 unresolved。
+
+    轮次中途(investigating)与案卷冻结未复核(ready_for_verification、
+    verifying)统一落 finished/unresolved/budget_exhausted;queued 不归本
+    原语(必须走 mark_not_started,不得计作已检查),非预算耗尽终态不得
+    改写,同值重放幂等。
+    """
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool}, budget=_budget(tmp_path))
+    mid = host.add_candidate({"target": "extracted/a"})
+    submitted = host.add_candidate({"target": "extracted/b"})
+    untouched = host.add_candidate({"target": "extracted/c"})
+
+    class InterruptedAfterAction(FakeSession):
+        """第一步完成后抛错:留下轮次中途(investigating)的现场。"""
+
+        def step(self, input_message=None):
+            self.inputs.append(input_message)
+            if len(self.inputs) >= 2:
+                raise RuntimeError("mid-round interruption")
+            return next(self.proposals)
+
+    # 先驱动提交案卷的调查:其 Evidence 占 ev-000001,供 claims 引用。
+    host.run_analysis(submitted.candidate_id, FakeSession([
+        _action({}),
+        _action(_claims_delta(
+            {name: _supported("ev-000001") for name in GENERIC_REQUIRED})),
+        _submit("ready"),
+    ]))
+    with pytest.raises(RuntimeError, match="mid-round"):
+        host.run_analysis(mid.candidate_id, InterruptedAfterAction([_action({})]))
+    assert host.queued_ids() == (untouched.candidate_id,)
+    assert host.in_flight_ids() == (mid.candidate_id, submitted.candidate_id)
+
+    closed = host.close_budget_exhausted(submitted.candidate_id)
+    assert (closed.lifecycle_status, closed.disposition,
+            closed.stop_reason) == ("finished", "unresolved", "budget_exhausted")
+    assert host.in_flight_ids() == (mid.candidate_id,)
+    replayed = host.close_budget_exhausted(submitted.candidate_id)
+    assert (replayed.disposition, replayed.stop_reason) == (
+        "unresolved", "budget_exhausted")
+
+    with pytest.raises(ValueError, match="进行中"):
+        host.close_budget_exhausted(untouched.candidate_id)
+    host.mark_not_started(untouched.candidate_id)
+    with pytest.raises(ValueError, match="不得改按预算耗尽"):
+        host.close_budget_exhausted(untouched.candidate_id)
+
+    events = [
+        json.loads(line)["kind"]
+        for line in (tmp_path / "investigations" / submitted.candidate_id
+                     / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1] == "budget_exhausted_closed"
+
+    # 收束投影是合法终态:恢复侧重建不拒绝(断点续跑/封存前崩溃兼容)
+    restored = HostAnalysisTracer(
+        tmp_path, {"read_file": tool}, budget=_budget(tmp_path))
+    investigation = restored.investigation_for(submitted.candidate_id)
+    assert (investigation.lifecycle_status, investigation.disposition,
+            investigation.stop_reason) == ("finished", "unresolved",
+                                           "budget_exhausted")
+
+
+def test_close_budget_exhausted_covers_verifying_scene(tmp_path: Path) -> None:
+    """票 21:复核会话中途遇运行总预算耗尽同样按 unresolved 收束,不聚合
+    Claim Result(与案卷轮次耗尽的聚合路径分属两条口径);案卷保持无
+    results.json,由完成门豁免放行封存。"""
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    assert tracer.in_flight_ids() == (candidate_id,)
+    tracer.begin_verification(candidate_id)
+    closed = tracer.close_budget_exhausted(candidate_id)
+    assert (closed.lifecycle_status, closed.disposition,
+            closed.stop_reason) == ("finished", "unresolved", "budget_exhausted")
+    assert tracer.in_flight_ids() == ()
+    assert not (tmp_path / "verifications" / candidate_id
+                / "results.json").exists()
 
 
 # ---- S3:服务中断——零终态、零记账、strike 不沾染 ----

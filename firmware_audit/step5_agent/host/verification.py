@@ -12,8 +12,9 @@ analysis 的判定或说服性说明。
 本次会话 Evidence 留存与断点续跑,复核终态经 tracer 落回 Investigation
 lifecycle,confirmed 案卷由 Host 追加为唯一 Finding 来源。无效回复整份
 重生成(票 10):连续三次按 inconclusive/protocol_error 收束且不生成
-Finding;局部轮次与运行总预算经 ``budget.RunBudget`` 守卫,运行级耗尽
-保存现场不落终态。
+Finding;局部轮次与运行总预算经 ``budget.RunBudget`` 守卫——案卷轮次耗尽
+仍按已持久化 Claim Result 聚合(2026-09-16 确认),运行级耗尽在 runner 内
+保存现场不落终态,收束由运行驱动统一执行(票 21:unresolved/budget_exhausted)。
 """
 from __future__ import annotations
 

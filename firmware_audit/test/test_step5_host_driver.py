@@ -820,28 +820,105 @@ def test_driver_input_failure_is_auditable_and_creates_no_investigation(
     assert sessions2.recon.inputs == []
 
 
-def test_driver_budget_exhaustion_marks_queued_not_started(tmp_path: Path) -> None:
-    class AnalysisOneAction(SmartAnalysisSession):
-        """只走一步就收尾不了,配合极小 llm 预算触发耗尽。"""
+class NotesRecordingLLM(FakeDedupLLM):
+    """记录 Analyst Notes 请求的假 LLM:注记失败也不得阻塞封存(票 12 既有
+    语义在预算耗尽场景下的回归断言,票 21)。"""
 
+    def __init__(self):
+        super().__init__()
+        self.notes_requested = False
+
+    def chat(self, messages):
+        if any(m.get("role") == "system" and "Analyst Notes" in m.get("content", "")
+               for m in messages):
+            self.notes_requested = True
+            raise RuntimeError("注记请求失败也不得阻塞封存")
+        return super().chat(messages)
+
+
+def test_driver_budget_exhaustion_closes_investigations_and_seals(
+        tmp_path: Path) -> None:
+    """票 21(ADR-0012 2026-09-19):预算耗尽即收束,不再冻结世代。
+
+    剩余 queued 收账 not_started;进行中调查(案卷已冻结未复核、轮次中途)
+    统一 unresolved/budget_exhausted 收束;同一执行内走 accounting →
+    finalizing → seal,产出 completed 世代,报告与 manifest 齐备。run 级
+    停止原因与正常完成同词汇,预算耗尽由调查级 stop_reason 分布承载。
+    """
     sessions = _recon_sessions()
     # recon 2 + 评分 2 + cand-0001 全程 3 = 7;cand-0002 第一步被拒
     driver = _make_driver(
         tmp_path, sessions=sessions,
-        explicit={"max_llm_calls": 7})
+        llm=NotesRecordingLLM(), explicit={"max_llm_calls": 7})
     summary = driver.run()
-    assert summary.stop_reason == "budget_exhausted"
-    assert summary.status == "running"
+    assert summary.status == "completed"
+    assert summary.stop_reason == "sealed"
     state = load_run_state(summary.gen_dir)
-    assert state["status"] == "running"
-    # cand-0001 进行中保留现场;cand-0002 未开始 → not_started 收账
+    assert state["status"] == "completed"
+    assert state["stop_reason"] == "sealed"
+    # cand-0001:案卷已冻结未复核 → unresolved/budget_exhausted 收束
     first = json.loads((summary.gen_dir / "investigations" / "cand-0001"
                         / "state.json").read_text(encoding="utf-8"))
-    assert first["state"]["investigation"]["lifecycle_status"] == (
-        "ready_for_verification")
+    investigation = first["state"]["investigation"]
+    assert (investigation["lifecycle_status"], investigation["disposition"],
+            investigation["stop_reason"]) == ("finished", "unresolved",
+                                              "budget_exhausted")
+    # cand-0002:未开始 → not_started 收账(不得计作已检查)
     second = json.loads((summary.gen_dir / "investigations" / "cand-0002"
                          / "state.json").read_text(encoding="utf-8"))
     assert second["state"]["investigation"]["disposition"] == "not_started"
+    # 同一 run 内产出报告与封存块;预算耗尽经调查级停止原因分布承载
+    report = (summary.gen_dir / "report.md").read_text(encoding="utf-8")
+    assert "budget_exhausted" in report
+    assert "seal" in json.loads(
+        (summary.gen_dir / "manifest.json").read_text(encoding="utf-8"))
+    # Analyst Notes:耗尽后的注记请求照常发起,失败不阻塞封存
+    assert driver._llm.notes_requested  # noqa: SLF001 -- 断言注记未被预算闸拦下
+
+    # 耗尽封存后再次 run 默认开新世代,而非恢复旧世代
+    sessions2 = _recon_sessions()
+    summary2 = _make_driver(tmp_path, sessions=sessions2).run()
+    assert summary2.generation == "gen-0002"
+    assert summary2.created is True
+    assert summary2.status == "completed"
+    assert load_run_state(summary.gen_dir)["status"] == "completed"
+
+
+def test_driver_budget_exhaustion_closes_both_in_flight_scenes(
+        tmp_path: Path) -> None:
+    """票 21:处理中段耗尽,轮次中途与案卷冻结未复核两现场统一 unresolved。
+
+    recon 2 + 评分 2 + cand-0001 全程 3 = 7;cand-0002 第 1 轮(8)后第 2 轮
+    被拒:耗尽时 cand-0002 轮次中途(investigating),cand-0001 案卷已冻结
+    未复核(ready_for_verification)。两者统一收束,完成门豁免经真实封存
+    放行(票 21 Comments 现场)。
+    """
+    sessions = _recon_sessions()
+    driver = _make_driver(tmp_path, sessions=sessions,
+                          explicit={"max_llm_calls": 8})
+    summary = driver.run()
+    assert summary.status == "completed"
+    assert summary.stop_reason == "sealed"
+    # cand-0001:案卷已冻结未复核 → unresolved 收束
+    first = json.loads((summary.gen_dir / "investigations" / "cand-0001"
+                        / "state.json").read_text(encoding="utf-8"))
+    investigation = first["state"]["investigation"]
+    assert (investigation["lifecycle_status"], investigation["disposition"],
+            investigation["stop_reason"]) == ("finished", "unresolved",
+                                              "budget_exhausted")
+    # 复核未发生:无 results.json,由完成门豁免放行封存
+    assert (summary.gen_dir / "verifications" / "cand-0001" / "case.json").exists()
+    assert not (summary.gen_dir / "verifications" / "cand-0001"
+                / "results.json").exists()
+    # cand-0002:轮次中途(investigating)→ 同口径 unresolved 收束
+    second = json.loads((summary.gen_dir / "investigations" / "cand-0002"
+                         / "state.json").read_text(encoding="utf-8"))
+    investigation = second["state"]["investigation"]
+    assert (investigation["lifecycle_status"], investigation["disposition"],
+            investigation["stop_reason"]) == ("finished", "unresolved",
+                                              "budget_exhausted")
+    assert "seal" in json.loads(
+        (summary.gen_dir / "manifest.json").read_text(encoding="utf-8"))
 
 
 def test_driver_related_candidates_requeue_and_process_new_case(
@@ -980,14 +1057,24 @@ def test_driver_never_reads_legacy_semantic_artifacts(tmp_path: Path) -> None:
 
 
 def test_driver_rejects_illegal_projection_on_resume(tmp_path: Path) -> None:
-    sessions = _recon_sessions()
-    driver = _make_driver(tmp_path, sessions=sessions,
-                          explicit={"max_llm_calls": 7})
-    driver.run()  # 预算耗尽收账(cand-0002 → not_started)
-    gen_dir = driver.root / "generations" / "gen-0001"
+    """恢复路径拒绝非法投影(票 17):queued 配终态 disposition 是领域非法轴。
+
+    预算耗尽现已收束封存(票 21),恢复拒绝路径改用服务中断现场搭建。
+    """
+    class FailingAnalysis(SmartAnalysisSession):
+        def __init__(self, candidate_id):
+            super().__init__(
+                candidate_id,
+                fail_on_step=3 if candidate_id == "cand-0002" else None)
+
+    sessions = SessionScript(
+        recon=FakeReconSession([_recon_action(), _survey(_survey_delta())]),
+        analysis=FailingAnalysis)
+    with pytest.raises(RuntimeError, match="service down"):
+        _make_driver(tmp_path, sessions=sessions).run()
+    gen_dir = tmp_path / "generations" / "gen-0001"
     # 人为破坏一个投影:queued 配上终态 disposition(票 17 非法轴)
     def _damage(path: Path) -> None:
-        # queued 配终态 disposition:票 17 的领域非法轴
         document = json.loads(path.read_text(encoding="utf-8"))
         document["state"]["investigation"]["lifecycle_status"] = "queued"
         document["state"]["investigation"]["disposition"] = "confirmed"

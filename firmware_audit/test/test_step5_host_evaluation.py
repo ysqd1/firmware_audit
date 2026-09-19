@@ -172,7 +172,7 @@ def _finding_document(finding_id: str, candidate_id: str, severity: str) -> dict
     }
 
 
-def _store_document() -> dict:
+def _store_document(*, with_budget_exhausted_case: bool = False) -> dict:
     """生产写入方形态的 Candidate Store(票 20 夹具契约)。
 
     queue/disposition 是选取投影(票 11 口径):已入选 → disposition=None
@@ -193,23 +193,28 @@ def _store_document() -> dict:
             "priority": {"total": 5},
         }
 
+    candidates = [
+        record("cand-0001", "extracted/etc/shadow", selected=True),
+        record("cand-0002", "extracted/unitree/bin/service",
+               selected=True),
+        record("cand-0003", "extracted/usr/lib/libhttpd.so",
+               selected=True),
+        record("cand-0004", "extracted/etc/shadow", selected=True),
+        record("cand-0005", "extracted/opt/vendor", selected=False,
+               kind="coverage"),
+        # 入选但预算耗尽未开跑:调查终态 not_started(票 20 混合词汇)。
+        record("cand-0006", "extracted/opt/daemon", selected=True),
+    ]
+    if with_budget_exhausted_case:
+        # 票 21:入选但预算耗尽按 unresolved 收束的调查,案卷冻结未复核。
+        candidates.append(
+            record("cand-0007", "extracted/etc/website.conf", selected=True))
     return {
         "schema_version": CANDIDATE_STORE_SCHEMA_VERSION,
         "survey": {"attack_surface": [{"area": "etc/ 配置"}],
                    "checked_scope": ["extracted/etc/*"],
                    "coverage_gaps": []},
-        "candidates": [
-            record("cand-0001", "extracted/etc/shadow", selected=True),
-            record("cand-0002", "extracted/unitree/bin/service",
-                   selected=True),
-            record("cand-0003", "extracted/usr/lib/libhttpd.so",
-                   selected=True),
-            record("cand-0004", "extracted/etc/shadow", selected=True),
-            record("cand-0005", "extracted/opt/vendor", selected=False,
-                   kind="coverage"),
-            # 入选但预算耗尽未开跑:调查终态 not_started(票 20 混合词汇)。
-            record("cand-0006", "extracted/opt/daemon", selected=True),
-        ],
+        "candidates": candidates,
     }
 
 
@@ -228,8 +233,14 @@ _EVIDENCE = (
 
 def _build_sealed_gen(
     tmp_path: Path, *, closed_investigation: bool = False,
+    budget_exhausted_case: bool = False,
 ) -> Path:
-    """构造处理责任收束并真正 seal_run 封存的世代。"""
+    """构造处理责任收束并真正 seal_run 封存的世代。
+
+    ``budget_exhausted_case`` 追加票 21 现场:cand-0007 入选后预算耗尽,
+    Investigation 按 unresolved/budget_exhausted 收束,ready 案卷冻结但无
+    results.json(完成门豁免放行封存)。
+    """
     _name, gen_dir = create_generation(tmp_path / "ws", now=1000.0)
     save_run_state(gen_dir, status="finalizing", phase="accounting",
                    stop_reason="processing_complete")
@@ -241,12 +252,15 @@ def _build_sealed_gen(
         "validated_rounds": 10, "tool_attempts": 30,
         "logical_tool_calls": 26, "active_seconds": 120.5,
     })
-    _write_json(gen_dir / "candidates.json", _store_document())
+    _write_json(gen_dir / "candidates.json", _store_document(
+        with_budget_exhausted_case=budget_exhausted_case))
 
     dispositions = {"cand-0001": "confirmed", "cand-0002": "inconclusive",
                     "cand-0003": "confirmed", "cand-0004": "confirmed",
                     # 预算耗尽未开跑的入选调查:终态 not_started,无案卷。
                     "cand-0006": "not_started"}
+    if budget_exhausted_case:
+        dispositions["cand-0007"] = "unresolved"
     if closed_investigation:
         dispositions["cand-0002"] = "closed"
     for candidate_id, disposition in dispositions.items():
@@ -254,7 +268,8 @@ def _build_sealed_gen(
                     _investigation_state(
                         candidate_id, disposition,
                         stop_reason="budget_exhausted"
-                        if disposition == "not_started" else "completed"))
+                        if disposition in ("not_started", "unresolved")
+                        else "completed"))
     for evidence_id, candidate_id, arguments, summary in _EVIDENCE:
         _write_json(
             gen_dir / "investigations" / candidate_id / "evidence"
@@ -268,6 +283,10 @@ def _build_sealed_gen(
                                     ("cand-0004", "ready")):
         _write_json(gen_dir / "verifications" / candidate_id / "case.json",
                     _case_document(candidate_id, admission))
+    if budget_exhausted_case:
+        # 票 21:冻结未复核的 ready 案卷——调查已按预算耗尽收束,无 results.json
+        _write_json(gen_dir / "verifications" / "cand-0007" / "case.json",
+                    _case_document("cand-0007", "ready"))
     verdicts = {"cand-0001": "confirmed", "cand-0002": "inconclusive",
                 "cand-0003": "confirmed", "cand-0004": "confirmed"}
     finding_ids = {"cand-0001": "f-0001", "cand-0003": "f-0002",
@@ -756,6 +775,61 @@ def test_closed_investigation_cannot_be_primary(tmp_path: Path) -> None:
     reply = _review_reply()
     with pytest.raises(EvaluationError, match="inconclusive"):
         evaluate_run(gen_dir, _write_gt(tmp_path), ScriptedReviewer(reply))
+
+
+def test_evaluation_accepts_budget_exhausted_unresolved_generation(
+        tmp_path: Path) -> None:
+    """票 21:unresolved 收束的世代通过 sealed 门并可完整评估。
+
+    材料包含未决调查与冻结未复核案卷;unresolved 不得作 primary(评审回复
+    硬拒绝),对应 Ground Truth 只能判 miss;指标与运行面分布如实承载
+    unresolved。
+    """
+    gen_dir = _build_sealed_gen(tmp_path, budget_exhausted_case=True)
+    gt = _gt_document()
+    gt["items"].append({
+        "gt_id": "gt-0004", "title": "网站配置默认凭据",
+        "root_cause": {"path": "etc/website.conf",
+                       "mechanism": "默认凭据未修改"},
+        "entry_point": "etc/website.conf",
+        "key_relations": ["登录认证"],
+        "impact": "管理权限泄露",
+    })
+    gt_path = _write_gt(tmp_path, gt)
+
+    reply = _review_reply()
+    reply["matches"].append({
+        "gt_id": "gt-0004", "primary": None, "duplicates": [],
+        "fields": _fields(), "rationale": "机器侧预算耗尽未决,无可信对应"})
+    reviewer = ScriptedReviewer(reply)
+    artifact = evaluate_run(gen_dir, gt_path, reviewer,
+                            model="codex-evaluator-x")
+
+    # 评审材料全量:未决调查与冻结未复核案卷都在场
+    materials = json.loads(reviewer.messages[1]["content"])
+    investigations = {item["candidate_id"]: item
+                      for item in materials["investigations"]}
+    assert investigations["cand-0007"]["disposition"] == "unresolved"
+    cases = {case["case"]["candidate_id"]: case
+             for case in materials["verification_cases"]}
+    assert cases["cand-0007"]["results"] is None
+    # 对应 GT 判 miss;unresolved 进入运行面 disposition 分布
+    assert artifact["metrics"]["machine"]["results"]["miss"] == 1
+    assert artifact["run"]["investigation_dispositions"].get("unresolved") == 1
+
+    # unresolved 不得作 primary:评审回复被确定性校验拒绝(独立世代,避免
+    # 撞上"评审工件已存在"守卫)
+    negative_gen = _build_sealed_gen(tmp_path / "negative",
+                                     budget_exhausted_case=True)
+    bad = _review_reply()
+    bad["matches"].append({
+        "gt_id": "gt-0004",
+        "primary": {"kind": "investigation", "id": "cand-0007"},
+        "duplicates": [], "fields": _fields(),
+        "rationale": "未决调查不得作 primary"})
+    with pytest.raises(EvaluationError, match="inconclusive"):
+        evaluate_run(negative_gen, gt_path, ScriptedReviewer(bad),
+                     model="codex-evaluator-x")
 
 
 # ---- S5 指标纯函数(AC6/AC7) ----

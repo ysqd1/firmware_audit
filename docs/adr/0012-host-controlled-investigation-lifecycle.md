@@ -72,7 +72,7 @@ Ground Truth 未覆盖的 confirmed Finding 标为 unmatched,由 Codex 进一步
 
 预算按真实消耗计数:每次模型请求都计入 llm_calls,包括协议重新生成、上下文压缩和中断后的重新请求;另记 validated_rounds。工具每次真实执行均计入 tool_attempts,另记 logical_tool_calls。token 全量累计,7200 秒只计活动执行时间,不包含关机或等待恢复的间隔;no_progress 只计成功完成的语义动作。
 
-配置优先级为显式运行参数、`.env` 本机覆盖、版本化 profile、代码默认值,最终生效值必须进入运行快照。案例总预算耗尽时保存当前 Investigation,尚未开始的 Candidate 标为 not_started,不得计作已检查。单个工具失败作为 Observation 留存并允许 Agent 选择替代方法;模型服务中断则保存运行现场并结束本次执行,恢复后继续,不生成替代结论。
+配置优先级为显式运行参数、`.env` 本机覆盖、版本化 profile、代码默认值,最终生效值必须进入运行快照。案例总预算耗尽时,进行中的 Investigation 以 unresolved、stop_reason=budget_exhausted 收束(2026-09-19 确认,见文末),尚未开始的 Candidate 标为 not_started,不得计作已检查;收束后运行按正常路径封存。单个工具失败作为 Observation 留存并允许 Agent 选择替代方法;模型服务中断则保存运行现场并结束本次执行,恢复后继续,不生成替代结论。
 
 Candidate Queue 分为 signal 与 coverage 两队。单案例默认 8 个处理名额中为最高优先级 coverage Candidate 保留 1 个,没有 coverage Candidate 时该名额自动归还 signal 队列。signal 分数=外部可达性+输入可控性+高影响操作+路径进展+材料强度-预计成本;coverage 分数=组件价值+外部暴露程度+尚未检查程度-预计成本。各项只取 0/1/2,缺少依据时取 0;LLM 只提交分项判断与依据,Host 计算总分,同分按创建顺序。本次 Candidate 上限只限制实际处理数量,所有 proposal 仍进入 Candidate Store,超出上限者标为 not_started。
 
@@ -103,6 +103,16 @@ Related Candidate 只继承相关 Investigation State、Evidence References 与�
 
 1. **关键信息缺失按最重档代入**：结构化 facet 缺失时，影响范围按"系统级或信任边界"、触发条件按"宽松"代入矩阵计算，计算后仍封顶不得 critical——未知信息不降低严重度，但最高档必须建立在完整事实之上（承接 L59 的"关键字段缺失时不得给出 critical"）。
 2. **前置条件不适用即宽松触发**：`preconditions` 判 `not_applicable` 视为"无前置条件"，按宽松触发计且属完整信息，不算缺失。
+
+## 2026-09-19 预算耗尽收束语义确认（票 21）
+
+用户确认案例总预算耗尽不再冻结世代。背景：配置快照在恢复路径冻结生效，原"保存供恢复"的世代实际无法取得进展（预算上限不可调高），恢复即再停；票 16 冒烟预演已实撞该场景。本节取代票 11 验收记录中"预算冻结世代恢复立即再停、force 新世代是唯一出路"的取舍；实施与验收由票 21 承接。
+
+1. **耗尽即收束**：案例总预算耗尽时，进行中的 Investigation（含轮次中途、ready_for_verification 未提交、案卷冻结未复核三种现场）统一以 `disposition=unresolved`、`stop_reason=budget_exhausted`、lifecycle `finished` 收束；随后运行走正常 finalizing → completed 路径封存，无需 force 新世代。服务临时中断的恢复语义不变。
+2. **完成门精确豁免**：完成门"全部 ready 案卷已复核"的检查，对所属调查已按上述口径收束（unresolved + budget_exhausted）的未复核案卷豁免；其余未复核 ready 案卷照旧拒绝封存。"入选调查须有 disposition"的检查不变（unresolved 满足）。
+3. **同一 run 内封存**：收束后在同一执行内直接完成报告与封存；Analyst Notes 维持"只记账不过预算闸、失败不阻塞封存"的既有语义。finalizing 恢复路径仍只服务报告/manifest 写失败场景。
+4. **run 级停止原因词汇不变**：收束后 run_state 的 stop_reason 为 `processing_complete`，与正常完成一致；预算耗尽由调查级 stop_reason 分布承载，不新增 run 级词汇。
+5. **评估口径不变**：unresolved 调查仍不得作为 Benchmark 评估的 partial primary（维持票 15 规则），预算耗尽对应的 Ground Truth 条目判 miss；是否放宽待首批案例实测后再议。
 
 ## 代价与影响
 

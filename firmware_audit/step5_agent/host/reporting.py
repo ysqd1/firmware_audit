@@ -69,7 +69,12 @@ class SealError(ValueError):
 
 
 def completion_gate(gen_dir: Path) -> list[str]:
-    """逐条检查封存前置条件;返回可读失败清单(空清单 = 可以封存)。"""
+    """逐条检查封存前置条件;返回可读失败清单(空清单 = 可以封存)。
+
+    "全部 ready 案卷已复核"带票 21(ADR-0012 2026-09-19)的精确豁免:所属
+    Investigation 已按 unresolved/budget_exhausted 收束的未复核案卷,复核
+    责任视为已了结;其余未复核 ready 案卷照旧拒绝。
+    """
     gen_dir = Path(gen_dir)
     failures: list[str] = []
     store_path = gen_dir / "candidates.json"
@@ -93,10 +98,16 @@ def completion_gate(gen_dir: Path) -> list[str]:
                 f"(实际 {record.get('disposition')!r})")
     for case in load_cases(gen_dir):
         candidate_id = case.get("candidate_id")
-        if (case.get("admission_reason") == "ready" and not (
-                gen_dir / "verifications" / str(candidate_id)
-                / "results.json").exists()):
-            failures.append(f"ready 案卷 {candidate_id} 尚未复核")
+        if case.get("admission_reason") != "ready":
+            continue
+        if (gen_dir / "verifications" / str(candidate_id)
+                / "results.json").exists():
+            continue
+        investigation = _investigation_snapshot(gen_dir, str(candidate_id))
+        if (investigation.get("disposition") == "unresolved"
+                and investigation.get("stop_reason") == "budget_exhausted"):
+            continue  # 票 21:调查已按预算耗尽收束,复核责任随之了结
+        failures.append(f"ready 案卷 {candidate_id} 尚未复核")
     return failures
 
 

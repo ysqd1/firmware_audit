@@ -4,7 +4,7 @@
 session factory + 真 AgentSession + 真 read_file 工具)+ 临时工作区 +
 ScriptedLLM,跑通 recon → Candidate Store → Investigation → Verification →
 确定性报告 → manifest → sealed run,并断言世代工件、默认 resume、强制新
-世代、预算耗尽 not_started、sealed immutability 与旧三工件零读取。
+世代、预算耗尽收束封存(票 21)、sealed immutability 与旧三工件零读取。
 
 另保留 engine/context 四分区与压缩契约、启动门、resolve_workspace、无 key
 报错等入口级测试。
@@ -314,20 +314,26 @@ def test_public_entry_force_and_sealed_immutability() -> list[str]:
     return fails
 
 
-def test_public_entry_budget_exhaustion_marks_not_started(monkeypatch) -> list[str]:
-    """运行预算耗尽:进行中调查保留现场,未开始 Candidate 收账 not_started。"""
+def test_public_entry_budget_exhaustion_closes_and_seals(monkeypatch) -> list[str]:
+    """票 21(ADR-0012 2026-09-19):预算耗尽即收束,同一 run 封存 completed。
+
+    进行中调查(案卷已冻结未复核)按 unresolved/budget_exhausted 收束,
+    未开始 Candidate 收账 not_started;报告与 manifest 齐备,run 级停止原因
+    与正常完成同词汇;耗尽封存后再次 run 默认开新世代。
+    """
     fails: list[str] = []
     monkeypatch.setenv("STEP5_MAX_LLM_CALLS", "7")  # recon2+评分2+c1全程3 = 7
     try:
         with tempfile.TemporaryDirectory() as td:
             target = _make_workspace(Path(td))
             summary = step5_run(target, llm=ScriptedLLM(full_chain_script()))
-            if summary["status"] != "running" or summary["stop_reason"] != "budget_exhausted":
-                fails.append(f"应按预算耗尽收束: {summary['status']}/{summary['stop_reason']}")
+            if summary["status"] != "completed" or summary["stop_reason"] != "sealed":
+                fails.append(f"耗尽后应同一 run 封存: "
+                             f"{summary['status']}/{summary['stop_reason']}")
             gen_dir = Path(summary["gen_dir"])
             state = load_run_state(gen_dir)
-            if state["stop_reason"] != "budget_exhausted":
-                fails.append(f"run_state 应记 budget_exhausted: {state}")
+            if state["status"] != "completed" or state["stop_reason"] != "sealed":
+                fails.append(f"run_state 应与正常完成同词汇: {state}")
             store = json.loads((gen_dir / "candidates.json").read_text(encoding="utf-8"))
             by_id = {c["candidate_id"]: c for c in store["candidates"]}
             if not by_id["cand-0002"]["queue"]["selected"]:
@@ -339,8 +345,24 @@ def test_public_entry_budget_exhaustion_marks_not_started(monkeypatch) -> list[s
                              f"{second['state']['investigation']}")
             first = json.loads((gen_dir / "investigations" / "cand-0001"
                                 / "state.json").read_text(encoding="utf-8"))
-            if first["state"]["investigation"]["lifecycle_status"] != "ready_for_verification":
-                fails.append("进行中责任不得被预算耗尽静默丢弃")
+            investigation = first["state"]["investigation"]
+            if (investigation["disposition"], investigation["stop_reason"]) != (
+                    "unresolved", "budget_exhausted"):
+                fails.append(f"案卷冻结未复核的调查应按预算耗尽收束: "
+                             f"{investigation}")
+            if not (gen_dir / "report.md").is_file():
+                fails.append("耗尽收束的世代也应产出确定性报告")
+            manifest = json.loads(
+                (gen_dir / "manifest.json").read_text(encoding="utf-8"))
+            if "seal" not in manifest:
+                fails.append(f"manifest 应含封存块: {manifest}")
+
+            # 耗尽封存后再次 run 默认开新世代,而非恢复旧世代
+            second_summary = step5_run(target, llm=ScriptedLLM(full_chain_script()))
+            if second_summary["generation"] != "gen-0002" or not second_summary["created"]:
+                fails.append(f"耗尽封存后应默认开新世代: {second_summary}")
+            if second_summary["status"] != "completed":
+                fails.append(f"新世代应完成: {second_summary['status']}")
     finally:
         monkeypatch.delenv("STEP5_MAX_LLM_CALLS", raising=False)
     return fails

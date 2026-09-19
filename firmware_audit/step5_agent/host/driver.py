@@ -12,8 +12,10 @@ Candidate → 循环 {Analysis 队列 → Verification 案卷队列(ready 优先
 evidence-gap 按优先级)→ Related Candidate 幂等回队} 至不动点 → 收尾
 (处理责任收束,status=finalizing)→ 封存(票 12:可选 LLM 注记 →
 确定性事实报告 → manifest seal → completed)。finalizing 世代的恢复只续
-封存、不重跑处理;封存失败保持 finalizing 可恢复;预算耗尽按可解释停止
-收账(剩余 queued 标 not_started);模型服务中断保存现场并原样上抛。
+封存、不重跑处理;封存失败保持 finalizing 可恢复。案例总预算耗尽按票 21
+(ADR-0012 2026-09-19)即收束:剩余 queued 标 not_started,进行中调查统一
+unresolved/budget_exhausted 终结,同一执行内走正常封存产出 completed 世代,
+不冻结世代;模型服务中断保存现场并原样上抛(该路径仍可续跑)。
 """
 from __future__ import annotations
 
@@ -268,19 +270,51 @@ class RunDriver:
         try:
             return self._execute(name, gen_dir, created, budget, resolved, tracer)
         except BudgetExhaustedError:
-            # 预算耗尽是可解释的正常停止:剩余 queued 收账 not_started,
-            # 进行中的调查保留现场(不落终态),未复核 ready 案卷保留责任。
-            for candidate_id in tracer.queued_ids():
-                tracer.mark_not_started(candidate_id)
-            save_run_state(gen_dir, status="running", phase=self._phase,
-                           stop_reason="budget_exhausted")
-            return self._summary(name, gen_dir, created, "running",
-                                 "budget_exhausted")
+            # 票 21(ADR-0012 2026-09-19):预算耗尽即收束,不再冻结世代。
+            # 剩余 queued 收账 not_started,进行中的调查(轮次中途、案卷已
+            # 冻结未复核、复核中途)统一 unresolved/budget_exhausted 收束,
+            # 随后同一执行内走正常 accounting → finalizing → 封存,产出
+            # completed 世代;run 级停止原因与正常完成同词汇,预算耗尽由
+            # 调查级 stop_reason 分布承载。
+            return self._settle_budget_exhaustion(
+                name, gen_dir, created, budget, tracer)
         except Exception as exc:
             # 模型服务中断等异常:现场已由既有 checkpoint 保存,这里只补一个
             # 可解释的停止原因并原样上抛(StoreError 即票 17 的拒绝路径)。
             self._record_failure(gen_dir, exc)
             raise
+
+    def _settle_budget_exhaustion(
+        self, name: str, gen_dir: Path, created: bool, budget: RunBudget,
+        tracer: HostAnalysisTracer,
+    ) -> RunSummary:
+        """预算耗尽的收账与收束(票 21),随后与正常完成共用封存路径。
+
+        收账/收束失败保持 running 现场可恢复;进入封存后的失败与正常路径
+        同语义(保持 finalizing)。耗尽发生在 Candidate Store 建立之前
+        (recon/去重阶段)时,完成门会以"Candidate Store 缺失"拒绝封存——
+        世代停在 finalizing 并留响亮失败原因,force 新世代是唯一出路;
+        该现场说明配置连 recon 都跑不完,属退化配置。
+        """
+        try:
+            for candidate_id in tracer.queued_ids():
+                tracer.mark_not_started(candidate_id)
+            for candidate_id in tracer.in_flight_ids():
+                tracer.close_budget_exhausted(candidate_id)
+            return self._begin_finalizing(name, gen_dir, created, budget)
+        except Exception as exc:
+            self._record_failure(gen_dir, exc)
+            raise
+
+    def _begin_finalizing(
+        self, name: str, gen_dir: Path, created: bool, budget: RunBudget,
+    ) -> RunSummary:
+        """处理责任全部收束后的唯一收尾路径:accounting → finalizing → 封存。"""
+        self._set_phase(gen_dir, "accounting")
+        save_run_state(gen_dir, status="finalizing", phase="accounting",
+                       stop_reason="processing_complete")
+        self._finalizing = True
+        return self._seal(name, gen_dir, created, budget)
 
     def _execute(
         self, name: str, gen_dir: Path, created: bool, budget: RunBudget,
@@ -346,6 +380,10 @@ class RunDriver:
                     # 已收尾案卷:幂等重放只补齐生命周期落账,不驱动 Session。
                     verifier.run_case(candidate_id, _ReplayOnlySession())
                     continue
+                if lifecycle == "finished":
+                    # 票 21:预算耗尽收束的调查,案卷复核责任已随之了结
+                    # (无 results.json 也不是待办);恢复路径不得再派发复核。
+                    continue
                 verifier.run_case(
                     candidate_id, self._session("verification", candidate_id))
 
@@ -361,11 +399,7 @@ class RunDriver:
                 break  # 幂等不动点:没有新增入选 Candidate
 
         # ---- 收尾:处理责任全部收束 → 事实报告与封存(票 12) ----
-        self._set_phase(gen_dir, "accounting")
-        save_run_state(gen_dir, status="finalizing", phase="accounting",
-                       stop_reason="processing_complete")
-        self._finalizing = True
-        return self._seal(name, gen_dir, created, budget)
+        return self._begin_finalizing(name, gen_dir, created, budget)
 
     # ---- 封存(票 12) ----
 
