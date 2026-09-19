@@ -66,6 +66,7 @@ from .store import (
     StoreError,
     atomic_json,
     store_error_boundary,
+    unknown_keys,
 )
 from .tooling import (
     compact_session_context,
@@ -125,7 +126,7 @@ def _optional_string(value: Any, label: str) -> str | None:
 
 
 def _known_keys(value: dict, allowed: frozenset[str] | set[str], label: str) -> None:
-    unknown = [key for key in value if key not in allowed]
+    unknown = unknown_keys(value, allowed)
     if unknown:
         _reject(f"{label} 含未知字段: {', '.join(map(str, unknown))};"
                 f"允许字段: {', '.join(sorted(allowed))}")

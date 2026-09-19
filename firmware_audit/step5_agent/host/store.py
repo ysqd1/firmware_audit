@@ -63,6 +63,17 @@ def _version(value: dict, field: str, expected: int) -> None:
         raise StoreError(f"{field} 不兼容；请创建新运行世代，保留原目录供检查")
 
 
+def unknown_keys(value: dict, allowed) -> list[str]:
+    """未知字段检测的单一出处(claims/verification/evaluation 共用)。
+
+    只负责"哪些键不在白名单里"这一纯判定与排序;是否抛错、抛什么错误
+    类型由调用方决定——三个模块的错误通道(ProposalRejectedError /
+    PolicyError / EvaluationError)语义不同,不在此处合并。
+    """
+    allow = set(allowed)
+    return [str(key) for key in value if key not in allow]
+
+
 def read_json_object(
     path: Path, label: str, *, guidance: str = "请检查原运行目录",
 ) -> dict:

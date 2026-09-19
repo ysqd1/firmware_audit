@@ -397,3 +397,42 @@ def test_legitimate_successor_append_keeps_earlier_record(
     assert [item["seq"] for item in surviving] == [1, 2]
     assert surviving[0] == record
     assert surviving[1]["reviewer"] == "codex/successor"
+
+
+def test_reviewed_severities_complete_when_adjusted_finding_is_not_first(
+        tmp_path: Path) -> None:
+    """票 15 回归:reviewed 分布是全量分布,与被调整 Finding 的位置无关。
+
+    计数器惰性初始化曾漏掉排在被调整 Finding 之前的未调整项;修复后
+    先建 entries 再统一计数。
+    """
+    _name, gen_dir = create_generation(tmp_path, now=1000.0)
+    findings = []
+    for finding_id in ("f-0001", "f-0002"):
+        findings.append({
+            "schema_version": FINDING_SCHEMA_VERSION,
+            "finding_id": finding_id,
+            "candidate_id": "cand-0001",
+            "investigation_id": "cand-0001",
+            "claim_profile": "data_propagation",
+            "admission_reason": "ready",
+            "verdict": "confirmed",
+            "severity": "high",
+            "claims": {},
+            "evidence_references": [],
+            "related_candidates": [],
+        })
+    (gen_dir / "findings.json").write_text(
+        json.dumps({"schema_version": FINDING_SCHEMA_VERSION,
+                    "findings": findings}, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    _write_evidence(gen_dir, "ev-000001")
+    save_run_state(gen_dir, status="completed")
+    overlay = ReviewOverlay(gen_dir)
+    overlay.append(reviewer="human/dr", finding_id="f-0002", field="severity",
+                   old_value="high", new_value="low", rationale="影响有限",
+                   evidence_ids=["ev-000001"])
+    projection = load_review_projection(gen_dir)
+    assert projection["summary"]["machine_severities"] == {"high": 2}
+    assert projection["summary"]["reviewed_severities"] == {"high": 1,
+                                                            "low": 1}

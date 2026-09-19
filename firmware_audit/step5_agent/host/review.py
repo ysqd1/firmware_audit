@@ -226,34 +226,36 @@ def project_review_report(
     """
     findings = [finding for finding in findings_document.get("findings", [])
                 if isinstance(finding, dict)]
-    machine_severities = Counter(
-        finding["severity"] for finding in findings if "severity" in finding)
     by_finding: dict[Any, list[dict[str, Any]]] = {}
     for record in reviews:
         target = record["target"]
         if target["artifact"] == "finding":
             by_finding.setdefault(target["finding_id"], []).append(record)
     entries: list[dict[str, Any]] = []
-    reviewed_severities: Counter | None = None
     for finding in findings:
         history = deepcopy(by_finding.get(finding.get("finding_id"), []))
         reviewed = deepcopy(finding)
         for record in history:
             reviewed[record["target"]["field"]] = record["new_value"]
-        adjusted = bool(history)
-        if adjusted and reviewed_severities is None:
-            reviewed_severities = Counter()
-        if reviewed_severities is not None:
-            # reviewed 侧是完整分布:未调整 Finding 沿用机器 severity。
-            effective = reviewed if adjusted else finding
-            if "severity" in effective:
-                reviewed_severities[effective["severity"]] += 1
         entries.append({
             "finding_id": finding.get("finding_id"),
             "machine": deepcopy(finding),
-            "reviewed": reviewed if adjusted else None,
+            "reviewed": reviewed if history else None,
             "history": history,
         })
+    machine_severities = Counter(
+        finding["severity"] for finding in findings if "severity" in finding)
+    # reviewed 侧是完整分布:任一 Finding 被调整后,全部 Finding 都计入
+    # (未调整者沿用机器 severity)。先建 entries 再统一计数,避免计数器
+    # 惰性初始化漏掉排在被调整 Finding 之前的未调整项。
+    reviewed_severities: Counter | None = None
+    if any(entry["history"] for entry in entries):
+        reviewed_severities = Counter()
+        for entry in entries:
+            effective = entry["reviewed"] if entry["reviewed"] is not None \
+                else entry["machine"]
+            if "severity" in effective:
+                reviewed_severities[effective["severity"]] += 1
     return {
         "schema_version": REVIEW_PROJECTION_SCHEMA_VERSION,
         "findings": entries,

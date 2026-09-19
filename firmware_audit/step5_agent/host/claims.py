@@ -20,6 +20,7 @@ from .candidates import (
     related_candidate_records,
 )
 from .json_values import JsonValueError, clone_json_value
+from .store import unknown_keys
 from .session import ProposalRejectedError
 
 # ---- Claim Profile:共同必填项 + 各 Profile 额外决定性项(ADR-0012)----
@@ -191,9 +192,9 @@ def _optional_string(value: Any, label: str) -> str | None:
 
 
 def _known_keys(value: Mapping, allowed: frozenset[str] | set[str], label: str) -> None:
-    unknown = [key for key in value if key not in allowed]
+    unknown = unknown_keys(value, allowed)
     if unknown:
-        _reject(f"{label} 含未知字段: {', '.join(map(str, unknown))};"
+        _reject(f"{label} 含未知字段: {', '.join(unknown)};"
                 f"允许字段: {', '.join(sorted(allowed))}")
 
 
