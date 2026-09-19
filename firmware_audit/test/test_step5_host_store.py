@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError
+from firmware_audit.step5_agent.host.store import (
+    InvestigationStore,
+    StoreError,
+    load_investigation_snapshot,
+)
 
 
 @pytest.mark.parametrize("reuse_instance", [False, True])
@@ -68,3 +72,53 @@ def test_history_gap_and_snapshot_without_history_refuse_resume(tmp_path):
     store.events_path.unlink()
     with pytest.raises(StoreError, match="历史"):
         InvestigationStore(tmp_path, "cand-0001")
+
+
+# ---- 票 22:Investigation 终态投影的共享解包(reporting/evaluation 共用)----
+
+
+def _write_state_snapshot(path: Path, state: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"schema_version": 1, "last_event_seq": 1, "state": state},
+                   ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    return path
+
+
+def test_load_investigation_snapshot_missing_state_returns_none(tmp_path):
+    path = tmp_path / "investigations" / "cand-0001" / "state.json"
+    assert load_investigation_snapshot(path) is None
+
+
+def test_load_investigation_snapshot_returns_terminal_projection(tmp_path):
+    path = _write_state_snapshot(
+        tmp_path / "investigations" / "cand-0001" / "state.json",
+        {"investigation": {"candidate_id": "cand-0001",
+                           "lifecycle_status": "finished",
+                           "disposition": "confirmed",
+                           "stop_reason": "completed"},
+         "runtime": {}})
+    assert load_investigation_snapshot(path) == {
+        "candidate_id": "cand-0001", "lifecycle_status": "finished",
+        "disposition": "confirmed", "stop_reason": "completed"}
+
+
+def test_load_investigation_snapshot_rejects_corrupt_json(tmp_path):
+    path = tmp_path / "investigations" / "cand-0001" / "state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{broken", encoding="utf-8")
+    with pytest.raises(StoreError, match="Investigation 快照损坏"):
+        load_investigation_snapshot(path)
+
+
+@pytest.mark.parametrize("state", [
+    pytest.param({}, id="missing-investigation"),
+    pytest.param({"investigation": "finished"}, id="non-object-investigation"),
+])
+def test_load_investigation_snapshot_rejects_broken_projection(
+        tmp_path, state):
+    path = _write_state_snapshot(
+        tmp_path / "investigations" / "cand-0001" / "state.json", state)
+    with pytest.raises(StoreError, match="cand-0001 快照损坏"):
+        load_investigation_snapshot(path)

@@ -92,6 +92,24 @@ def read_json_object(
     return payload
 
 
+def load_investigation_snapshot(path: Path) -> dict | None:
+    """单个 Investigation 终态投影的共享解包(state.json → state.investigation)。
+
+    事实报告与封存后评估共用的调查终态装载单一出处(票 22):state.json
+    缺失返回 None,由调用方各自适配缺失语义(按 ID 查找容忍缺失 / glob 只
+    命中已存在目录);存在但 ``state.investigation`` 非对象按 Store 语义拒绝。
+    """
+    path = Path(path)
+    if not path.exists():
+        return None
+    snapshot = read_json_object(path, "Investigation 快照")
+    investigation = snapshot.get("state", {}).get("investigation")
+    if not isinstance(investigation, dict):
+        raise StoreError(
+            f"Investigation {path.parent.name} 快照损坏；请检查原运行目录")
+    return investigation
+
+
 def sync_directory(directory: Path) -> None:
     """On POSIX, persist directory entries as well as file contents."""
     if os.name == "posix":

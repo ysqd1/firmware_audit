@@ -29,6 +29,7 @@ from firmware_audit.step5_agent.host.verification import (
     build_case_brief,
     build_finding_payload,
     load_cases,
+    load_verification_results,
     plan_verification_queue,
     resolve_verification_max_rounds,
     validate_verification_delta,
@@ -504,6 +505,76 @@ def test_load_cases_rejects_broken_json(tmp_path: Path) -> None:
     path.write_text("{not json", encoding="utf-8")
     with pytest.raises(StoreError, match="冻结案卷损坏"):
         load_cases(tmp_path)
+
+
+# ---- S1.5 复核结果装载单一出处(票 22:reporting/evaluation 共用)----
+
+
+def _write_results(run_dir: Path, payload: dict) -> Path:
+    path = run_dir / "verifications" / payload["candidate_id"] / "results.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _results_payload(candidate_id: str = "cand-0001") -> dict:
+    return {
+        "schema_version": RESULTS_SCHEMA_VERSION,
+        "candidate_id": candidate_id,
+        "investigation_id": "inv-" + candidate_id.removeprefix("cand-"),
+        "claim_profile": "generic",
+        "admission_reason": "ready",
+        "verdict": "inconclusive",
+        "stop_reason": "completed",
+        "claim_results": {},
+        "decisive_refuted": [],
+        "unsupported": ["target_exists"],
+        "evidence_references": [],
+        "related_candidates": [],
+        "finding_id": None,
+        "rounds_used": 3,
+        "max_rounds": 15,
+    }
+
+
+def test_load_verification_results_keyed_by_candidate_in_order(
+        tmp_path: Path) -> None:
+    _write_results(tmp_path, _results_payload("cand-0002"))
+    _write_results(tmp_path, _results_payload("cand-0001"))
+    results = load_verification_results(tmp_path)
+    assert list(results) == ["cand-0001", "cand-0002"]
+    assert results["cand-0001"]["verdict"] == "inconclusive"
+    # 尚未走到复核阶段的运行没有 verifications 目录:按空装载,不报错。
+    assert load_verification_results(tmp_path / "不存在") == {}
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        pytest.param(
+            lambda path: path.write_text("{not json", encoding="utf-8"),
+            id="broken-json"),
+        pytest.param(
+            lambda path: path.write_text('["results"]', encoding="utf-8"),
+            id="non-object"),
+    ],
+)
+def test_load_verification_results_rejects_corrupt_results(
+        tmp_path: Path, write) -> None:
+    path = tmp_path / "verifications" / "cand-0001" / "results.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write(path)
+    with pytest.raises(StoreError, match="复核结果"):
+        load_verification_results(tmp_path)
+
+
+def test_load_verification_results_rejects_version_mismatch(
+        tmp_path: Path) -> None:
+    payload = _results_payload()
+    payload["schema_version"] = RESULTS_SCHEMA_VERSION + 1
+    _write_results(tmp_path, payload)
+    with pytest.raises(StoreError, match="复核结果版本不兼容"):
+        load_verification_results(tmp_path)
 
 
 def test_case_brief_omits_analysis_verdicts_and_notes() -> None:

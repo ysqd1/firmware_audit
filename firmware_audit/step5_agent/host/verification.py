@@ -66,6 +66,7 @@ from .store import (
     InvestigationStore,
     StoreError,
     atomic_json,
+    read_json_object,
     store_error_boundary,
     unknown_keys,
 )
@@ -664,6 +665,22 @@ def load_findings_document(run_dir: Path) -> dict[str, Any]:
             or not isinstance(loaded.get("findings"), list)):
         raise StoreError("Findings 结构损坏；请检查原运行目录")
     return loaded
+
+
+def load_verification_results(run_dir: Path) -> dict[str, dict[str, Any]]:
+    """装载 ``verifications/cand-*/results.json``,按 Candidate ID 升序成键。
+
+    复核结果装载的单一出处:事实报告(票 12)与封存后评估(票 15)共用
+    同一 schema 版本校验(票 22 收敛);结构损坏按 Store 语义拒绝。
+    """
+    results: dict[str, dict[str, Any]] = {}
+    root = Path(run_dir) / "verifications"
+    for path in sorted(root.glob("cand-*/results.json")) if root.is_dir() else []:
+        payload = read_json_object(path, "复核结果")
+        if payload.get("schema_version") != RESULTS_SCHEMA_VERSION:
+            raise StoreError("复核结果版本不兼容；请检查原运行目录")
+        results[path.parent.name] = payload
+    return results
 
 
 def build_finding_payload(

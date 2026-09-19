@@ -31,13 +31,14 @@ from .store import (
     StoreError,
     atomic_json,
     atomic_text,
+    load_investigation_snapshot,
     read_json_object,
     store_error_boundary,
 )
 from .verification import (
-    RESULTS_SCHEMA_VERSION,
     load_cases,
     load_findings_document,
+    load_verification_results,
 )
 
 SEAL_SCHEMA_VERSION = 1
@@ -112,16 +113,14 @@ def completion_gate(gen_dir: Path) -> list[str]:
 
 
 def _investigation_snapshot(gen_dir: Path, candidate_id: str) -> dict[str, Any]:
-    """单个 Investigation 的终态投影;目录缺失给空 dict,损坏按 Store 语义拒绝。"""
-    snapshot_path = gen_dir / "investigations" / candidate_id / "state.json"
-    if not snapshot_path.exists():
-        return {}
-    snapshot = read_json_object(snapshot_path, "Investigation 快照")
-    investigation = snapshot.get("state", {}).get("investigation")
-    if not isinstance(investigation, dict):
-        raise StoreError(
-            f"Investigation {candidate_id} 快照损坏；请检查原运行目录")
-    return investigation
+    """单个 Investigation 的终态投影;目录缺失给空 dict,损坏按 Store 语义拒绝。
+
+    解包与校验的单一出处见 ``store.load_investigation_snapshot``(票 22);
+    这里适配按 ID 查找的缺失语义(容忍缺失 → 空 dict)。
+    """
+    snapshot = load_investigation_snapshot(
+        gen_dir / "investigations" / candidate_id / "state.json")
+    return {} if snapshot is None else snapshot
 
 
 def _selected_candidate_failures(
@@ -192,7 +191,7 @@ def build_fact_report(gen_dir: Path) -> str:
     store = read_json_object(gen_dir / "candidates.json", "Candidate Store")
     findings = _load_findings(gen_dir)
     investigation_states = _investigation_states(gen_dir)
-    verification_results = _verification_results(gen_dir)
+    verification_results = load_verification_results(gen_dir)
 
     lines: list[str] = []
     lines.append(f"# 固件审计事实报告 — {manifest['generation']}")
@@ -374,17 +373,6 @@ def _investigation_states(gen_dir: Path) -> dict[str, dict[str, Any]]:
         return {}
     return {directory.name: _investigation_snapshot(gen_dir, directory.name)
             for directory in sorted(root.glob("cand-*"))}
-
-
-def _verification_results(gen_dir: Path) -> dict[str, dict[str, Any]]:
-    results: dict[str, dict[str, Any]] = {}
-    root = gen_dir / "verifications"
-    for path in sorted(root.glob("cand-*/results.json")) if root.is_dir() else []:
-        payload = read_json_object(path, "复核结果")
-        if payload.get("schema_version") != RESULTS_SCHEMA_VERSION:
-            raise StoreError("复核结果版本不兼容；请检查原运行目录")
-        results[path.parent.name] = payload
-    return results
 
 
 # ---- 封存:报告 digest + manifest seal + completed ----

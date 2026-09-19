@@ -29,11 +29,17 @@ from .candidates import CANDIDATE_ID_PATTERN, normalize_target_path
 from .generation import load_run_state, read_manifest
 from .review import load_review_projection
 from .severity import SEVERITY_LEVELS
-from .store import StoreError, atomic_json, read_json_object, unknown_keys
+from .store import (
+    StoreError,
+    atomic_json,
+    load_investigation_snapshot,
+    read_json_object,
+    unknown_keys,
+)
 from .verification import (
-    RESULTS_SCHEMA_VERSION,
     load_cases,
     load_findings_document,
+    load_verification_results,
 )
 
 GROUND_TRUTH_SCHEMA_VERSION = 1
@@ -261,27 +267,16 @@ def _machine_views(gen_dir: Path) -> tuple[list[dict[str, Any]], dict[str, str]]
     root = Path(gen_dir) / "investigations"
     for path in sorted(root.glob("cand-*/state.json")) if root.is_dir() else []:
         candidate_id = path.parent.name
-        snapshot = read_json_object(path, "Investigation 快照")
-        investigation = snapshot.get("state", {}).get("investigation")
-        if not isinstance(investigation, dict):
+        investigation = load_investigation_snapshot(path)
+        if investigation is None:
+            # glob 只命中已存在的 state.json,None 只能是读取前被删的竞态;
+            # 沿用改动前 read_json_object 对该场景的"快照损坏"口径拒绝。
             raise StoreError(
                 f"Investigation {candidate_id} 快照损坏；请检查原运行目录")
         disposition = investigation.get("disposition")
         dispositions[candidate_id] = disposition if isinstance(disposition, str) \
             else ""
     return findings, dispositions
-
-
-def _verification_results(gen_dir: Path) -> dict[str, dict[str, Any]]:
-    results: dict[str, dict[str, Any]] = {}
-    root = Path(gen_dir) / "verifications"
-    for path in sorted(root.glob("cand-*/results.json")) \
-            if root.is_dir() else []:
-        payload = read_json_object(path, "复核结果")
-        if payload.get("schema_version") != RESULTS_SCHEMA_VERSION:
-            raise StoreError("复核结果版本不兼容；请检查原运行目录")
-        results[path.parent.name] = payload
-    return results
 
 
 def _evidence_records(gen_dir: Path) -> list[dict[str, Any]]:
@@ -415,7 +410,7 @@ def generate_candidate_map(
                for record in store.get("candidates", [])
                if isinstance(record, dict) and record.get("candidate_id")}
     findings, dispositions = _machine_views(gen_dir)
-    results_by_candidate = _verification_results(gen_dir)
+    results_by_candidate = load_verification_results(gen_dir)
     evidence_by_candidate: dict[str, list[dict[str, Any]]] = {}
     for item in _evidence_records(gen_dir):
         evidence_by_candidate.setdefault(item.get("candidate_id") or "",
@@ -504,6 +499,8 @@ def build_review_materials(
     for candidate_id in sorted(dispositions):
         if dispositions[candidate_id] == "confirmed":
             continue  # confirmed 调查已由 Finding 表达,避免材料重复
+        # 材料要的是整份 state(含 runtime 等外层),不是 investigation
+        # 终态投影——不走 store.load_investigation_snapshot,形状不同。
         snapshot = read_json_object(
             root / candidate_id / "state.json", "Investigation 快照")
         investigations.append({
@@ -512,7 +509,7 @@ def build_review_materials(
             "state": snapshot.get("state", {}),
         })
     cases = load_cases(gen_dir)
-    results = _verification_results(gen_dir)
+    results = load_verification_results(gen_dir)
     verification_cases = [
         {"case": case, "results": results.get(str(case.get("candidate_id")))}
         for case in cases
