@@ -145,8 +145,12 @@ def test_extract_guided_routes_shrs(tmp_path: Path) -> list[str]:
 
     extract_guided(fw, tmp_path / "extracted", extractor=fake_extractor,
                    check_docker=False)
-    if "fw.bin" not in called:
+    # 票05 工作副本化:extractor 收到的是树内工作副本(<seq>_原名),
+    # 原件 fw.bin 留在原位——路由证据按"fw.bin 的工作副本被递交"判定。
+    if not called or not called[0].endswith("fw.bin"):
         fails.append(f"SHRS 候选应交 extractor(fake 记录),实际 {called}")
+    if not fw.exists():
+        fails.append("票05:递交 extractor 后原件应原位保留")
 
     # 误报路径:csman 弱魔数文本 → 路由但空产出 → 原文件留树
     fw2 = tmp_path / "note.txt"

@@ -56,6 +56,33 @@ _MANIFEST_NAME = "guided_extract.json"
 # 残留误删(2026-09-10 评审发现:误删会静默丢掉已入账的 rootfs)
 _DEEP_RESCAN_PREFIX = "_deeprescan_"
 
+# 容器解包工作副本前缀(票05):与 _deeprescan_ 同款纪律——副本带专用前缀,
+# 与内容文件可肉眼区分、永不会被候选队列当原件;崩溃残留副本在入口统一清
+# (只删文件不删目录,理由同上)。专用前缀同时消除"树内原件名恰撞 <seq>_
+# 前缀被误当已备副本"的边界。
+_WC_PREFIX = "_wc_"
+
+
+def _working_copy_name(seq: int, name: str) -> str:
+    """工作副本标准名(单一出处,循环层备副本与 extractor 识别共用)。"""
+    return f"{_WC_PREFIX}{seq:06d}_{name}"
+
+
+def _cleanup_working_copy_residue(output_dir: Path) -> None:
+    """清崩溃残留的容器工作副本(票05;只删文件,绝不删目录——理由同上)。
+
+    中断发生在 manifest 落盘前时,残留副本无 renamed_to 记录,候选重建
+    (rglob)会把它当新文件重新入队重复解包;入口统一清堵住这条路。崩溃
+    残留的半成品产物目录(_wc_*.extracted,目录形态)不在此清:其内容是
+    真实扫描产物,留树由候选决策正常处置。
+    """
+    if not output_dir.is_dir():
+        return
+    for stale in output_dir.glob(f"{_WC_PREFIX}*"):
+        with contextlib.suppress(OSError):
+            if stale.is_file():
+                stale.unlink()
+
 
 def _deep_rescan(path: Path, seq: int, parent: Path) -> tuple[list[Path], str]:
     """大体积无签名文件的全偏移复扫(票04):binwalk -e -M 单发 + 守卫三件套。
@@ -145,60 +172,84 @@ def _save_manifest(output_dir: Path, manifest: dict) -> None:
 
 
 def _binwalk_extract_one(path: Path, seq: int, parent: Path) -> tuple[list[Path], str]:
-    """真实解包: binwalk -e 单层 + 7z 兜底 + 单次产出上限守卫。
+    """真实解包: binwalk -e 单层 + 7z 兜底 + 单次产出上限守卫(票05 工作副本化)。
 
     流程:
-      1. 硬改名 <parent>/<seq>_<原名>(防 binwalk 同名输出覆盖;首段
-         .extracted 与 Step2 _EXTRACTED_PREFIX_RE 天然兼容)
+      1. 定位工作副本 <parent>/<seq>_<原名>:调用方(主循环)通常已按此名
+         备好副本,识别到即直接用;直调/裸原件则复制一份。原件永不在解包
+         路径上——binwalk -e 成功后会消费输入(2026-09-10 实测),被吃的
+         是副本,无损原件。副本创建失败大声报错返回 failed,绝不降级为
+         移动原件。首段 .extracted 命名与 Step2 _EXTRACTED_PREFIX_RE 的
+         兼容不变。
       2. binwalk -e <f> -x dtb -d <parent>,env BINWALK_RM_EXTRACTION_SYMLINK=1
          (-x dtb: 恒排除设备树签名,源头拦截 fdt 分解)
-      3. 空产出 → 7z 兜底(binwalk 镜像内置 7z;cpio/tar/7z/zip/squashfs
-         等 binwalk 有签名但无 extractor 的场景)
+      3. 空产出 → 7z 兜底(binwalk 镜像内置 7z;binwalk 有签名但无 extractor
+         的场景。2026-09-20 实测:当前镜像 zip 等常见格式已自带 extractor,
+         兜底罕见触发)
       4. 产出 > 单次上限(env STEP1_MAX_FILES_PER_EXTRACTION,默认 5 万)
          → 删除该次产物,记 over_guard
+      5. 任何终态都清理工作副本(missing_ok:成功路径多半已被 binwalk 消费)
 
     Returns:
         (产出文件列表, 状态): "ok" / "empty" / "over_guard" / "failed"
     """
-    new = parent / f"{seq:06d}_{path.name}"
-    try:
-        path.rename(new)
-    except OSError:
-        return [], "failed"
+    wc_prefix = f"{_WC_PREFIX}{seq:06d}_"
+    prepared = path.parent == parent and path.name.startswith(wc_prefix)
+    new = path if prepared else parent / _working_copy_name(seq, path.name)
+    if new != path:
+        try:
+            shutil.copy2(path, new)
+        except OSError as e:
+            print(f"[Step1] 工作副本创建失败 {path.name}: {e}(原件保持原位,未解包)")
+            return [], "failed"
 
     container_file = f"{CONTAINER_WS}/{new.name}"
     mounts = [(parent, CONTAINER_WS)]
 
-    rc, _stdout, _stderr = run_docker(
-        BINWALK_IMAGE,
-        ["-e", container_file, "-x", "dtb", "-d", CONTAINER_WS],
-        mounts=mounts,
-        env={"BINWALK_RM_EXTRACTION_SYMLINK": "1"},
-        timeout=600,
-    )
-
-    extracted_dir = parent / f"{new.name}.extracted"
-    files = _collect_files(extracted_dir)
-
-    if not files and rc == 0:
-        # 空产出: 7z 兜底(binwalk 有签名但无 extractor 的容器)
-        _rc7, _o7, _e7 = run_docker(
+    try:
+        rc, _stdout, _stderr = run_docker(
             BINWALK_IMAGE,
-            ["x", container_file, f"-o{CONTAINER_WS}/{new.name}.extracted"],
+            ["-e", container_file, "-x", "dtb", "-d", CONTAINER_WS],
             mounts=mounts,
-            entrypoint="7z",
-            timeout=300,
+            env={"BINWALK_RM_EXTRACTION_SYMLINK": "1"},
+            timeout=600,
         )
+
+        extracted_dir = parent / f"{new.name}.extracted"
         files = _collect_files(extracted_dir)
 
-    if not files:
-        return [], "empty"
+        if not files and rc == 0:
+            # 空产出: 7z 兜底(binwalk 有签名但无 extractor 的容器)
+            _rc7, _o7, _e7 = run_docker(
+                BINWALK_IMAGE,
+                ["x", container_file, f"-o{CONTAINER_WS}/{new.name}.extracted"],
+                mounts=mounts,
+                entrypoint="7z",
+                timeout=300,
+            )
+            files = _collect_files(extracted_dir)
 
-    if len(files) > resolve_max_files_per_extraction():
-        shutil.rmtree(extracted_dir, ignore_errors=True)
-        return [], "over_guard"
+        if not files:
+            return [], "empty"
 
-    return files, "ok"
+        if len(files) > resolve_max_files_per_extraction():
+            shutil.rmtree(extracted_dir, ignore_errors=True)
+            return [], "over_guard"
+
+        # 产物目录从簿记前缀归位标准命名 <seq>_<原名>.extracted(与 Step2
+        # _EXTRACTED_PREFIX_RE 兼容;rename 失败保底留前缀,内容无损)
+        if prepared:
+            final_dir = parent / f"{seq:06d}_{path.name[len(wc_prefix):]}.extracted"
+            try:
+                extracted_dir.rename(final_dir)
+            except OSError:
+                final_dir = extracted_dir
+            return _collect_files(final_dir), "ok"
+        return files, "ok"
+    finally:
+        # 工作副本用后即清(任何终态);missing_ok:成功路径多半已被消费
+        with contextlib.suppress(OSError):
+            new.unlink(missing_ok=True)
 
 
 def _collect_files(directory: Path) -> list[Path]:
@@ -297,6 +348,7 @@ def extract_guided(
     if deep_rescanner is None:
         deep_rescanner = _deep_rescan
     _cleanup_deep_rescan_residue(output_dir)
+    _cleanup_working_copy_residue(output_dir)
 
     manifest = _load_manifest(output_dir)
     # 新 seq 从现有最大 seq+1 开始:断点续传时新产物绝不与旧同名冲突
@@ -492,10 +544,27 @@ def extract_guided(
         seqs = {id(p): next_seq + i for i, (p, *_rest) in enumerate(to_extract)}
         next_seq += len(to_extract)
 
+        # --- 工作副本化(票05):原件永不动,extractor 只碰树内 _wc_ 副本 ---
+        # 真实 binwalk -e 成功后会消费输入文件(副本被吃无损原件);副本
+        # 创建失败大声记录该容器未解包(原件原位),不提交解包。
+        submitted: list[tuple[Path, str, Path]] = []  # (原件, rel, 工作副本)
+        for path, rel, _sigs, _reason in to_extract:
+            wc = output_dir / _working_copy_name(seqs[id(path)], path.name)
+            try:
+                shutil.copy2(path, wc)
+            except OSError as e:
+                print(f"[Step1] 工作副本创建失败 {rel}: {e}(原件保持原位,未解包)")
+                manifest[rel] = {"seq": seqs[id(path)], "depth": depth,
+                                 "action": "finalize", "renamed_to": None,
+                                 "preserved_original": str(path),
+                                 "reason": f"工作副本创建失败: {e}", "done": True}
+            else:
+                submitted.append((path, rel, wc))
+
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             futures = {
-                ex.submit(extractor, path, seqs[id(path)], output_dir): (path, rel)
-                for path, rel, _sigs, reason in to_extract
+                ex.submit(extractor, wc_path, seqs[id(orig)], output_dir): (orig, rel)
+                for orig, rel, wc_path in submitted
             }
             # path -> reason 映射,供 as_completed 回调写 manifest(continue 记录
             # 带决策理由,与 finalize/skip 记录字段一致)
@@ -507,14 +576,20 @@ def extract_guided(
                 except Exception as e:
                     print(f"[Step1] 解包异常 {rel}: {e}")
                     status, files = "failed", []
+                # 工作副本用后即清(任何终态;missing_ok:成功路径多半已被消费)
+                with contextlib.suppress(OSError):
+                    (output_dir / _working_copy_name(
+                        seqs[id(path)], path.name)).unlink(missing_ok=True)
+                # renamed_to: 工作副本 rel(_wc_<seq>_原名)。scan_tree resume
+                # 时 rglob 会再次找到副本(如崩溃残留),若不在 manifest 会重复
+                # 决策/解包;记录后候选初始化排除之。preserved_original: 原件
+                # 原位指针(票05;原件可能在树外,故存绝对路径)。
+                renamed_to = _working_copy_name(seqs[id(path)], path.name)
                 if status == "ok":
-                    # renamed_to: 容器被改名后的 rel(树根/<seq>_原名)。
-                    # scan_tree resume 时, rglob 会再次找到改名文件,若不在
-                    # manifest 会重复决策/解包;记录后候选初始化排除之。
-                    renamed_to = f"{seqs[id(path)]:06d}_{path.name}"
                     manifest[rel] = {
                         "seq": seqs[id(path)], "depth": depth, "action": "continue",
                         "renamed_to": renamed_to,
+                        "preserved_original": str(path),
                         "reason": reasons.get(id(path), ""),
                         "files": [_rel_of(f, output_dir) for f in files],
                         "done": True,
@@ -529,18 +604,23 @@ def extract_guided(
                     over_guard_count += 1
                     manifest[rel] = {"seq": seqs[id(path)], "depth": depth,
                                      "action": "finalize",
+                                     "renamed_to": renamed_to,
+                                     "preserved_original": str(path),
                                      "reason": f"单次产出>{resolve_max_files_per_extraction()} 删除",
                                      "done": True}
                     print(f"[Step1] over_guard: {rel} 产出超限,已删除")
                 elif status == "empty":
                     manifest[rel] = {"seq": seqs[id(path)], "depth": depth,
                                      "action": "finalize",
+                                     "renamed_to": renamed_to,
+                                     "preserved_original": str(path),
                                      "reason": "binwalk/7z 均无产出(extractor 缺失或损坏)",
                                      "done": True}
                 else:  # failed
                     manifest[rel] = {"seq": seqs[id(path)], "depth": depth,
-                                     "action": "finalize", "reason": "解包失败",
-                                     "done": True}
+                                     "action": "finalize", "renamed_to": renamed_to,
+                                     "preserved_original": str(path),
+                                     "reason": "解包失败", "done": True}
                     print(f"[Step1] 解包失败: {rel}")
 
         candidates = next_candidates
