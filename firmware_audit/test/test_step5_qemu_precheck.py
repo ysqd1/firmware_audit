@@ -144,7 +144,6 @@ def stub_facility(*, available: bool = True,
             "available": available,
             "version": version if available else None,
             "detail": "" if available else "镜像不可用(Docker 替身)",
-            "check": "executed",
         }
 
     original = QemuPrecheckTool._facility_check
@@ -490,6 +489,62 @@ def test_precheck_accepts_extracted_prefix_refs() -> list[str]:
     return fails
 
 
+def test_precheck_loader_same_basename_not_treated_present() -> list[str]:
+    """PT_INTERP 原路径缺失时,-L 语义下运行期必然失败:basename 兜底命中
+    只留痕(same_basename_found),解释器仍判未就位并阻塞(票 04 评审修复)。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        ws, fref, rref = _make_workspace(
+            Path(td), blob=elf32_blob(machine=40, interp=ARM_LE_LOADER, needed=[]),
+            loader=None, libs={})
+        # 同名加载器放在非标准相对路径(usr/lib/),原路径 /lib/... 缺失
+        alt = Path(ws) / "extracted" / rref / "usr" / "lib" / "ld-uClibc.so.0"
+        alt.parent.mkdir(parents=True, exist_ok=True)
+        alt.write_bytes(_fake_loader())
+        with stub_facility():
+            r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        interp = (d or {}).get("interpreter") or {}
+        if interp.get("present") is not False:
+            fails.append(f"原路径缺失时 present 必须为 False: {interp}")
+        if interp.get("same_basename_found") != "usr/lib/ld-uClibc.so.0":
+            fails.append(f"同名命中应留痕: {interp}")
+        if d.get("result_class") != "dependency_blocked":
+            fails.append(f"解释器原路径缺失应 dependency_blocked: {d.get('result_class')}")
+    return fails
+
+
+def test_precheck_search_truncation_recorded() -> list[str]:
+    """检索达上限截断时不得静默当作缺失:报告记 search_notes,阻塞 detail
+    注明结论可能不可靠(原始信息保留红线,code-review 修复)。"""
+    fails: list[str] = []
+    import firmware_audit.step5_agent.providers.tools.qemu_precheck as qp_module
+    original_cap = qp_module._LIB_SEARCH_CAP
+    qp_module._LIB_SEARCH_CAP = 0  # 强制 rglob 兜底立即截断
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            # 库只放在非标准位置(绕过 _LIB_DIRS 布局直查),逼出 rglob 兜底
+            ws, fref, rref = _make_workspace(
+                Path(td), blob=elf32_blob(machine=40, interp=ARM_LE_LOADER,
+                                          needed=["libc.so.0"]),
+                loader=ARM_LE_LOADER, libs={})
+            odd = Path(ws) / "extracted" / rref / "usr" / "share" / "libc.so.0"
+            odd.parent.mkdir(parents=True, exist_ok=True)
+            odd.write_bytes(_fake_loader())
+            with stub_facility():
+                r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        notes = (d.get("dependencies") or {}).get("search_notes") or []
+        if not any("libc.so.0" in n and "截断" in n for n in notes):
+            fails.append(f"截断应如实写入 search_notes: {notes}")
+        detail = " ".join(b.get("detail", "") for b in d.get("blockers") or [])
+        if "不可靠" not in detail:
+            fails.append(f"缺失阻塞应注明截断致结论不可靠: {detail}")
+    finally:
+        qp_module._LIB_SEARCH_CAP = original_cap
+    return fails
+
+
 # ---------- 离线:注册表角色授权(AC2) ----------
 
 def test_precheck_registry_contract() -> list[str]:
@@ -695,6 +750,8 @@ def test_main() -> int:
         ("precheck_facility_failure", test_precheck_facility_failure),
         ("precheck_path_boundary_no_execution", test_precheck_path_boundary_no_execution),
         ("precheck_accepts_extracted_prefix_refs", test_precheck_accepts_extracted_prefix_refs),
+        ("precheck_loader_same_basename_not_treated_present", test_precheck_loader_same_basename_not_treated_present),
+        ("precheck_search_truncation_recorded", test_precheck_search_truncation_recorded),
         ("precheck_registry_contract", test_precheck_registry_contract),
         ("precheck_image_pin_matches_pins_env", test_precheck_image_pin_matches_pins_env),
         ("sandbox_verify_cannot_reach_qemu", test_sandbox_verify_cannot_reach_qemu),

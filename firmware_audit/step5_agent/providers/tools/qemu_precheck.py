@@ -70,9 +70,9 @@ def parse_elf_runtime(blob: bytes) -> dict:
 
     纯 struct 实现(零依赖铁律),32/64 位、大小端通吃;失败抛 ElfParseError。
     只读字节,不执行任何代码(预检红线,见模块 docstring)。
-    返回 {bits, endianness, e_machine, interp, needed, dynamic_note};
-    static 形态 interp=None/needed=[];dynamic_note 记动态段不可解析的原因
-    (非阻塞 note,原始信息保留)。
+    返回 {bits, endianness, e_machine, interp, needed, has_dynamic,
+    dynamic_note};static 形态 interp=None/needed=[]/has_dynamic=False;
+    dynamic_note 记动态段不可解析的原因(非阻塞 note,原始信息保留)。
     """
     if len(blob) < 20 or blob[:4] != b"\x7fELF":
         raise ElfParseError("非 ELF 文件(魔数不符)")
@@ -94,6 +94,7 @@ def parse_elf_runtime(blob: bytes) -> dict:
             "e_machine": e_machine,
             "interp": None,
             "needed": [],
+            "has_dynamic": False,
             "dynamic_note": None}
     if phnum == 0 or phentsize == 0:
         info["dynamic_note"] = "无程序头表"
@@ -131,6 +132,7 @@ def parse_elf_runtime(blob: bytes) -> dict:
 
     if dynamic is None:
         return info  # 静态形态(无动态段)
+    info["has_dynamic"] = True
     doff, dsz = dynamic
     entsize = 8 if bits == 32 else 16
     fmt = end + ("iI" if bits == 32 else "qQ")
@@ -183,14 +185,16 @@ class QemuPrecheckTool(AgentTool):
 
     def _facility_check(self, qemu_binary: str) -> dict:
         """执行镜像内 qemu 二进制自报版本。只跑 qemu 自身(x86 静态二进制),
-        不读不触固件字节(预检红线:不运行固件或其加载器)。"""
+        不读不触固件字节(预检红线:不运行固件或其加载器)。
+
+        命令按 AGENTS.md 踩坑纪律用纯字符串拼接(禁 .format/f-string)。
+        """
         if not docker_available(QEMU_EXEC_IMAGE):
             return {"image": QEMU_EXEC_IMAGE, "qemu_binary": qemu_binary,
                     "available": False, "version": None,
                     "detail": f"镜像 {QEMU_EXEC_IMAGE} 不可用"
-                              "(docker image inspect 失败;先运行 build_image.sh)",
-                    "check": "executed"}
-        cmd = f"{qemu_binary} --version 2>&1 | head -1"
+                              "(docker image inspect 失败;先运行 build_image.sh)"}
+        cmd = qemu_binary + " --version 2>&1 | head -1"
         rc, out, err = run_docker(QEMU_EXEC_IMAGE, ["-c", cmd],
                                   entrypoint="bash", network="none", timeout=60)
         lines = (out or "").strip().splitlines()
@@ -200,8 +204,7 @@ class QemuPrecheckTool(AgentTool):
         return {"image": QEMU_EXEC_IMAGE, "qemu_binary": qemu_binary,
                 "available": available,
                 "version": version if available else None,
-                "detail": detail or f"qemu --version 无有效输出(rc={rc})",
-                "check": "executed"}
+                "detail": detail or f"qemu --version 无有效输出(rc={rc})"}
 
     # ---- 路径解析 ----
 
@@ -214,20 +217,25 @@ class QemuPrecheckTool(AgentTool):
 
     # ---- 固件根内检索 ----
 
-    def _find_in_root(self, root: Path, basename: str) -> str | None:
-        """在固件根内找库/加载器文件,返回相对 root 的 POSIX 路径;找不到 None。"""
+    def _find_in_root(self, root: Path, basename: str) -> tuple[str | None, bool]:
+        """在固件根内找库/加载器文件,返回 (相对 root 的 POSIX 路径|None, 检索是否截断)。
+
+        先按标准库目录布局,再限界递归兜底;超过 _LIB_SEARCH_CAP 时返回
+        (None, True)——"未找到"与"没找完"必须可区分,截断由调用方写入报告,
+        不得静默当作缺失(原始信息保留红线)。
+        """
         for d in _LIB_DIRS:
             cand = root / d / basename
             if cand.is_file():
-                return cand.relative_to(root).as_posix()
+                return cand.relative_to(root).as_posix(), False
         seen = 0
         for cand in root.rglob(basename):
             seen += 1
             if seen > _LIB_SEARCH_CAP:
-                return None
+                return None, True
             if cand.is_file():
-                return cand.relative_to(root).as_posix()
-        return None
+                return cand.relative_to(root).as_posix(), False
+        return None, False
 
     # ---- 主流程 ----
 
@@ -312,39 +320,62 @@ class QemuPrecheckTool(AgentTool):
                                        "matrix": "first_batch",
                                        "observed_notes": profile.observed_notes})
 
-        # 4) 解释器(PT_INTERP → 固件根内加载器;静态形态直接放行)
+        # 4) 解释器(-L 按 PT_INTERP 原路径解析:精确路径是唯一判据;
+        # basename 兜底命中只留痕,不当作解释器已就位)
         if elf["interp"]:
             rel = elf["interp"].lstrip("/")
-            loader_rel = self._find_in_root(root, rel.split("/")[-1]) \
-                if not (root / rel).is_file() else rel
-            present = loader_rel is not None
-            report["interpreter"] = {"requested": elf["interp"],
-                                     "resolved_under_root": loader_rel,
-                                     "present": present}
-            if not present:
-                block("interpreter", QemuResultClass.DEPENDENCY_BLOCKED,
-                      f"解释器 {elf['interp']} 在固件根内未找到"
-                      "(运行期将无法加载;固件根可能不完整)")
+            if (root / rel).is_file():
+                report["interpreter"] = {"requested": elf["interp"],
+                                         "resolved_under_root": rel,
+                                         "present": True}
+            else:
+                alt, truncated = self._find_in_root(root, rel.split("/")[-1])
+                note = (f"解释器 {elf['interp']} 在固件根内未找到"
+                        "(-L 按原路径解析,运行期将无法加载;固件根可能不完整)")
+                entry: dict = {"requested": elf["interp"],
+                               "resolved_under_root": None, "present": False}
+                if alt is not None:
+                    entry["same_basename_found"] = alt
+                    note += (f";固件根内另有同名文件 {alt},"
+                             "但 PT_INTERP 原路径缺失,不视为解释器已就位")
+                if truncated:
+                    entry["search_truncated"] = True
+                    note += ";检索在达上限后截断,结论可能不可靠"
+                report["interpreter"] = entry
+                block("interpreter", QemuResultClass.DEPENDENCY_BLOCKED, note)
         else:
+            note = ("动态段存在但无 PT_INTERP,加载器解析路径未知"
+                    if elf.get("has_dynamic")
+                    else "静态链接:无 PT_INTERP,无需加载器解析")
             report["interpreter"] = {"requested": None, "present": None,
-                                     "note": "静态链接:无 PT_INTERP,无需加载器解析"}
+                                     "note": note}
 
-        # 5) 依赖(NEEDED → 固件根内逐一解析)
+        # 5) 依赖(NEEDED → 固件根内逐一解析;截断如实入报告)
         resolved: dict[str, str] = {}
         missing: list[str] = []
+        search_notes: list[str] = []
         for lib in elf["needed"]:
-            hit = self._find_in_root(root, lib.split("/")[-1])
+            hit, truncated = self._find_in_root(root, lib.split("/")[-1])
             if hit is None:
                 missing.append(lib)
+                if truncated:
+                    search_notes.append(
+                        f"{lib}: 固件根检索达上限({_LIB_SEARCH_CAP} 条目)后截断,"
+                        "未找到的结论可能不可靠")
             else:
                 resolved[lib] = hit
         report["dependencies"] = {"needed": list(elf["needed"]),
                                   "resolved": resolved, "missing": missing}
         if elf.get("dynamic_note"):
-            report["dependencies"]["search_note"] = elf["dynamic_note"]
+            report["dependencies"]["dynamic_note"] = elf["dynamic_note"]
+        if search_notes:
+            report["dependencies"]["search_notes"] = search_notes
         for lib in missing:
+            truncated_note = (";检索截断,结论可能不可靠"
+                              if any(n.startswith(lib + ":") for n in search_notes)
+                              else "")
             block("dependencies", QemuResultClass.DEPENDENCY_BLOCKED,
-                  f"NEEDED 库 {lib} 在固件根内未找到"
+                  f"NEEDED 库 {lib} 在固件根内未找到{truncated_note}"
                   "(运行期加载将失败;确认固件根是否完整或需适配模板补齐)")
 
         # 6) 模板适用性(票 02 口径:NVRAM 系库 → 需模板;支持表未定稿 = 运行阻塞)
@@ -395,7 +426,7 @@ def _render_text(report: dict) -> str:
         lines.append(f"- 解释器: {interp['requested']}({state}"
                      f"{': ' + interp['resolved_under_root'] if interp.get('resolved_under_root') else ''})")
     else:
-        lines.append("- 解释器: 静态链接,无需加载器")
+        lines.append(f"- 解释器: {(interp or {}).get('note') or '无 PT_INTERP'}")
     deps = report.get("dependencies") or {}
     if deps.get("needed"):
         parts = [f"{lib}→{deps['resolved'][lib]} ✓" if lib in deps["resolved"]
