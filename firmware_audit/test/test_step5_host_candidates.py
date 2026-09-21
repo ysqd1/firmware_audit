@@ -43,7 +43,7 @@ from firmware_audit.step5_agent.host.recon import (
     RECON_SESSION_SYSTEM,
     HostReconRunner,
 )
-from firmware_audit.step5_agent.host.session import AgentSession
+from firmware_audit.step5_agent.host.session import AgentSession, ProposalRejectedError
 from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError, atomic_json
 from firmware_audit.step5_agent.host.verification import validate_verification_delta
 from firmware_audit.step5_agent.providers.tools import ToolContext, make_tools
@@ -1146,3 +1146,181 @@ def test_stored_related_proposals_reads_both_roles_and_dedups_by_source(tmp_path
 
     assert proposals == (record,)
     assert stored_related_proposals(tmp_path) == proposals  # 读取幂等
+
+
+# ---- 票 25:错放进嵌套 fingerprint 对象的领域字段拒绝,不静默退化 ----
+
+
+def _misplaced_via_extras() -> dict:
+    """真实两例的错放形态:领域字段包进 extras.fingerprint 嵌套对象。"""
+    return _recon_proposal(extras={"fingerprint": {
+        "claim_profile": "data_propagation",
+        "anchor": "parse_header+0x42",
+        "mechanism": "integer overflow",
+    }})
+
+
+def test_normalize_intake_rejects_fingerprint_nested_domain_fields() -> None:
+    with pytest.raises(CandidateIntakeError) as excinfo:
+        normalize_intake(_misplaced_via_extras(), source="recon")
+    message = str(excinfo.value)
+    assert "extras.fingerprint.claim_profile" in message
+    assert "平铺" in message  # 拒绝时告知正确字段位置
+    # 顶层 fingerprint 对象是同一已知错误位置
+    with pytest.raises(CandidateIntakeError, match="fingerprint\\.anchor"):
+        normalize_intake(
+            _recon_proposal(fingerprint={"anchor": "handle_msg", "mechanism": "x"}),
+            source="recon",
+        )
+
+
+def test_normalize_intake_names_misplacement_before_missing_required_fields() -> None:
+    """整份 candidate 被包进嵌套时,错放诊断优先于零散的缺字段报错。"""
+    with pytest.raises(CandidateIntakeError, match="fingerprint"):
+        normalize_intake({
+            "proposal_id": "proposal-0001",
+            "kind": "signal",
+            "fingerprint": {
+                "target": "extracted/bin/robotd", "signal": "s", "evidence_id": "ev-000001",
+                "next_action": "n", "claim_profile": "credentials",
+            },
+        }, source="recon")
+
+
+def test_normalize_intake_keeps_unknown_nested_metadata() -> None:
+    """未知嵌套元数据不一刀切禁止;真正缺省 claim_profile 仍按 generic。"""
+    intake = normalize_intake(
+        _recon_proposal(extras={
+            "fingerprint": {"notes": "模型自查备注"},
+            "review": {"verdict": "pending"},
+        }),
+        source="recon",
+    )
+    assert intake.claim_profile == "generic"
+    assert intake.anchor == "" and intake.mechanism == ""
+    assert intake.extras == {
+        "fingerprint": {"notes": "模型自查备注"}, "review": {"verdict": "pending"},
+    }
+
+
+def test_normalize_intake_stored_reproduces_misplaced_history() -> None:
+    """盘上记录按已接受时刻的归一复现(stored=True),不重新审判历史。"""
+    intake = normalize_intake(_misplaced_via_extras(), source="recon", stored=True)
+    assert intake.claim_profile == "generic"
+    assert intake.anchor == "" and intake.mechanism == ""
+    assert intake.extras["fingerprint"] == {
+        "claim_profile": "data_propagation",
+        "anchor": "parse_header+0x42",
+        "mechanism": "integer overflow",
+    }
+
+
+def test_related_candidate_records_reject_fingerprint_nesting() -> None:
+    """Related Candidate 与 Recon 入口同规则:错放整份拒绝(票 25 AC3)。"""
+    origin = RelatedOrigin("analysis", "cand-0001", "inv-0001")
+    entry = _recon_proposal(
+        proposal_id="rel-cand-0001-1",
+        extras={"fingerprint": {"claim_profile": "credentials", "anchor": "load_keys"}},
+    )
+    with pytest.raises(CandidateIntakeError, match="extras\\.fingerprint\\.claim_profile"):
+        related_candidate_records(
+            [entry], evidence_ids=frozenset({"ev-000001"}), origin=origin)
+
+
+def test_analysis_delta_rejects_misplaced_related_candidate_as_model_feedback() -> None:
+    """调用边界翻译成 ProposalRejectedError:拒绝发生在任何状态应用之前。"""
+    example = {"related_candidates": [{
+        "proposal_id": "rel-cand-0001-1", "kind": "signal",
+        "target": "extracted/bin/updater", "signal": "升级包解析未校验长度",
+        "evidence_id": "ev-000001", "next_action": "反编译确认边界检查",
+        "extras": {"fingerprint": {"mechanism": "integer overflow"}},
+    }]}
+    with pytest.raises(ProposalRejectedError, match="fingerprint"):
+        validate_analysis_delta(
+            {}, example, evidence_ids=frozenset({"ev-000001"}), profile="generic",
+            related_origin=RelatedOrigin("analysis", "cand-0001", "inv-0001"))
+
+
+def test_related_intake_reproduces_pre_fix_misplaced_history() -> None:
+    """修复前入册的 Related 记录读取时按 stored 契约复现,不升格为 StoreError。"""
+    origin = RelatedOrigin("analysis", "cand-0001", "inv-0001")
+    record = {
+        "origin": origin.record(),
+        **normalize_intake(
+            _recon_proposal(proposal_id="rel-cand-0001-1"), source=origin.source,
+        ).as_dict(),
+        "extras": {"fingerprint": {"claim_profile": "credentials"}},
+    }
+    intake = related_intake(record)
+    assert intake.claim_profile == "generic"
+    assert intake.extras["fingerprint"] == {"claim_profile": "credentials"}
+
+
+def test_corrected_flat_input_keeps_dedup_dimensions() -> None:
+    """票 25 AC:按指路修正后的平铺输入保留去重维度,同目标不同锚点不合并不清空。"""
+    first = _intake(proposal_id="proposal-0001", claim_profile="data_propagation",
+                    anchor="parse_header+0x42", mechanism="integer overflow")
+    second = _intake(proposal_id="proposal-0002", claim_profile="data_propagation",
+                     anchor="parse_header+0x99", mechanism="integer overflow")
+    assert first.fingerprint() != second.fingerprint()
+    comparator = _ScriptedComparator([_outcome("different")])
+    result = deduplicate([first, second], comparator=comparator)
+    assert [entry["type"] for entry in result.dedup_log] == ["created", "kept_independent"]
+    assert len(result.candidates) == 2
+    # coverage 维度同理:同目标同组件,check_goal 不同即不同候选
+    goal_a = _intake(proposal_id="proposal-0003", kind="coverage",
+                     component_or_entry="upgrade handler", check_goal="边界检查覆盖")
+    goal_b = _intake(proposal_id="proposal-0004", kind="coverage",
+                     component_or_entry="upgrade handler", check_goal="主题授权覆盖")
+    assert goal_a.fingerprint() != goal_b.fingerprint()
+    assert goal_a.check_goal == "边界检查覆盖" and goal_b.check_goal == "主题授权覆盖"
+
+
+def test_normalize_intake_rejects_conflict_between_flat_and_nested_fields() -> None:
+    """票 25 AC:平铺字段与嵌套 fingerprint 同时出现的冲突形态同样整份拒绝。"""
+    with pytest.raises(CandidateIntakeError, match="extras\\.fingerprint\\.claim_profile"):
+        normalize_intake(
+            _recon_proposal(
+                claim_profile="config",
+                extras={"fingerprint": {"claim_profile": "credentials"}},
+            ),
+            source="recon",
+        )
+
+
+def test_contract_text_demands_flat_fingerprint_inputs() -> None:
+    text = related_candidate_contract()
+    assert "Host 派生" in text and "平铺" in text
+
+
+def test_store_build_reproduces_pre_fix_misplaced_v1_history(tmp_path: Path) -> None:
+    """修复前落盘的 v1 错放 proposal 在续跑升级时按已接受形态复现(旧恢复兼容),
+    不因新契约拒之门外;已封存世代不重算、不改写语义。"""
+
+    class _ZeroScorer:
+        def score(self, candidate):
+            return {"factors": {}, "total": 0, "status": "ok", "raw": None}
+
+    misplaced = {
+        "proposal_id": "proposal-0001",
+        "kind": "signal",
+        "target": "extracted/etc/device.conf",
+        "signal": "配置含口令样式条目",
+        "evidence_id": "ev-000001",
+        "next_action": "核实口令用途",
+        "extras": {"fingerprint": {"claim_profile": "credentials", "anchor": "device.conf:1"}},
+    }
+    atomic_json(tmp_path / "candidates.json", {
+        "schema_version": 1, "survey": {}, "session_state": {},
+        "candidates": [misplaced],
+    })
+
+    payload = CandidateStore(tmp_path).build(
+        SemanticComparator(ScriptedLLM([])), lambda evidence_context: _ZeroScorer(),
+    )
+
+    record = payload["candidates"][0]
+    assert record["claim_profile"] == "generic"
+    assert record["extras"]["fingerprint"] == {
+        "claim_profile": "credentials", "anchor": "device.conf:1",
+    }

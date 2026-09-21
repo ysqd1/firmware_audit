@@ -58,6 +58,16 @@ _KNOWN_KEYS = frozenset({
     *FINGERPRINT_INPUT_FIELDS, *_INTAKE_OPTIONAL_NULLABLE, "extras",
 })
 
+# 已知错误位置(票 25):模型把领域字段包进一个名为 fingerprint 的嵌套对象。
+# 真实两例 15 个 proposal 实测 extras.fingerprint.claim_profile 携带非 generic
+# 意图却被缺省值静默掩盖。fingerprint 是 Host 派生值,不是可提交字段;嵌套里
+# 出现任意已知 intake 字段即整份拒绝,未知嵌套元数据不受影响(不一刀切禁止)。
+_MISPLACEMENT_NESTING_KEY = "fingerprint"
+_MISPLACEMENT_FIELD_KEYS = _KNOWN_KEYS - {"proposal_id", "extras"}
+# 拒绝文案与契约提示共用的平铺字段清单,由常量拼装防漂移。
+FLAT_INPUT_FIELDS_HINT = "/".join((
+    "claim_profile", *FINGERPRINT_INPUT_FIELDS, *_INTAKE_OPTIONAL_NULLABLE))
+
 
 class CandidateIntakeError(ValueError):
     """Candidate proposal 未通过归一化契约。
@@ -170,16 +180,44 @@ def _field_from(record: dict[str, Any], name: str) -> Any:
     return None
 
 
+def find_misplaced_intake_fields(record: dict[str, Any]) -> tuple[str, ...]:
+    """已知领域字段落在已知错误位置(嵌套 ``fingerprint`` 对象)的路径清单。
+
+    只认两种已知错误位置:顶层 ``fingerprint`` 与 extras 直接 ``fingerprint``
+    (真实两例实测形态);其余未知嵌套结构按未知 extras 原样保留。返回相对
+    proposal 根的路径(如 ``extras.fingerprint.claim_profile``),供
+    ``normalize_intake`` 的拒绝文案与 recon survey 门的问题清单共用。
+    """
+    if not isinstance(record, dict):
+        return ()
+    extras = record.get("extras")
+    locations = (
+        ("", record.get(_MISPLACEMENT_NESTING_KEY)),
+        ("extras.", extras.get(_MISPLACEMENT_NESTING_KEY)
+         if isinstance(extras, dict) else None),
+    )
+    findings: list[str] = []
+    for prefix, nested in locations:
+        if isinstance(nested, dict):
+            findings.extend(
+                f"{prefix}{_MISPLACEMENT_NESTING_KEY}.{key}"
+                for key in nested if key in _MISPLACEMENT_FIELD_KEYS)
+    return tuple(findings)
+
+
 def _intake_from_stored_record(record: dict[str, Any], *, source: str) -> IntakeCandidate:
     """归一盘上已入册的 Candidate 记录。
 
     同一份 intake 契约有两种来源:模型新输入(Recon proposal / Related
     Candidate)失败是 ``CandidateIntakeError``,由调用方翻译成模型可见的拒绝;
     盘上记录损坏则是 Store 语义,必须按 StoreError 停下并引导检查原目录,
-    不得让模型契约错误类型冒充磁盘损坏。
+    不得让模型契约错误类型冒充磁盘损坏。盘上读取走 ``stored=True``:记录按
+    已接受时刻的归一原样复现,不按新契约重新审判(票 25 旧恢复兼容——修复前
+    入册的错放历史保持 generic + extras 透传,续跑与重放等幂;已封存世代不
+    重算、不改写)。
     """
     try:
-        return normalize_intake(record, source=source)
+        return normalize_intake(record, source=source, stored=True)
     except (CandidateIntakeError, JsonValueError) as exc:
         raise StoreError(
             f"既有 Candidate 记录未通过 intake 契约；请检查原运行目录: {exc}") from exc
@@ -195,12 +233,22 @@ def _text(value: Any, *, nullable: bool = False) -> str | None:
     return value.strip()
 
 
-def normalize_intake(record: dict[str, Any], *, source: str, proposal_id: str | None = None) -> IntakeCandidate:
+def normalize_intake(
+    record: dict[str, Any],
+    *,
+    source: str,
+    proposal_id: str | None = None,
+    stored: bool = False,
+) -> IntakeCandidate:
     """把 recon survey proposal 或 Related Candidate 记录归一为 IntakeCandidate。
 
     必填 kind/target/signal/evidence_id/next_action;claim_profile 缺省
     generic 且必须属于枚举;fingerprint 输入与 possible_source/sink 为可选
     字符串;未知键保留进 extras(顶层已知键除外),不丢信息。
+
+    模型新输入(默认)把已知领域字段嵌进 ``fingerprint`` 对象的整份拒绝并
+    告知正确字段位置(票 25);``stored=True`` 供盘上已入册记录复现已接受
+    形态,不做错放拒绝(见 ``_intake_from_stored_record``)。
     """
     if not isinstance(record, dict):
         raise CandidateIntakeError("Candidate proposal 必须是 JSON object")
@@ -209,6 +257,15 @@ def normalize_intake(record: dict[str, Any], *, source: str, proposal_id: str | 
     resolved_id = proposal_id if proposal_id is not None else record.get("proposal_id")
     if not isinstance(resolved_id, str) or not resolved_id.strip():
         raise CandidateIntakeError("proposal_id 必须是非空字符串")
+
+    misplaced = find_misplaced_intake_fields(record)
+    if misplaced and not stored:
+        raise CandidateIntakeError(
+            "proposal 把已知字段嵌进了 "
+            f"{_MISPLACEMENT_NESTING_KEY} 对象({', '.join(misplaced)});"
+            f"{_MISPLACEMENT_NESTING_KEY} 由 Host 派生,不是可提交字段。请把这些字段"
+            f"平铺在 proposal 顶层({FLAT_INPUT_FIELDS_HINT},extras "
+            "直接字段亦可),并完整重新生成整份 proposal,不要只改动嵌套结构")
 
     values: dict[str, Any] = {}
     for name in _INTAKE_REQUIRED_TEXT:
@@ -397,7 +454,9 @@ def related_candidate_contract() -> str:
         "signal 线索还需 anchor(位置锚点)或 mechanism(问题机制)至少其一;coverage",
         "线索需 component_or_entry(组件或入口)或 check_goal(检查目标)至少其一。两者",
         "都为空说明它只是同一案卷内的分支观察,请写进 Claim,不要新开线索。可选字段",
-        "claim_profile(缺省 generic)、possible_source/possible_sink。",
+        "claim_profile(缺省 generic)、possible_source/possible_sink。这些输入字段一律",
+        "平铺在每项顶层(extras 直接字段亦可);fingerprint 由 Host 派生,不是可提交",
+        "字段,包成嵌套的 fingerprint 对象会被整份拒绝。",
     ]
     for example, kind in zip(_RELATED_EXAMPLES, ("signal", "coverage")):
         lines += [

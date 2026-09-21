@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -603,3 +604,70 @@ def test_survey_rejected_on_bad_fingerprint_input_fields(
     feedback = session.inputs[2]
     assert "survey_rejected" in feedback
     assert "$.state_delta.candidates[0]" in feedback
+
+
+# ---- 票 25:错放进嵌套 fingerprint 对象的领域字段在 survey 门整份拒绝 ----
+
+
+@pytest.mark.parametrize(
+    "mutation,expected_path",
+    [
+        (
+            lambda c: c.update(extras={"fingerprint": {
+                "claim_profile": "credentials", "anchor": "device.conf:1",
+            }}),
+            "$.state_delta.candidates[0].extras.fingerprint.claim_profile",
+        ),
+        (
+            lambda c: c.update(fingerprint={"mechanism": "command injection"}),
+            "$.state_delta.candidates[0].fingerprint.mechanism",
+        ),
+    ],
+)
+def test_survey_rejected_on_fingerprint_nested_fields(
+    tmp_path: Path, mutation, expected_path: str,
+) -> None:
+    """领域字段错放进嵌套 fingerprint 对象整份拒绝并指路平铺,不静默降级为 generic。"""
+    delta = _survey_delta()
+    mutation(delta["candidates"][0])
+    session = FakeReconSession([_recon_action(), _survey(delta), _survey(_survey_delta())])
+
+    result = _run(tmp_path, session)
+
+    assert result.status == "completed"
+    feedback = session.inputs[2]
+    assert "survey_rejected" in feedback
+    assert expected_path in feedback
+    assert "平铺" in feedback
+    # 只有修正后的重提入库;入库记录不再携带嵌套对象
+    store = json.loads((tmp_path / "candidates.json").read_text(encoding="utf-8"))
+    assert all(
+        "fingerprint" not in item.get("extras", {}) for item in store["candidates"])
+
+
+def test_recon_prompt_example_candidate_passes_gate_with_flat_fields(
+    tmp_path: Path,
+) -> None:
+    """提示里的完整 candidate 示例(平铺字段)必须真能通过 survey 门并带值入库。"""
+    blocks = re.findall(r"```json\n(.*?)\n```", RECON_SESSION_SYSTEM, re.S)
+    assert blocks, "提示缺少完整 candidate 示例"
+    candidate = json.loads(blocks[0])
+    assert candidate["kind"] == "signal"
+    assert "fingerprint" not in candidate  # fingerprint 是 Host 派生值,不是输入
+    candidate["evidence_id"] = "ev-000001"
+    delta = _survey_delta(candidates=[
+        candidate, _survey_delta()["candidates"][1],
+    ])
+    session = FakeReconSession([_recon_action(), _survey(delta)])
+
+    result = _run(tmp_path, session)
+
+    assert result.status == "completed"
+    stored = json.loads(
+        (tmp_path / "candidates.json").read_text(encoding="utf-8"))["candidates"][0]
+    # v1 原始 proposal 工件把 fingerprint 输入字段收进 extras 透传(既有兼容链),
+    # 值必须原样保留,后续 CandidateStore.build 归一时顶层读回。
+    assert stored["extras"]["claim_profile"] == candidate["claim_profile"]
+    assert stored["extras"]["anchor"] == candidate["anchor"]
+    assert stored["extras"]["mechanism"] == candidate["mechanism"]
+    assert "fingerprint" not in stored["extras"]  # 平铺输入不得包成嵌套对象

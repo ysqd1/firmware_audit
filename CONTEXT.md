@@ -97,7 +97,7 @@ _Avoid_: 弱信号 Candidate, 强制 finding
 _Avoid_: inventory(已被 ADR-0011 否决的独立流水线产物), finding
 
 **Candidate Store**:
-Host 校验、去重并分配稳定身份后的 Candidate 权威集合。signal Candidate 的确定性 fingerprint 由目标路径、位置锚点、Claim Profile 与问题机制组成;coverage Candidate 则由目标路径、组件或入口与检查目标组成。只有目标与 Profile 相同但 fingerprint 不同时才做一次语义比较;结果为 same / different / uncertain,只有 same 合并并保留原 proposal 作为 alias。
+Host 校验、去重并分配稳定身份后的 Candidate 权威集合。signal Candidate 的确定性 fingerprint 由目标路径、位置锚点、Claim Profile 与问题机制组成;coverage Candidate 则由目标路径、组件或入口与检查目标组成。只有目标与 Profile 相同但 fingerprint 不同时才做一次语义比较;结果为 same / different / uncertain,只有 same 合并并保留原 proposal 作为 alias。fingerprint 是 Host 派生值:模型 proposal 只提交平铺输入字段,把已知领域字段包进嵌套 fingerprint 对象的新 proposal 被整份拒绝;盘上已入册记录按已接受形态复现,不重新审判。
 _Avoid_: survey.json 内嵌列表, Agent 私有队列
 
 **Candidate ID**:

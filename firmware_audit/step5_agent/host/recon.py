@@ -32,6 +32,7 @@ from .candidates import (
     CANDIDATE_STORE_SCHEMA_VERSION,
     CLAIM_PROFILES,
     FINGERPRINT_INPUT_FIELDS,
+    find_misplaced_intake_fields,
 )
 from .evidence import (
     DEFAULT_TOOL_RESULT_LIMIT_BYTES,
@@ -363,6 +364,16 @@ def _candidate_issues(
                 expected="Claim Profile 枚举值或缺失(默认 generic)",
                 actual=json.dumps(profile, ensure_ascii=False),
                 allowed_values=CLAIM_PROFILES,
+            ))
+        # 票 25:领域字段错放进嵌套 fingerprint 对象时整份拒绝并指路平铺,
+        # 不让非 generic 意图被缺省值静默掩盖(与 normalize_intake 同一检测出处)。
+        for misplaced_path in find_misplaced_intake_fields(entry):
+            issues.append(ValidationIssue(
+                path=f"{base}.{misplaced_path}",
+                expected=(
+                    "平铺在 candidate 顶层的输入字段"
+                    "(fingerprint 由 Host 派生,不接受嵌套对象)"),
+                actual="嵌套在 fingerprint 对象内",
             ))
         evidence_id = entry.get("evidence_id")
         issues.extend(_string_entry_issues(f"{base}.evidence_id", evidence_id))
@@ -971,11 +982,17 @@ Host 会在首轮消息注入确定性现场概览(顶层目录×文件数×大�
   (组件或入口)与 check_goal(检查目标);两者都可带 claim_profile
   (data_propagation/config/credentials/memory/generic,缺省 generic)。
   同一问题的重复 proposal 靠这些字段精确合并,缺失会增加一次语义比较。
+  这些输入字段必须平铺在 candidate 顶层(extras 直接字段亦可);fingerprint
+  是 Host 派生值,不是可提交字段,把输入字段包进嵌套的 fingerprint 对象会
+  被整份拒绝。完整 candidate 示例(字段全部平铺):
+```json
+{"kind": "signal", "target": "extracted/www/cgi-bin/cgi-exec", "signal": "CGI 处理器导入 execl/system,命令组装参数未见校验", "evidence_id": "ev-000012", "next_action": "反编译命令组装点确认数据流与边界", "claim_profile": "data_propagation", "anchor": "handle_cgi_request", "mechanism": "command injection", "possible_source": "QUERY_STRING", "possible_sink": "execl 调用"}
+```
 - checked_scope: 非空字符串数组,记录已检查范围(目录/扫描/抽查);
   跑过工具却报空范围会被整份拒绝。
 - coverage_gaps: object 数组,每项含非空 area(未检查的高价值面)。
-缺段、空 attack_surface/candidates、字段缺失或引用未知 Evidence 都会被
-Host 整份拒绝并回喂问题清单,请修正后从头重新提交。
+缺段、空 attack_surface/candidates、字段缺失、字段错放或引用未知 Evidence
+都会被 Host 整份拒绝并回喂问题清单,请修正后从头重新提交。
 
 ## 5 红线
 - evidence_id 只能来自本轮 Observation View 中出现的 Evidence ID,禁止编造。
