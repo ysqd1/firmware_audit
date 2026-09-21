@@ -111,7 +111,12 @@ def test_profile_claim_document_lists_schema(profile: str) -> None:
     assert document["profile"] == profile
     assert [item["name"] for item in document["claims"]] == list(required_claims(profile))
     assert all(item["label"] for item in document["claims"])
-    assert document["statuses"] == list(CLAIM_STATUSES)
+    # 票 26:读侧/写侧显式拆分——unassessed 只在读侧,写侧三值以省略表达未评估。
+    statuses = document["statuses"]
+    assert statuses["read_side"] == list(CLAIM_STATUSES)
+    assert statuses["write_side"] == list(ASSESSABLE_STATUSES)
+    assert "unassessed" not in statuses["write_side"]
+    assert "省略" in statuses["note"]
 
 
 def test_unknown_profile_is_policy_error() -> None:
@@ -321,6 +326,23 @@ def test_malformed_gap_openings_rejected(value: object) -> None:
 def test_direct_writes_to_owned_gap_store_are_rejected() -> None:
     with pytest.raises(ProposalRejectedError, match="Host 管理"):
         _apply({"evidence_gaps": "直写"})
+
+
+# ---- 票 26:拒绝反馈指导省略,与模型可见契约同一口径 ----
+
+def test_explicit_unassessed_feedback_points_to_omission() -> None:
+    with pytest.raises(ProposalRejectedError, match="未评估请省略该 Claim"):
+        _apply({"claims": {"root_cause": {"status": "unassessed"}}})
+
+
+@pytest.mark.parametrize("delta", [
+    {"gaps_resolved": []},
+    {"gaps_opened": []},
+    {"path_nodes": []},
+])
+def test_empty_optional_fields_feedback_tells_model_to_omit(delta: dict) -> None:
+    with pytest.raises(ProposalRejectedError, match="省略该字段"):
+        _apply(delta)
 
 
 @pytest.mark.parametrize("key", ["hypothesis", "claims", "path_nodes"])

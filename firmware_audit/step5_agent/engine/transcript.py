@@ -2,7 +2,8 @@
 
 Transcript 封装一个 Agent 运行的全部磁盘痕迹:
   - <name>/transcript.jsonl  逐轮事件流(assistant/tool/observation/协议错误),
-    每条带 ts 时间戳;assistant 事件带 in_chars/usage/elapsed(LLM 调用留痕)
+    每条带 ts 时间戳;assistant 事件带 in_chars/usage/elapsed(LLM 调用留痕),
+    且 content 即 parser 的逐字输入、reasoning 分字段独立留存(票 26)
   - <name>/obs/step<N>_<tool>.txt  每次工具结果的未截断全文(回读通道)
 
 路径约定:transcript.jsonl 位于 process/agent/<name>/ 下,obs/ 与其同层;
@@ -11,6 +12,7 @@ obs 文件返回相对 process/ 的路径,与 read_file 白名单同根(LLM 可�
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import re
 from datetime import datetime
@@ -81,3 +83,46 @@ class Transcript:
             return p.relative_to(self.path.parents[2]).as_posix()  # agent/<name>/obs/...
         except (ValueError, IndexError):
             return str(p)
+
+
+@dataclass(frozen=True)
+class ReplayBody:
+    """一条 assistant 事件的可重放判定(票 26)。
+
+    body 是 parser 当时的逐字输入;reasoning 独立留存(从不回灌控制上下文)。
+    旧格式事件把 reasoning 与正文合写进 content 且没有边界,此时
+    replayable=False、body=None,不做任何推测切分或补造。
+    """
+
+    replayable: bool
+    body: str | None
+    reasoning: str | None
+    note: str | None
+
+
+def assistant_replay_body(entry: dict) -> ReplayBody:
+    """判定并提取一条 transcript assistant 事件的原始 parser 正文(票 26)。
+
+    票 26 起的新格式:content 与 reasoning 分字段,content 即
+    ``parse_proposal`` 的逐字输入,可原样重放;区分依据是 reasoning
+    字段的存在性(新事件恒写该键,空思考也写空串)。旧格式没有正文边界,
+    明确标记不可精确重放,绝不把拼接展示文本当 parser 输入。
+    非 assistant 事件没有 parser 输入,按不可重放如实标注。
+    """
+    if entry.get("phase") != "assistant":
+        return ReplayBody(
+            replayable=False, body=None, reasoning=None,
+            note=f"非 assistant 事件(phase={entry.get('phase')!r}),无 parser 输入",
+        )
+    if "reasoning" not in entry:
+        return ReplayBody(
+            replayable=False, body=None, reasoning=None,
+            note=("旧格式 assistant 事件:reasoning 与正文合写入 content,"
+                  "正文边界缺失,不能精确重放 parser 输入"),
+        )
+    return ReplayBody(
+        replayable=True,
+        body=entry.get("content"),
+        reasoning=entry.get("reasoning") or None,
+        note=None,
+    )

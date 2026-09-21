@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from firmware_audit.step5_agent.engine.context import ContextManager
+from firmware_audit.step5_agent.engine.transcript import assistant_replay_body
 from firmware_audit.step5_agent.host.session import (
     ActionProposal,
     AgentSession,
@@ -240,3 +241,101 @@ def test_invalid_session_reply_has_no_tool_or_loop_side_effect(tmp_path: Path) -
     assert session.request_count == 1
     assert not hasattr(session, "tools")
     assert not hasattr(session, "run")
+
+
+# ---- 票 26:parser 正文与 reasoning 分离留存、原始回复可重放 ----
+
+def _assistant_entries(transcript_path: Path) -> list[dict]:
+    entries = [
+        json.loads(line)
+        for line in transcript_path.read_text(encoding="utf-8").splitlines()
+    ]
+    return [entry for entry in entries if entry["phase"] == "assistant"]
+
+
+def test_step_logs_parser_body_and_reasoning_separately(tmp_path: Path) -> None:
+    """content 即 parse_proposal 的逐字输入;reasoning 分字段独立留存,
+    且不回灌控制上下文(票 26)。"""
+    reply = _reply({"kind": "tool_action", "tool": "read_file", "arguments": {}})
+    reasoning = "先读入口配置,再判断暴露面。"
+    llm = ScriptedLLM([(reply, {
+        "prompt_tokens": 12, "completion_tokens": 34,
+        "reasoning_content": reasoning,
+    })])
+    context = ContextManager("fixed system", "current investigation")
+    transcript = tmp_path / "transcript.jsonl"
+    session = AgentSession(role="analysis", llm=llm, context=context,
+                           transcript=transcript)
+
+    result = session.step()
+
+    assert isinstance(result, ActionProposal)
+    entries = _assistant_entries(transcript)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["content"] == reply  # 逐字 parser 输入,无拼接
+    assert entry["reasoning"] == reasoning  # 独立字段,可审计
+    assert entry["usage"] == {"prompt_tokens": 12, "completion_tokens": 34}
+    # 控制上下文只回灌正文,reasoning 不进对话记忆。
+    assert context.recent == [{"role": "assistant", "content": reply}]
+
+
+def test_assistant_replay_body_roundtrips_parser_input(tmp_path: Path) -> None:
+    """新格式事件:reader 取回的正文可原样重放 parser,结论与原次一致。"""
+    reply = _reply({"kind": "submit_case"})
+    llm = ScriptedLLM([(reply, {"reasoning_content": "案卷已成熟"})])
+    transcript = tmp_path / "transcript.jsonl"
+    session = AgentSession(role="analysis", llm=llm,
+                           context=ContextManager("s", ""),
+                           transcript=transcript)
+    original = session.step()
+
+    entry = _assistant_entries(transcript)[0]
+    replay = assistant_replay_body(entry)
+
+    assert replay.replayable is True
+    assert replay.body == reply
+    assert replay.reasoning == "案卷已成熟"
+    assert replay.note is None
+    assert parse_proposal(replay.body, "analysis").kind == original.kind  # type: ignore[union-attr]
+
+
+def test_assistant_replay_body_marks_legacy_merged_content_not_replayable() -> None:
+    """旧格式(reasoning 并入 content,无边界)明确标记不可精确重放,
+    不推测切分、不补造正文(票 26)。"""
+    merged = "先想想。\n{\"decision_summary\": \"合并存储\"}"
+
+    replay = assistant_replay_body({
+        "step": 1, "phase": "assistant", "content": merged,
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2},
+    })
+
+    assert replay.replayable is False
+    assert replay.body is None
+    assert replay.reasoning is None
+    assert replay.note is not None and "旧格式" in replay.note
+
+
+def test_assistant_replay_body_rejects_non_assistant_events() -> None:
+    """user/tool 等事件没有 parser 输入,reader 如实标注而不是误判格式。"""
+    replay = assistant_replay_body({
+        "step": 1, "phase": "user", "content": "Candidate 上下文",
+    })
+
+    assert replay.replayable is False
+    assert replay.body is None
+    assert "非 assistant 事件" in replay.note
+
+
+def test_assistant_replay_body_tolerates_null_reasoning(tmp_path: Path) -> None:
+    reply = _reply({"kind": "close_investigation"})
+    llm = ScriptedLLM([(reply, {"reasoning_content": None})])
+    transcript = tmp_path / "transcript.jsonl"
+    AgentSession(role="analysis", llm=llm, context=ContextManager("s", ""),
+                 transcript=transcript).step()
+
+    replay = assistant_replay_body(_assistant_entries(transcript)[0])
+
+    assert replay.replayable is True
+    assert replay.body == reply
+    assert replay.reasoning is None

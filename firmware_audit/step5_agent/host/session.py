@@ -477,13 +477,16 @@ class AgentSession:
         started = time.time()
         reply, usage_value = self.llm.chat(messages)
         usage = dict(usage_value or {})
-        reasoning = usage.pop("reasoning_content", "")
+        reasoning = usage.pop("reasoning_content", "") or ""
         self.last_usage = usage
-        content = f"{reasoning}\n{reply}".strip() if reasoning else reply
+        # 票 26:content 即 parse_proposal 的逐字输入,reasoning 分字段独立
+        # 留存——合并展示文本无法无歧义还原 parser 输入;reasoning 不回灌
+        # 控制上下文(context 只追加 reply)。
         self.transcript.log(
             self.request_count,
             "assistant",
-            content,
+            reply,
+            reasoning=reasoning,
             usage=usage,
             elapsed=time.time() - started,
             in_chars=sum(len(message.get("content", "")) for message in messages),

@@ -93,7 +93,12 @@ def _known_profile(profile: str) -> None:
 
 
 def profile_claim_document(profile: str) -> dict[str, Any]:
-    """渲染进 Agent 上下文的该 Profile Claim 模式(名称/决定性/释义)。"""
+    """渲染进 Agent 上下文的该 Profile Claim 模式(名称/决定性/释义)。
+
+    票 26:statuses 显式拆读侧/写侧——unassessed 是 Host 状态的未评估缺省,
+    只在读侧出现;delta 写侧只允许三值,未评估以省略该 Claim 表达,避免
+    模型照抄读侧全集显式提交 unassessed 被整份拒绝。
+    """
     _known_profile(profile)
     return {
         "profile": profile,
@@ -105,7 +110,14 @@ def profile_claim_document(profile: str) -> dict[str, Any]:
             }
             for name in required_claims(profile)
         ],
-        "statuses": list(CLAIM_STATUSES),
+        "statuses": {
+            "read_side": list(CLAIM_STATUSES),
+            "write_side": list(ASSESSABLE_STATUSES),
+            "note": (
+                "unassessed 是未评估缺省,只在读侧状态出现;"
+                "state_delta 不允许显式提交,未评估的 Claim 以省略表达"
+            ),
+        },
     }
 
 
@@ -244,7 +256,8 @@ def _validate_claim_updates(
         if status not in ASSESSABLE_STATUSES:
             _reject(
                 f"state_delta.claims.{name}.status 只允许 "
-                f"{', '.join(ASSESSABLE_STATUSES)}(unassessed 是未评估缺省,不可显式提交)")
+                f"{', '.join(ASSESSABLE_STATUSES)}"
+                "(unassessed 是未评估缺省,不可显式提交,未评估请省略该 Claim)")
         if status == "not_applicable" and is_decisive(profile, name):
             _reject(
                 f"决定性 Claim {name!r} 不允许 not_applicable;"
@@ -405,13 +418,15 @@ def validate_analysis_delta(
                 value, state, evidence_ids, profile)
         elif key == "path_nodes":
             if not isinstance(value, list) or not value:
-                _reject("state_delta.path_nodes 必须为非空字符串数组")
+                _reject("state_delta.path_nodes 必须为非空字符串数组;"
+                        "未变化请整体省略该字段")
             for item in value:
                 _nonempty_string(item, "state_delta.path_nodes[]")
             path_nodes = tuple(value)
         elif key == "gaps_opened":
             if not isinstance(value, list) or not value:
-                _reject("state_delta.gaps_opened 必须为非空数组")
+                _reject("state_delta.gaps_opened 必须为非空数组;"
+                        "未变化请整体省略该字段")
             existing_ids = {gap.get("id") for gap in _gaps_state(state)}
             for item in value:
                 if not isinstance(item, dict):
@@ -431,7 +446,8 @@ def validate_analysis_delta(
                     })
         elif key == "gaps_resolved":
             if not isinstance(value, list) or not value:
-                _reject("state_delta.gaps_resolved 必须为非空 Gap ID 数组")
+                _reject("state_delta.gaps_resolved 必须为非空 Gap ID 数组;"
+                        "未变化请整体省略该字段")
             known_ids = {gap.get("id") for gap in _gaps_state(state)}
             for item in value:
                 gap_id = _nonempty_string(item, "state_delta.gaps_resolved[]")

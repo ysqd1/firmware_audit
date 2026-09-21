@@ -22,6 +22,7 @@ from firmware_audit.step5_agent.host.evidence import EvidenceRecorder
 from firmware_audit.step5_agent.host.store import InvestigationStore, StoreError
 from firmware_audit.step5_agent.providers.tools.base import ToolResult
 from firmware_audit.test.host_related import related_entry as _related_entry
+from firmware_audit.test.scripted_llm import ScriptedLLM
 
 
 
@@ -1055,3 +1056,215 @@ def test_analysis_prompt_pins_evidence_discipline() -> None:
     assert "gaps_opened" in prompt
     # 不把无动态 PoC 当作统一否决条件。
     assert "不要求动态" in prompt and "PoC" in prompt
+
+
+# ---- 票 26:协议读写契约可用性与原始回复可重放性 ----
+
+
+def test_analysis_prompt_pins_delta_contract_usability() -> None:
+    """模型可见契约:省略表达未评估、未变化可选字段整体省略。"""
+    from firmware_audit.step5_agent.host.analysis import ANALYSIS_SESSION_SYSTEM
+
+    prompt = ANALYSIS_SESSION_SYSTEM
+    assert "未评估的 Claim 以" in prompt and "省略表达" in prompt
+    assert "unassessed" in prompt and "显式提交会被整份拒绝" in prompt
+    assert "gaps_resolved: []" in prompt and "path_nodes: []" in prompt
+    assert "整体省略" in prompt
+
+
+def test_third_rejection_persists_final_reason_and_seals_protocol_error(
+        tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    invalid = ProposalError((ValidationIssue(
+        path="$", expected="JSON object", actual="invalid JSON: expecting value",
+    ),), raw_reply="not json")
+    session = FakeSession([invalid, invalid, invalid])
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    # 三连无效按 unresolved/protocol_error 收束;最终拒绝原因进权威投影。
+    assert (investigation.disposition, investigation.stop_reason) == (
+        "unresolved", "protocol_error")
+    assert investigation.protocol_error_detail
+    saved = json.loads((tmp_path / "investigations" / candidate.candidate_id
+                        / "state.json").read_text(encoding="utf-8"))
+    detail = saved["state"]["investigation"]["protocol_error_detail"]
+    assert isinstance(detail, str) and detail
+
+    # 恢复投影带完整审计字段;不回喂已收束的调查(没有第四次请求)。
+    resumed = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    restored = resumed.investigation_for(candidate.candidate_id)
+    assert restored.protocol_error_detail == detail
+    assert restored.lifecycle_status == "finished"
+    assert len(session.inputs) == 3
+
+
+@pytest.mark.parametrize("corrupt", [[], True, 3, "", "   "])
+def test_restore_rejects_corrupt_protocol_error_detail(
+        tmp_path: Path, corrupt: object) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="same", raw="same"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/bin/router"})
+    invalid = ProposalError((ValidationIssue(
+        path="$", expected="JSON object", actual="invalid JSON",
+    ),), raw_reply="nope")
+    host.run_analysis(candidate.candidate_id, FakeSession([invalid] * 3))
+
+    state_path = tmp_path / "investigations" / candidate.candidate_id / "state.json"
+    events_path = tmp_path / "investigations" / candidate.candidate_id / "events.jsonl"
+    snapshot = json.loads(state_path.read_text(encoding="utf-8"))
+    snapshot["state"]["investigation"]["protocol_error_detail"] = corrupt
+    state_path.write_text(
+        json.dumps(snapshot, ensure_ascii=False) + "\n", encoding="utf-8")
+    events = events_path.read_text(encoding="utf-8").splitlines()
+    event = json.loads(events[-1])
+    event["state"]["investigation"]["protocol_error_detail"] = corrupt
+    events[-1] = json.dumps(event, ensure_ascii=False)
+    events_path.write_text("\n".join(events) + "\n", encoding="utf-8")
+
+    with pytest.raises(StoreError, match="protocol_error_detail"):
+        HostAnalysisTracer(tmp_path, {"read_file": tool})
+
+
+def _production_session(llm, tmp_path: Path, candidate_id: str):
+    """生产 AgentSession(真实解析+Transcript)+ 世代内 transcript 布局。"""
+    from firmware_audit.step5_agent.engine.context import ContextManager
+    from firmware_audit.step5_agent.host.analysis import ANALYSIS_SESSION_SYSTEM
+    from firmware_audit.step5_agent.host.session import AgentSession
+    return AgentSession(
+        "analysis", llm,
+        ContextManager(ANALYSIS_SESSION_SYSTEM, ""),
+        transcript=tmp_path / "investigations" / candidate_id / "transcript.jsonl",
+    )
+
+
+def _raw_action(state_delta: dict | None = None) -> str:
+    return json.dumps({
+        "decision_summary": "读取候选目标确认暴露面",
+        "state_delta": state_delta or {},
+        "next": {"kind": "tool_action", "tool": "read_file",
+                 "arguments": {"path": "extracted/etc/device.conf"}},
+    }, ensure_ascii=False)
+
+
+def _raw_close() -> str:
+    return json.dumps({
+        "decision_summary": "材料足够,结束调查",
+        "state_delta": {"closure_reason": "决定性反证",
+                        "evidence_refs": ["ev-000001"]},
+        "next": {"kind": "close_investigation"},
+    }, ensure_ascii=False)
+
+
+def _transcript_entries(tmp_path: Path, candidate_id: str) -> list[dict]:
+    path = tmp_path / "investigations" / candidate_id / "transcript.jsonl"
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_production_session_legal_first_action_runs_to_closure(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="observed", raw="observed"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    llm = ScriptedLLM([_raw_action(), _raw_close()])
+    session = _production_session(llm, tmp_path, candidate.candidate_id)
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert (investigation.disposition, investigation.stop_reason) == (
+        "closed", "agent_closed")
+    assert len(tool.calls) == 1
+    budget = json.loads((tmp_path / "budget.json").read_text(encoding="utf-8"))
+    assert (budget["llm_calls"], budget["validated_rounds"]) == (2, 2)
+    entries = _transcript_entries(tmp_path, candidate.candidate_id)
+    # 首个 user 是 Candidate 上下文,第二个 user 是 Observation View。
+    assert [entry["phase"] for entry in entries] == [
+        "user", "assistant", "user", "assistant"]
+    # 新 transcript:正文即 parser 输入,reasoning 分字段(空也写键)。
+    for entry in entries:
+        if entry["phase"] == "assistant":
+            assert "reasoning" in entry
+
+
+def test_production_session_two_corrections_then_success(tmp_path: Path) -> None:
+    from firmware_audit.step5_agent.engine.transcript import assistant_replay_body
+
+    tool = FakeTool(ToolResult(ok=True, text="observed", raw="observed"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    llm = ScriptedLLM([
+        "not json at all",  # 正文非法
+        _raw_action({"claims": {"root_cause": {"status": "unassessed"}}}),  # 写侧违规
+        _raw_action(),
+        _raw_close(),
+    ])
+    session = _production_session(llm, tmp_path, candidate.candidate_id)
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    # 两次拒绝各有结构化反馈;整份拒绝零工具/状态副作用,合法轮才执行。
+    user_messages = [m["content"] for m in session.context.recent
+                     if m["role"] == "user"]
+    assert "invalid_agent_proposal" in user_messages[1]
+    assert "unassessed" in user_messages[2]
+    assert len(tool.calls) == 1
+    assert investigation.state.get("claims") is None
+    assert (investigation.disposition, investigation.stop_reason) == (
+        "closed", "agent_closed")
+    budget = json.loads((tmp_path / "budget.json").read_text(encoding="utf-8"))
+    assert budget["llm_calls"] == 4
+    assert budget["validated_rounds"] == 2
+    assert budget["tool_attempts"] == 1
+    # Transcript:拒绝轮逐字留痕,任何一轮都能精确重放 parser 输入。
+    entries = _transcript_entries(tmp_path, candidate.candidate_id)
+    # user 事件依次为:Candidate 上下文、两次拒绝反馈、Observation View。
+    assert [entry["phase"] for entry in entries] == ["user", "assistant"] * 4
+    bodies = [assistant_replay_body(entry) for entry in entries
+              if entry["phase"] == "assistant"]
+    assert all(body.replayable for body in bodies)
+    assert isinstance(parse_proposal(bodies[0].body, "analysis"), ProposalError)
+
+
+def test_production_session_three_failures_seal_protocol_error(tmp_path: Path) -> None:
+    tool = FakeTool(ToolResult(ok=True, text="must not run", raw="must not run"))
+    host = HostAnalysisTracer(tmp_path, {"read_file": tool})
+    candidate = host.add_candidate({"target": "extracted/etc/device.conf"})
+    llm = ScriptedLLM([
+        "not json at all",
+        _raw_action({"claims": {"root_cause": {"status": "unassessed"}}}),
+        _raw_action({"gaps_resolved": []}),  # 空数组占位同样整份拒绝
+    ])
+    session = _production_session(llm, tmp_path, candidate.candidate_id)
+
+    investigation = host.run_analysis(candidate.candidate_id, session)
+
+    assert (investigation.disposition, investigation.stop_reason) == (
+        "unresolved", "protocol_error")
+    assert investigation.protocol_error_detail
+    # 拒绝不产生工具或状态副作用;预算如实计入三次请求(重生成同计)。
+    assert tool.calls == []
+    assert investigation.state == {}
+    assert len(investigation.evidence) == 0
+    budget = json.loads((tmp_path / "budget.json").read_text(encoding="utf-8"))
+    assert budget["llm_calls"] == 3
+    assert budget["validated_rounds"] == 0
+    assert budget["tool_attempts"] == 0
+    events = [
+        json.loads(line)["kind"]
+        for line in (tmp_path / "investigations" / candidate.candidate_id
+                     / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1] == "protocol_error"
+    saved = json.loads((tmp_path / "investigations" / candidate.candidate_id
+                        / "state.json").read_text(encoding="utf-8"))
+    assert saved["state"]["runtime"]["rounds_used"] == 3
+    # 前两次拒绝的反馈在 transcript 可审计;最终拒绝不回喂(无第 4 次请求)。
+    entries = _transcript_entries(tmp_path, candidate.candidate_id)
+    assert session.request_count == 3
+    feedbacks = [entry for entry in entries
+                 if "invalid_agent_proposal" in entry["content"]]
+    assert len(feedbacks) == 2

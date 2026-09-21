@@ -260,6 +260,11 @@ def build_fact_report(gen_dir: Path) -> str:
     for candidate_id, state in unconverged:
         lines.append(f"- {candidate_id}: disposition={state.get('disposition')};"
                      f" stop_reason={state.get('stop_reason')}")
+        # 票 26:protocol_error 收束的调查附最终拒绝原因(落盘于权威投影)。
+        detail = state.get("protocol_error_detail")
+        if (state.get("stop_reason") == "protocol_error"
+                and isinstance(detail, str) and detail.strip()):
+            lines.append(f"  最终拒绝: {detail}")
     lines.append("")
 
     # 5. 未开始 Candidates

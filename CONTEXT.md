@@ -234,7 +234,7 @@ ReAct 循环的一次 LLM 调用迭代,记入 transcript 并编号(step 1..max_i
 _Avoid_: 步(step 已用于索引)
 
 **Transcript**:
-一次 Agent Session 的完整留痕,包含输入输出、动作建议、耗时与用量。它用于追溯,不是 Investigation State 也不作为恢复时的工作记忆。
+一次 Agent Session 的完整留痕,包含输入输出、动作建议、耗时与用量。assistant 事件的 `content` 即协议 parser 的逐字输入,`reasoning` 分字段独立留存、从不回灌控制上下文(票 26);旧数据(2026-09-21 前)reasoning 与正文合写入 content 且无边界,经 `engine.transcript.assistant_replay_body` 判定为不可精确重放,不推测切分。它用于追溯,不是 Investigation State 也不作为恢复时的工作记忆。
 _Avoid_: Investigation State, 恢复快照
 
 **工具 (tool)**:

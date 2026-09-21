@@ -277,6 +277,25 @@ def test_completion_gate_still_rejects_non_budget_unreviewed_ready_case(
     assert load_run_state(gen_dir)["status"] == "finalizing"
 
 
+def test_report_surfaces_protocol_error_detail(tmp_path: Path) -> None:
+    """票 26:protocol_error 收束的调查在事实报告里给出最终拒绝原因。"""
+    gen_dir = _build_gen(tmp_path, name_suffix="-proto")
+    state_path = gen_dir / "investigations" / "cand-0001" / "state.json"
+    snapshot = json.loads(state_path.read_text(encoding="utf-8"))
+    snapshot["state"]["investigation"].update(
+        disposition="unresolved", stop_reason="protocol_error",
+        protocol_error_detail=(
+            "state_delta.claims.root_cause.status 只允许 supported, "
+            "refuted, not_applicable(unassessed 是未评估缺省,不可显式提交)"))
+    _write_json(state_path, snapshot)
+
+    report = build_fact_report(gen_dir)
+
+    assert "cand-0001" in report
+    assert "stop_reason=protocol_error" in report
+    assert "不可显式提交" in report
+
+
 # ---- S2 报告:固定顺序、确定性、敏感值呈现纪律 ----
 
 

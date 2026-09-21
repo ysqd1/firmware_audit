@@ -7,9 +7,13 @@ from __future__ import annotations
 
 
 class ScriptedLLM:
-    """按序吐预置回复,耗尽即抛错(防测试静默通过)。"""
+    """按序吐预置回复,耗尽即抛错(防测试静默通过)。
 
-    def __init__(self, replies: list[str]):
+    回复项可以是 str(零用量)或 (reply, usage) 二元组(票 26:模拟推理
+    模型把 reasoning_content 放在 usage 里返回的形态)。
+    """
+
+    def __init__(self, replies: list[str | tuple[str, dict]]):
         self.replies = list(replies)
         self.calls: list[list[dict]] = []  # 记录每次请求的 messages
         self._idx = 0
@@ -28,6 +32,9 @@ class ScriptedLLM:
         self.calls.append(list(messages))
         if self._idx >= len(self.replies):
             raise RuntimeError(f"ScriptedLLM 回复已耗尽(第 {self._idx + 1} 次调用)")
-        reply = self.replies[self._idx]
+        item = self.replies[self._idx]
         self._idx += 1
-        return reply, {"prompt_tokens": 0, "completion_tokens": 0}
+        if isinstance(item, tuple):
+            reply, usage = item
+            return reply, dict(usage)
+        return item, {"prompt_tokens": 0, "completion_tokens": 0}

@@ -117,6 +117,8 @@ class Investigation:
     stop_reason: str | None = None
     closure_reason: str | None = None
     closure_evidence: tuple[str, ...] = ()
+    # 票 26:protocol_error 收束时的最终拒绝原因(可审计,不回喂已收束调查)。
+    protocol_error_detail: str | None = None
     claim_profile: str = "generic"
     no_progress_count: int = 0
     state: dict[str, Any] = field(default_factory=dict)
@@ -175,6 +177,11 @@ class HostAnalysisTracer:
         if "claim_profile" not in data and isinstance(candidate.proposal, dict):
             # 票 08 之前的快照没有该字段;从 Candidate proposal 回填保真。
             data["claim_profile"] = candidate.proposal.get("claim_profile", "generic")
+        detail = data.get("protocol_error_detail")
+        if not (detail is None or (isinstance(detail, str) and detail.strip())):
+            # 票 26:审计字段自身失真按损坏处理,不做推测规整。
+            raise StoreError(
+                "protocol_error_detail 必须为非空字符串或省略;请检查原运行目录")
         if (candidate.candidate_id != candidate_id
                 or not isinstance(candidate.proposal, dict)
                 or data["candidate_id"] != candidate_id
@@ -690,6 +697,9 @@ class HostAnalysisTracer:
                         self._finish_investigation(
                             investigation, disposition="unresolved",
                             stop_reason="protocol_error")
+                        # 票 26:最终拒绝原因落权威投影(events + 快照)供
+                        # 审计;已收束的调查不再回喂,契约次数不变。
+                        investigation.protocol_error_detail = str(exc)
                         self._checkpoint(candidate_id, "protocol_error")
                         return deepcopy(investigation)
                     input_message = regeneration_feedback(str(exc))
@@ -914,7 +924,9 @@ _ANALYSIS_SESSION_SYSTEM = """## 1 角色与使命
 - 单个工具失败是正常 Observation,换路取证,不要编造结果。
 
 ## 3 state_delta 结构化状态
-随每个动作提交增量(只写变化,不重发全量):
+随每个动作提交增量(只写变化,不重发全量)。可选字段只在本轮有变化时出现;
+未变化的字段整体省略,空数组占位(如 gaps_opened: []、gaps_resolved: []、
+path_nodes: [])会被整份拒绝。
 - hypothesis: {"statement": "...", "note": "..."} 设置/替换当前唯一工作假设
   (换假设前先给旧假设一个 hypothesis_outcome)。
 - hypothesis_outcome: {"outcome": "supported|refuted", "note": "..."} 收束
@@ -922,7 +934,8 @@ _ANALYSIS_SESSION_SYSTEM = """## 1 角色与使命
 - claims: {Claim 名: {"status": "supported|refuted|not_applicable",
   "evidence_ids": ["ev-xxxxxx"], "note": "..."}} 逐项推进必填 Claim
   (见上下文 claim_schema;决定性 Claim 不允许 not_applicable;
-  supported 必须引用本 Investigation 的 Evidence)。
+  supported 必须引用本 Investigation 的 Evidence)。未评估的 Claim 以
+  省略表达:unassessed 是 Host 读侧缺省,显式提交会被整份拒绝。
 - path_nodes: ["source-to-sink 链条上的节点"] 记录路径进展。
 - gaps_opened: [{"id": "...", "description": "...", "blocking": bool}] /
   gaps_resolved: ["gap-id"] 管理证据缺口(blocking 缺口会阻止 ready)。
