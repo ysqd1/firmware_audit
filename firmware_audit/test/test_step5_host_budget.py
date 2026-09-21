@@ -176,6 +176,26 @@ def test_effective_config_snapshot_is_persisted_and_reloadable(tmp_path: Path) -
         load_config_snapshot(tmp_path)
 
 
+def test_config_snapshot_prompt_versions_roundtrip(tmp_path: Path) -> None:
+    """票 24:prompts 段随快照冻结并可读回;缺段快照(历史世代)照常装载。"""
+    document = resolve_effective_config(env={})
+    document["prompts"] = {"recon": "aa", "analysis": "bb", "verification": "cc"}
+    persist_config_snapshot(tmp_path, document)
+    loaded = load_config_snapshot(tmp_path)
+    assert loaded["prompts"] == {"recon": "aa", "analysis": "bb", "verification": "cc"}
+
+    # 无 prompts 段:既有快照形状不变,旧世代快照零影响装载。
+    persist_config_snapshot(tmp_path, resolve_effective_config(env={}))
+    plain = load_config_snapshot(tmp_path)
+    assert "prompts" not in plain
+
+    # prompts 段形状失约按快照损坏拒绝,不静默吞掉。
+    persist_config_snapshot(
+        tmp_path, {**resolve_effective_config(env={}), "prompts": {"recon": 7}})
+    with pytest.raises(StoreError, match="配置快照"):
+        load_config_snapshot(tmp_path)
+
+
 def test_env_keys_stay_coherent_with_role_resolvers(monkeypatch) -> None:
     """键名单一纪律:配置链与各角色 resolver 读同名环境变量,不漂移。"""
     from firmware_audit.step5_agent.host.candidates import resolve_processing_slots

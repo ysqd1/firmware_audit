@@ -1703,3 +1703,58 @@ def test_case_context_message_carries_checklist_for_resumed_verifier(
     assert "逐 Claim 检查清单" in first_input
     # 检查清单内容实际进入上下文(逐项 claim 条目可见)
     assert '"claim"' in first_input
+
+
+# ---- 票 24:证据纪律钉进提示词与逐 Claim 检查清单 ----
+
+
+def test_session_system_prompt_pins_evidence_discipline() -> None:
+    """版本映射/推断措辞禁令、unresolved 非反证语义、analysis 结论非证据。"""
+    assert "版本映射" in VERIFICATION_SESSION_SYSTEM
+    assert "通常" in VERIFICATION_SESSION_SYSTEM
+    assert "分项核对" in VERIFICATION_SESSION_SYSTEM
+    for material in ("根因", "可达性", "权限或认证"):
+        assert material in VERIFICATION_SESSION_SYSTEM, material
+    # 未证实 ≠ 反证:证据不足走 unresolved 并逐项写明缺失材料。
+    assert "证据不足不是反证" in VERIFICATION_SESSION_SYSTEM
+    assert "写明缺失" in VERIFICATION_SESSION_SYSTEM
+    # 冻结案卷里 analysis 的判定与说明不得当作已核实事实引用。
+    assert "已核实事实" in VERIFICATION_SESSION_SYSTEM
+
+
+def test_case_checklist_carries_claim_check_focus(tmp_path: Path) -> None:
+    """检查清单逐 Claim 携带分项核对重点:确定性、零模型请求、不含 analysis 判定。"""
+    from firmware_audit.step5_agent.host.verification import (
+        CLAIM_CHECK_FOCUS,
+        build_case_checklist,
+    )
+
+    tracer, (candidate_id,) = _prepared_tracer(tmp_path)
+    tool = FakeTool(ToolResult(ok=True, text="device.conf", raw="device.conf"))
+    runner = HostVerificationRunner(tmp_path, {"read_file": tool}, tracer)
+    case = load_cases(tmp_path)[0]
+
+    checklist = build_case_checklist(case)
+    focus_by_claim = {
+        item["claim"]: item.get("focus") for item in checklist["items"]}
+    for claim, focus in CLAIM_CHECK_FOCUS.items():
+        assert focus_by_claim[claim] == focus, claim
+    # 共同必填项中只有承载核对纪律的条目带 focus;其余沿用通用 check 文本。
+    assert focus_by_claim["target_exists"] is None
+    # 纪律锚点:机制证据不可由版本比对替代;影响须逐项材料。
+    assert "版本" in focus_by_claim["root_cause"]
+    assert "权限或认证" in focus_by_claim["actual_impact"]
+    # 幂等:同一案卷重复生成逐字节一致(与既有确定性断言同源复核)。
+    assert build_case_checklist(case) == checklist
+
+    # focus 实际进入 Verifier 首条上下文(检查清单随案卷上下文注入)。
+    session = FakeSession([
+        _v_action({"claim_results": {
+            name: _result("supported", "ev-000002", claim=name)
+            for name in GENERIC_REQUIRED}}),
+        _v_complete(),
+    ])
+    runner.run_case(candidate_id, session)
+    first_input = session.inputs[0] or ""
+    assert "focus" in first_input
+    assert "版本区间的比对" in first_input

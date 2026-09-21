@@ -399,6 +399,31 @@ def test_role_prompts_match_tool_contract() -> list[str]:
     return fails
 
 
+def test_role_prompts_pin_version_mapping_ban() -> list[str]:
+    """票 24:生产装配的三角色系统提示词必须显式带版本映射禁令(AC1)。
+
+    Blind Discovery 的版本映射禁令不能只靠禁用 CVE 工具承载;run_step5 的
+    _ROLE_WIRING 是生产装配点,这里按装配表逐角色校验纪律锚点。
+    """
+    fails: list[str] = []
+    import hashlib
+
+    from firmware_audit.step5_agent.host.driver import prompt_version_document
+    from firmware_audit.step5_agent.run_step5 import _ROLE_WIRING
+
+    versions = prompt_version_document()
+    for role, (prompt, _) in _ROLE_WIRING.items():
+        if "版本映射" not in prompt:
+            fails.append(f"{role} 生产提示词缺少版本映射禁令锚点")
+        if "服务启动字符串" not in prompt:
+            fails.append(f"{role} 生产提示词缺少版本/配置/服务字符串证据纪律")
+        # 装配表与快照指纹必须出自同一组提示词常量,两处映射不得各自漂移。
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if versions.get(role) != digest:
+            fails.append(f"{role} 生产装配提示词与快照指纹出处不一致")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for name, fn in [
@@ -417,6 +442,7 @@ def test_main() -> int:
         ("blind_discovery_role_contract", test_blind_discovery_role_contract),
         ("role_contract_rejects_unauthorized_action", test_role_contract_rejects_unauthorized_action),
         ("role_prompts_match_tool_contract", test_role_prompts_match_tool_contract),
+        ("role_prompts_pin_version_mapping_ban", test_role_prompts_pin_version_mapping_ban),
     ]:
         fl = fn()
         if fl:

@@ -1034,3 +1034,24 @@ def test_valid_related_candidate_survives_resume_with_origin(tmp_path: Path) -> 
     }
     assert record["evidence_id"] == "ev-000001"
     assert record["extras"] == {}
+
+
+# ---- 票 24:生产提示词钉住 Blind Discovery 证据纪律 ----
+
+
+def test_analysis_prompt_pins_evidence_discipline() -> None:
+    """版本映射禁令、逐项材料清单、不猜 supported 与静态链豁免必须写进提示词。"""
+    from firmware_audit.step5_agent.host.analysis import ANALYSIS_SESSION_SYSTEM
+
+    prompt = ANALYSIS_SESSION_SYSTEM
+    # 版本映射禁令:三个角色共享同一纪律锚点,而不仅是禁用 CVE 工具。
+    assert "版本映射" in prompt
+    assert "服务启动字符串" in prompt
+    # 决定性 Claim 的证据材料逐项:根因/可达性/权限或认证。
+    for material in ("根因", "可达性", "权限或认证"):
+        assert material in prompt, material
+    # 证据不足的出路是保持未评估或开 gap,不是猜 supported。
+    assert "不要猜 supported" in prompt
+    assert "gaps_opened" in prompt
+    # 不把无动态 PoC 当作统一否决条件。
+    assert "不要求动态" in prompt and "PoC" in prompt

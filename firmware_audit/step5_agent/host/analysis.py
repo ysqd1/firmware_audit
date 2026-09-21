@@ -939,6 +939,13 @@ _ANALYSIS_SESSION_SYSTEM = """## 1 角色与使命
 
 ## 5 红线
 - Evidence ID 只能来自本轮 Observation View,禁止编造或复用其他调查的 ID。
+- Blind Discovery 证据纪律:版本号、配置开关、服务启动字符串只是观察信号,
+  禁止把它们与公开已知问题做版本映射推断(如按版本区间认定存在公开漏洞);
+  仅凭这类材料不能支撑任何决定性 Claim。supported 需要本 Investigation
+  观察到的机制证据:根因(问题机制本身)、可达性(入口/触发路径)、所需
+  权限或认证材料逐项落实;证据不足的项保持 unassessed 或以 gaps_opened
+  逐项列出缺失材料,不要猜 supported。有真实证据的静态缺陷链不要求动态
+  PoC 才能提交复核。
 - 无效回复会收到字段级问题清单并被要求从头重生成整份 JSON(最多三次,
   之后本调查按 protocol_error 收束)。
 - 连续五个动作无新证据/Claim/假设/路径/gap 变化会以 no_progress 停止,

@@ -573,6 +573,27 @@ def build_case_brief(
 CHECKLIST_SCHEMA_VERSION = 1
 
 
+# 逐 Claim 核对重点(票 24:证据纪律在检查清单上的确定性投影,零模型请求)。
+# 只覆盖共同必填项中承载分项核对纪律的条目;Profile 额外项沿用通用 check
+# 文本。条目幂等可重放,修改措辞会改变 checklist.json 内容指纹。
+CLAIM_CHECK_FOCUS: dict[str, str] = {
+    "root_cause": (
+        "证实问题机制本身(具体代码路径/数据流/缺失边界);版本号、配置开关、"
+        "服务启动字符串或公开问题版本区间的比对不能替代机制证据"),
+    "trigger_or_exposure": (
+        "证实入口与触发路径真实可达(网络暴露/调用链/输入到达),"
+        "不能靠推断代替取证"),
+    "actual_impact": (
+        "逐项核实实际影响成立所需材料:根因机制、可达性、所需权限或认证;"
+        "通常如此类推断不构成影响证据,系统级影响必须有对应事实"),
+    "preconditions": (
+        "把触发条件当独立事实核实,写明实际需要的权限/认证/配置状态;"
+        "未证实的条件不得计入影响证明"),
+    "mitigations": (
+        "核实缓解是否真实生效;证实完全阻断实际影响时按决定性反证提交 refuted"),
+}
+
+
 def checklist_path(run_dir: Path, candidate_id: str) -> Path:
     return Path(run_dir) / "verifications" / candidate_id / "checklist.json"
 
@@ -581,8 +602,9 @@ def build_case_checklist(case_payload: dict[str, Any]) -> dict[str, Any]:
     """从冻结案卷确定性生成逐 Claim 检查清单与证据入口(零模型请求)。
 
     清单条目只携带 Profile 的结构性事实(名称/决定性/释义/supported 时必填
-    的 severity facet),不透出 analysis 的判定或说明;证据入口沿用简报的
-    重定位字段并附明示用途。同一案卷重复生成结果逐字节一致(幂等)。
+    的 severity facet)与逐 Claim 核对重点(CLAIM_CHECK_FOCUS,票 24 证据
+    纪律),不透出 analysis 的判定或说明;证据入口沿用简报的重定位字段并附
+    明示用途。同一案卷重复生成结果逐字节一致(幂等)。
     """
     profile = case_payload["claim_profile"]
     entries = [
@@ -603,6 +625,9 @@ def build_case_checklist(case_payload: dict[str, Any]) -> dict[str, Any]:
                 "method/evidence_ids);supported 与 refuted 必须引用本次复核"
                 "Evidence"),
         }
+        focus = CLAIM_CHECK_FOCUS.get(name)
+        if focus is not None:
+            item["focus"] = focus
         if facet_rules:
             item["facets_required_on_supported"] = {
                 facet: list(allowed) for facet, allowed in facet_rules.items()}
@@ -1402,6 +1427,14 @@ Reference 只用于重新定位原始材料,不能作为你的支持证据。最
 - supported 与 refuted 必须引用本次复核 Evidence;决定性 Claim(见
   claim_schema.decisive)不允许 not_applicable;工具不可用判 unresolved,
   它不是反证。
+- 分项核对纪律:实际影响、触发条件、所需权限或认证材料、缓解逐项独立
+  取证后才能判 supported;通常/一般/可尝试类推断,以及仅凭版本号、配置
+  开关、服务启动字符串或公开问题版本区间的比对(版本映射),都不能支撑
+  任何判定。
+- 证据不足不是反证:材料不足判 unresolved,并在 limitations 逐项写明缺失
+  的材料(根因/可达性/权限或认证),不要用 refuted 表达没有证明。
+- observed 只写本次取证得到的事实;条件与假设写进 limitations。冻结案卷
+  里 analysis 的判定与说明不是你的证据,也不得当作已核实事实引用。
 - 每轮可只提交部分 Claim Result;重复提交以最后一次为准。
 
 ## 4 complete_verification 规范

@@ -35,7 +35,7 @@ from .budget import (
     persist_config_snapshot,
     resolve_effective_config,
 )
-from .driver import RunDriver, RunSummary
+from .driver import RunDriver, RunSummary, prompt_version_document
 from .evaluation import (
     CANDIDATE_MAP_SCHEMA_VERSION,
     EVALUATION_REVIEW_SCHEMA_VERSION,
@@ -157,6 +157,7 @@ from .session import (
 )
 from .verification import (
     CHECKLIST_SCHEMA_VERSION,
+    CLAIM_CHECK_FOCUS,
     CLAIM_RESULT_JUDGMENTS,
     DEFAULT_VERIFICATION_MAX_ROUNDS,
     FINDING_SCHEMA_VERSION,
@@ -212,6 +213,7 @@ __all__ = [
     "canonical_json",
     "CASE_SCHEMA_VERSION",
     "CaseOutcome",
+    "CLAIM_CHECK_FOCUS",
     "CLAIM_PROFILES",
     "CLAIM_RESULT_FACETS",
     "CLAIM_RESULT_JUDGMENTS",
@@ -280,6 +282,7 @@ __all__ = [
     "project_review_report",
     "ProposalError",
     "ProposalRejectedError",
+    "prompt_version_document",
     "protocol_instruction",
     "read_manifest",
     "ReconRunResult",

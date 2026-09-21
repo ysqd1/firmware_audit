@@ -131,15 +131,23 @@ def config_snapshot_path(run_dir: Path) -> Path:
 
 
 def persist_config_snapshot(run_dir: Path, config: dict[str, Any]) -> Path:
-    """把生效配置与键级来源原子落盘;结果按实际预算可解释的运行工件。"""
+    """把生效配置与键级来源原子落盘;结果按实际预算可解释的运行工件。
+
+    ``prompts`` 段可选(票 24):新世代随快照冻结三角色系统提示词的内容
+    指纹,提示版本可追溯;恢复路径读回冻结快照,不重写。
+    """
     if "resolved" not in config or "sources" not in config:
         raise ConfigError("配置快照必须来自 resolve_effective_config 的返回值")
     path = config_snapshot_path(run_dir)
-    atomic_json(path, {
+    document: dict[str, Any] = {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "resolved": dict(config["resolved"]),
         "sources": dict(config["sources"]),
-    })
+    }
+    prompts = config.get("prompts")
+    if prompts is not None:
+        document["prompts"] = dict(prompts)
+    atomic_json(path, document)
     return path
 
 
@@ -151,6 +159,12 @@ def load_config_snapshot(run_dir: Path) -> dict[str, Any] | None:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise StoreError(f"配置快照损坏；请检查原运行目录: {exc}") from exc
+    prompts = payload.get("prompts") if isinstance(payload, dict) else None
+    if prompts is not None and (
+            not isinstance(prompts, dict)
+            or not all(isinstance(key, str) and isinstance(value, str)
+                       for key, value in prompts.items())):
+        raise StoreError("配置快照结构或版本损坏；请检查原运行目录")
     if (not isinstance(payload, dict)
             or payload.get("schema_version") != CONFIG_SCHEMA_VERSION
             or not isinstance(payload.get("resolved"), dict)

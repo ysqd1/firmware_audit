@@ -114,6 +114,16 @@ Related Candidate 只继承相关 Investigation State、Evidence References 与�
 4. **run 级停止原因词汇不变**：收束后 run_state 的 stop_reason 为 `processing_complete`，与正常完成一致；预算耗尽由调查级 stop_reason 分布承载，不新增 run 级词汇。
 5. **评估口径不变**：unresolved 调查仍不得作为 Benchmark 评估的 partial primary（维持票 15 规则），预算耗尽对应的 Ground Truth 条目判 miss；是否放宽待首批案例实测后再议。
 
+## 2026-09-21 证据纪律确认（票 24）
+
+两例离线评估（Tenda f-0001、D-Link f-0001 unsupported）暴露：禁用 CVE 工具并未阻止模型用版本区间比对或影响猜测替代证据；D-Link f-0002 的"嵌入式上下文通常 root"也不能作权限证明。确认以下纪律落点，不新增模型调用，不新增 Host 证明字段或 schema（结构化证明门如何判语义充分尚无可执行规格，需另行补规格后再议）：
+
+1. **三角色提示词禁令**：recon/analysis/verification 的生产系统提示词显式写入 Blind Discovery 证据纪律——版本号、配置开关、服务启动字符串只是信号，禁止与公开已知问题做版本映射推断，仅凭这类材料不能支撑任何决定性 Claim。工具禁用与语义禁令并行，后者不依赖前者。
+2. **Verifier 分项核对**：实际影响、触发条件、所需权限或认证材料、缓解逐项独立取证；"通常/一般/可尝试"类推断不构成判定依据。证据不足判 unresolved 并在 limitations 逐项写明缺失材料，不得用 refuted 表达"没有证明"；observed 只写本次取证事实，冻结案卷里 analysis 的判定与说明不是独立证据。
+3. **检查清单承载纪律**：逐 Claim 检查清单（确定性生成，零模型请求）为 root_cause/trigger_or_exposure/actual_impact/preconditions/mitigations 附核对重点（focus），纪律随清单进入复核上下文。
+4. **保留有证据的静态缺陷链**：不要求动态 PoC 才能提交或确认；不采用 CVE 字符串黑名单或"包含版本字样即拒"式硬门——语义充分性判断由提示词纪律与固定离线评审承载，测试只证明确定性契约与提示接线。
+5. **提示版本可追溯**：新世代配置快照增加可选 `prompts` 段，冻结三角色系统提示词的 SHA-256 内容指纹；恢复与封存不重写已冻结快照。历史世代没有该段或指纹不同均原样保留，不回写；语义改善由固定离线评审或后续新世代实测验证。
+
 ## 代价与影响
 
 - 当前 LLM orchestrator 在迁移期间只作为兼容入口,不再拥有 finish、阶段跳转或 confirmed 接受权。

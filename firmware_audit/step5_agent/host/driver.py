@@ -20,13 +20,14 @@ unresolved/budget_exhausted 终结,同一执行内走正常封存产出 complete
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import time
 import warnings
 from typing import Any, Callable, Mapping
 
-from .analysis import HostAnalysisTracer
+from .analysis import ANALYSIS_SESSION_SYSTEM, HostAnalysisTracer
 from .budget import (
     BudgetExhaustedError,
     RunBudget,
@@ -50,7 +51,7 @@ from .generation import (
     save_run_state,
 )
 from .locking import acquire_lock
-from .recon import HostReconRunner
+from .recon import RECON_SESSION_SYSTEM, HostReconRunner
 from .reporting import (
     ANALYST_NOTES_SYSTEM_PROMPT,
     build_fact_report,
@@ -58,6 +59,7 @@ from .reporting import (
 )
 from .store import StoreError, read_json_object
 from .verification import (
+    VERIFICATION_SESSION_SYSTEM,
     HostVerificationRunner,
     load_cases,
     plan_verification_queue,
@@ -69,6 +71,23 @@ _BOOKKEEPING_KEYS = (
     "candidate_id", "fingerprint", "aliases", "merged_proposals",
     "queue", "disposition", "priority",
 )
+
+
+def prompt_version_document() -> dict[str, str]:
+    """三角色生产系统提示词的 SHA-256 内容指纹(票 24)。
+
+    新世代随配置快照冻结,提示版本可追溯;恢复与封存不重写已冻结快照。
+    指纹不同即提示文本不同,对照评估与事后审计可据此区分产出代际。与
+    run_step5._ROLE_WIRING 引用同一组角色常量,提示文本是唯一事实源。
+    """
+    return {
+        role: hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        for role, prompt in (
+            ("recon", RECON_SESSION_SYSTEM),
+            ("analysis", ANALYSIS_SESSION_SYSTEM),
+            ("verification", VERIFICATION_SESSION_SYSTEM),
+        )
+    }
 
 
 class _ReplayOnlySession:
@@ -226,12 +245,33 @@ class RunDriver:
             if snapshot is not None:
                 raise StoreError(
                     "新世代已存在配置快照;请检查原运行目录或显式 force")
-            persist_config_snapshot(gen_dir, fresh)
+            # 票 24:提示词内容指纹只随新世代冻结一次,恢复不重写。
+            persist_config_snapshot(
+                gen_dir, {**fresh, "prompts": prompt_version_document()})
             return fresh
         if snapshot is None:
             raise StoreError(
                 "运行世代缺少配置快照;请检查原运行目录或显式 force 创建新世代")
+        self._warn_prompt_drift(snapshot)
         return snapshot
+
+    @staticmethod
+    def _warn_prompt_drift(snapshot: Mapping[str, Any]) -> None:
+        """恢复世代时提示词与冻结指纹不一致只告警不阻断(票 24)。
+
+        快照冻结语义不变;告警保证"续跑已换新提示词"不在台账上静默失真。
+        历史世代快照没有 prompts 段,无从比对,保持安静。
+        """
+        frozen = snapshot.get("prompts")
+        if not isinstance(frozen, dict):
+            return
+        drifted = sorted(
+            role for role, digest in prompt_version_document().items()
+            if frozen.get(role) != digest)
+        if drifted:
+            warnings.warn(
+                "提示词与世代冻结快照不一致(" + ", ".join(drifted) + ");"
+                "续跑以当前提示词执行,快照保留原指纹供追溯", RuntimeWarning)
 
     # ---- 主执行 ----
 

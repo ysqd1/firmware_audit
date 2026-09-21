@@ -671,3 +671,12 @@ def test_recon_prompt_example_candidate_passes_gate_with_flat_fields(
     assert stored["extras"]["anchor"] == candidate["anchor"]
     assert stored["extras"]["mechanism"] == candidate["mechanism"]
     assert "fingerprint" not in stored["extras"]  # 平铺输入不得包成嵌套对象
+
+
+def test_recon_prompt_pins_evidence_discipline() -> None:
+    """票 24:recon 提示词钉住版本映射禁令——信号只记录,不充当缺陷证据。"""
+    assert "版本映射" in RECON_SESSION_SYSTEM
+    assert "服务启动字符串" in RECON_SESSION_SYSTEM
+    # 纪律区分记录与证明:版本等字符串可如实列出,但不得当作缺陷成立的证据。
+    assert "只负责如实列出" in RECON_SESSION_SYSTEM
+    assert "缺陷成立的证据" in RECON_SESSION_SYSTEM

@@ -800,6 +800,83 @@ def test_driver_profile_layer_and_explicit_override(tmp_path: Path) -> None:
     assert snapshot2["sources"]["recon_max_rounds"] == "explicit"
 
 
+def test_driver_config_snapshot_freezes_prompt_versions(tmp_path: Path) -> None:
+    """票 24:新世代配置快照冻结三角色提示词指纹;恢复路径不重写快照。"""
+    import hashlib
+
+    from firmware_audit.step5_agent.host.driver import prompt_version_document
+    from firmware_audit.step5_agent.host.analysis import ANALYSIS_SESSION_SYSTEM
+    from firmware_audit.step5_agent.host.recon import RECON_SESSION_SYSTEM
+    from firmware_audit.step5_agent.host.verification import (
+        VERIFICATION_SESSION_SYSTEM,
+    )
+
+    class FailingAnalysis(SmartAnalysisSession):
+        def __init__(self, candidate_id):
+            super().__init__(candidate_id, fail_on_step=2)
+
+    sessions = SessionScript(
+        recon=FakeReconSession([_recon_action(), _survey(_survey_delta())]),
+        analysis=FailingAnalysis)
+    driver = _make_driver(tmp_path, sessions=sessions)
+    with pytest.raises(RuntimeError, match="service down"):
+        driver.run()
+    config_path = (tmp_path / "generations" / "gen-0001" / "config.json")
+    snapshot = json.loads(config_path.read_text(encoding="utf-8"))
+    expected = prompt_version_document()
+    assert snapshot["prompts"] == expected
+    assert set(expected) == {"recon", "analysis", "verification"}
+    assert expected["recon"] == hashlib.sha256(
+        RECON_SESSION_SYSTEM.encode("utf-8")).hexdigest()
+    assert expected["analysis"] == hashlib.sha256(
+        ANALYSIS_SESSION_SYSTEM.encode("utf-8")).hexdigest()
+    assert expected["verification"] == hashlib.sha256(
+        VERIFICATION_SESSION_SYSTEM.encode("utf-8")).hexdigest()
+
+    # 恢复完成同一世代:配置快照字节级不变,提示词指纹不随重跑漂移。
+    before = config_path.read_bytes()
+    driver2 = _make_driver(tmp_path, sessions=_recon_sessions())
+    summary2 = driver2.run()
+    assert summary2.status == "completed"
+    assert config_path.read_bytes() == before
+
+
+def test_driver_resume_warns_when_prompts_drifted_from_frozen(
+        tmp_path: Path, monkeypatch) -> None:
+    """票 24:恢复时提示词已变只告警不阻断;冻结快照原样保留。"""
+    import hashlib
+
+    import firmware_audit.step5_agent.host.driver as driver_module
+    from firmware_audit.step5_agent.host.driver import prompt_version_document
+    from firmware_audit.step5_agent.host.recon import RECON_SESSION_SYSTEM
+
+    class FailingAnalysis(SmartAnalysisSession):
+        def __init__(self, candidate_id):
+            super().__init__(candidate_id, fail_on_step=2)
+
+    sessions = SessionScript(
+        recon=FakeReconSession([_recon_action(), _survey(_survey_delta())]),
+        analysis=FailingAnalysis)
+    with pytest.raises(RuntimeError, match="service down"):
+        _make_driver(tmp_path, sessions=sessions).run()
+
+    config_path = tmp_path / "generations" / "gen-0001" / "config.json"
+    frozen_digest = json.loads(
+        config_path.read_text(encoding="utf-8"))["prompts"]["recon"]
+    drifted = {**prompt_version_document(), "recon": "0" * 64}
+    monkeypatch.setattr(
+        driver_module, "prompt_version_document", lambda: drifted)
+
+    with pytest.warns(RuntimeWarning, match="提示词与世代冻结快照不一致"):
+        summary = _make_driver(tmp_path, sessions=_recon_sessions()).run()
+    assert summary.status == "completed"
+    # 快照冻结语义不变:仍指向首次创建时的指纹。
+    snapshot = json.loads(config_path.read_text(encoding="utf-8"))
+    assert snapshot["prompts"]["recon"] == frozen_digest
+    assert frozen_digest == hashlib.sha256(
+        RECON_SESSION_SYSTEM.encode("utf-8")).hexdigest()
+
+
 def test_driver_input_failure_is_auditable_and_creates_no_investigation(
         tmp_path: Path) -> None:
     process_dir = tmp_path / "empty_process"  # 无 extracted/
