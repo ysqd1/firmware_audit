@@ -38,3 +38,6 @@ firmware_audit/docker/ghidra/ghidra_11.3.2_PUBLIC.zip
 
 # ---- 本地会话/工具状态 ----
 .zcode/
+
+# ---- QEMU 执行镜像的 .deb 下载缓存(41MB 二进制,不入仓,radare2 tar.gz 同款) ----
+firmware_audit/docker/qemu-exec/deb-cache/
