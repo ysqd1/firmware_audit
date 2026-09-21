@@ -24,8 +24,6 @@ from firmware_audit.docker.docker_utils import docker_available, run_docker
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMG_DIR = REPO_ROOT / "firmware_audit" / "docker" / "qemu-exec"
 PINS_PATH = IMG_DIR / "pins.env"
-QEMU_EXEC_IMAGE = "firm_audit/qemu-exec"
-BASE_IMAGE = "firm_audit/sandbox:latest"
 
 # 冒烟样本的解包树(workspace 工件,gitignored;票 01 实测两架构代表二进制所在)
 TGT6_SQUASH = (REPO_ROOT / "target/6/process/extracted/"
@@ -34,6 +32,10 @@ TGT6_SQUASH = (REPO_ROOT / "target/6/process/extracted/"
 TGT8_SQUASH = (REPO_ROOT / "target/8/process/extracted/"
                "000000_openwrt-19.07.0-ath79-generic-tplink_archer-c7-v2-"
                "squashfs-sysupgrade.bin.extracted/185BC4/squashfs-root")
+
+# 容器测试超时:容器启动 + 单次 qemu 执行实测秒级,180/300 是宽裕上限;
+# 不用 run_docker 默认 3600——卡死的测试不该挂一小时。
+TEST_TIMEOUT = 180
 
 
 def _load_pins() -> dict[str, str]:
@@ -53,11 +55,20 @@ def _qemu_upstream_version(pins: dict[str, str]) -> str:
     return pins["QEMU_USER_STATIC_VERSION"].split(":", 1)[1].split("+", 1)[0]
 
 
-def _require_exec_image() -> None:
-    if not docker_available(QEMU_EXEC_IMAGE):
+def _require_exec_image() -> str:
+    """镜像名取 pins.env(与构建脚本同源,防测试侧常量漂移);缺镜像 SKIP 记原因。"""
+    image = _load_pins()["QEMU_EXEC_IMAGE"]
+    if not docker_available(image):
         pytest.skip(
-            f"Docker 或镜像 {QEMU_EXEC_IMAGE} 不可用(先运行 "
+            f"Docker 或镜像 {image} 不可用(先运行 "
             "firmware_audit/docker/qemu-exec/build_image.sh 构建)")
+    return image
+
+
+def _require_smoke_binary(squash_root: Path, rel_bin: str) -> None:
+    """解包树或样本二进制缺失一律 SKIP 并记录原因(AC5:不假绿、不 FAIL 冒充)。"""
+    if not (squash_root / rel_bin).is_file():
+        pytest.skip(f"冒烟样本二进制不存在(解包树缺失或不完整): {squash_root / rel_bin}")
 
 
 # ---------- 离线:钉值与构建材料一致性(无 Docker,始终跑) ----------
@@ -109,16 +120,16 @@ def test_dockerfile_and_build_script_consistent_with_pins() -> None:
 # ---------- 真实容器:镜像内版本查询(AC1) ----------
 
 def test_image_versions_queryable() -> None:
-    _require_exec_image()
+    image = _require_exec_image()
     pins = _load_pins()
     rc, out, err = run_docker(
-        QEMU_EXEC_IMAGE,
+        image,
         ["-c",
          "cat /usr/local/share/fw-qemu-exec/BUILD-INFO.txt && "
          "dpkg-query -W -f='dpkg: ${Version}\\n' qemu-user-static && "
          "qemu-arm-static --version | head -1 && "
          "qemu-mips-static --version | head -1"],
-        entrypoint="bash", network="none", timeout=180)
+        entrypoint="bash", network="none", timeout=TEST_TIMEOUT)
     assert rc == 0, f"版本查询失败: {err}"
     # 基线可查询:BUILD-INFO 记录基座镜像名与 .deb 校验值
     assert pins["BASE_IMAGE"] in out, "BUILD-INFO 缺基线镜像名"
@@ -133,28 +144,26 @@ def test_image_versions_queryable() -> None:
 # ---------- 真实容器:双架构真实执行(AC2) ----------
 
 def test_arm32_le_execution() -> None:
-    _require_exec_image()
-    if not TGT6_SQUASH.is_dir():
-        pytest.skip(f"target/6 解包树不存在: {TGT6_SQUASH}")
+    image = _require_exec_image()
+    _require_smoke_binary(TGT6_SQUASH, "usr/sbin/nvram")
     rc, out, err = run_docker(
-        QEMU_EXEC_IMAGE,
+        image,
         ["-c", "qemu-arm-static -L /work/tgt6 /work/tgt6/usr/sbin/nvram"],
         mounts=[(TGT6_SQUASH, "/work/tgt6", "ro")],
-        entrypoint="bash", network="none", timeout=180)
+        entrypoint="bash", network="none", timeout=TEST_TIMEOUT)
     assert rc == 0, f"ARM32 LE 执行失败 rc={rc}: {err}"
     # nvram 的 usage 打到 stderr(冒烟脚本 2>&1 同款口径)
     assert "usage: nvram" in out + err, f"输出不含 usage: {(out + err)[:400]}"
 
 
 def test_mips32_be_execution() -> None:
-    _require_exec_image()
-    if not TGT8_SQUASH.is_dir():
-        pytest.skip(f"target/8 解包树不存在: {TGT8_SQUASH}")
+    image = _require_exec_image()
+    _require_smoke_binary(TGT8_SQUASH, "bin/busybox")
     rc, out, err = run_docker(
-        QEMU_EXEC_IMAGE,
+        image,
         ["-c", "qemu-mips-static -L /work/tgt8 /work/tgt8/bin/busybox echo hello-from-qemu-exec"],
         mounts=[(TGT8_SQUASH, "/work/tgt8", "ro")],
-        entrypoint="bash", network="none", timeout=180)
+        entrypoint="bash", network="none", timeout=TEST_TIMEOUT)
     assert rc == 0, f"MIPS32 BE 执行失败 rc={rc}: {err}"
     assert "hello-from-qemu-exec" in out, f"输出不含回显: {out[:400]}"
 
@@ -165,14 +174,13 @@ def test_binfmt_independence_control() -> None:
     宿主若注册了 arm 的 binfmt,此对照会以 rc=0 失败——那是运行环境漂移信号,
     按票 01 边界(不改宿主 binfmt)应查明,不是测试误报。
     """
-    _require_exec_image()
-    if not TGT6_SQUASH.is_dir():
-        pytest.skip(f"target/6 解包树不存在: {TGT6_SQUASH}")
+    image = _require_exec_image()
+    _require_smoke_binary(TGT6_SQUASH, "usr/sbin/nvram")
     rc, out, err = run_docker(
-        QEMU_EXEC_IMAGE,
+        image,
         ["-c", "/work/tgt6/usr/sbin/nvram"],
         mounts=[(TGT6_SQUASH, "/work/tgt6", "ro")],
-        entrypoint="bash", network="none", timeout=180)
+        entrypoint="bash", network="none", timeout=TEST_TIMEOUT)
     assert rc == 126, f"裸跑对照预期 126,实得 rc={rc}(宿主 binfmt 漂移?) out={out[:200]} err={err[:200]}"
     assert "Exec format error" in (out + err)
 
@@ -182,10 +190,11 @@ def test_binfmt_independence_control() -> None:
 def test_base_image_no_qemu_and_tools_intact() -> None:
     """firm_audit/sandbox 保持零 qemu(结构性隔离:sandbox_verify 无法启动 QEMU),
     且原有工具入口健在;深层工具行为由既有 CLI 工具门控套件覆盖。"""
-    if not docker_available(BASE_IMAGE):
-        pytest.skip(f"基础镜像 {BASE_IMAGE} 不可用")
+    base_image = _load_pins()["BASE_IMAGE"]
+    if not docker_available(base_image):
+        pytest.skip(f"基础镜像 {base_image} 不可用")
     rc, out, err = run_docker(
-        BASE_IMAGE,
+        base_image,
         ["-c",
          "ls /usr/bin/qemu-*-static 2>/dev/null | wc -l; "
          "dpkg-query -W qemu-user-static >/dev/null 2>&1 && echo QEMU-PKG-INSTALLED "

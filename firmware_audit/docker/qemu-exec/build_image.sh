@@ -17,40 +17,42 @@ if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
     exit 1
 fi
 
-# 2. .deb 缓存就位(缺失则下载,双源回退)
+# 2. .deb 就位:缓存命中直接用;缺失则逐源"下载→校验",坏件即删、回退下一源,
+#    双源全失败才中止(校验不过绝不换包或跳过)
 DEB_PATH="deb-cache/$QEMU_USER_STATIC_DEB"
+verify_deb() {
+    echo "$QEMU_USER_STATIC_DEB_SHA256  $1" | sha256sum -c - >/dev/null \
+        && [ "$(stat -c %s "$1")" = "$QEMU_USER_STATIC_DEB_SIZE" ]
+}
+if [ -f "$DEB_PATH" ] && ! verify_deb "$DEB_PATH"; then
+    echo "[build] 缓存 .deb 校验不过,删除坏件重新下载: $DEB_PATH"
+    rm -f "$DEB_PATH"
+fi
 if [ ! -f "$DEB_PATH" ]; then
     mkdir -p deb-cache
     for url in "$DEB_POOL_URL_ALIYUN" "$DEB_POOL_URL_DEBIAN"; do
         echo "[build] 下载 $url"
-        if curl -sfL --retry 3 -o "$DEB_PATH" "$url"; then
+        if curl -sfL --retry 3 -o "$DEB_PATH" "$url" && verify_deb "$DEB_PATH"; then
             break
         fi
         rm -f "$DEB_PATH"
     done
 fi
 if [ ! -f "$DEB_PATH" ]; then
-    echo "FAIL: .deb 不可获取(双源均失败): $QEMU_USER_STATIC_DEB。" >&2
+    echo "FAIL: .deb 不可获取(双源均失败或校验不过): $QEMU_USER_STATIC_DEB。" >&2
     echo "      换源/换版本需先改 pins.env 并重新核实校验值,不得静默换包。" >&2
-    exit 1
-fi
-
-# 3. sha256 + 尺寸校验(权威值 = pins.env,源 = bullseye/main Packages 索引)
-echo "$QEMU_USER_STATIC_DEB_SHA256  $DEB_PATH" | sha256sum -c - >/dev/null
-ACTUAL_SIZE=$(stat -c %s "$DEB_PATH")
-if [ "$ACTUAL_SIZE" != "$QEMU_USER_STATIC_DEB_SIZE" ]; then
-    echo "FAIL: .deb 尺寸 $ACTUAL_SIZE ≠ 钉值 $QEMU_USER_STATIC_DEB_SIZE" >&2
     exit 1
 fi
 echo "[build] .deb 校验通过: $QEMU_USER_STATIC_DEB (sha256 ${QEMU_USER_STATIC_DEB_SHA256:0:16}…)"
 
-# 4. 构建:基线 digest 记进镜像内 BUILD-INFO;版本 tag 去掉 epoch(冒号不合法)
-BASE_DIGEST=$(docker image inspect --format '{{.Id}}' "$BASE_IMAGE")
+# 4. 构建:基座镜像 ID(.Id,本地构建镜像无 RepoDigests,票 01 存档同口径)
+#    记进镜像内 BUILD-INFO;版本 tag 取 Debian 修订号(最后一个 + 之后,
+#    tag 语法不收 epoch 冒号与 +)
+BASE_IMAGE_ID=$(docker image inspect --format '{{.Id}}' "$BASE_IMAGE")
 VERSION_TAG="${QEMU_USER_STATIC_VERSION##*+}"
 docker build \
-    --build-arg "BASE_IMAGE_DIGEST=$BASE_DIGEST" \
+    --build-arg "BASE_IMAGE_ID=$BASE_IMAGE_ID" \
     --label "org.opencontainers.image.base.name=$BASE_IMAGE" \
-    --label "org.opencontainers.image.base.digest=$BASE_DIGEST" \
     --label "fw.firm-audit.qemu-user-static.version=$QEMU_USER_STATIC_VERSION" \
     --label "fw.firm-audit.qemu-user-static.deb-sha256=$QEMU_USER_STATIC_DEB_SHA256" \
     -t "$QEMU_EXEC_IMAGE:latest" \

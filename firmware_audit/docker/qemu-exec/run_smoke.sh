@@ -26,7 +26,7 @@ for pair in "tgt6:$TGT6_ROOT:usr/sbin/nvram" "tgt8:$TGT8_ROOT:bin/busybox"; do
 done
 
 docker run --rm --network none --entrypoint bash \
-    -v "$(cd .. && pwd)/qemu-exec/smoke_test.sh":/smoke.sh:ro \
+    -v "$PWD/smoke_test.sh":/smoke.sh:ro \
     -v "$(cd "$TGT6_ROOT" && pwd)":/work/tgt6:ro \
     -v "$(cd "$TGT8_ROOT" && pwd)":/work/tgt8:ro \
     "$QEMU_EXEC_IMAGE" /smoke.sh

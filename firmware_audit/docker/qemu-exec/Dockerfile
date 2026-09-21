@@ -10,26 +10,27 @@
 # ENTRYPOINT 保持基座值(analyzeHeadless,继承不覆盖),调用侧显式覆盖,
 # 与现有 CLI 工具模式一致。宿主 binfmt 零接触:--no-install-recommends 同款
 # 语义下 binfmt-support 不安装,postinst 容器守卫短路(票 01 实测)。
-ARG BASE_IMAGE_DIGEST=unknown
+ARG BASE_IMAGE_ID=unknown
 FROM firm_audit/sandbox:latest
 
 # ARG 在 FROM 前声明只作用于 FROM 行;RUN 要用必须在 FROM 后重新声明
-ARG BASE_IMAGE_DIGEST=unknown
+ARG BASE_IMAGE_ID=unknown
 
 COPY pins.env /tmp/fw-qemu-pins.env
 COPY deb-cache/qemu-user-static_5.2+dfsg-11+deb11u3_amd64.deb /tmp/qemu-user-static.deb
 
-# sha256 校验(值取自 pins.env)→ 离线安装 → 基线与版本落盘(镜像内可查询,票 03 AC1)
+# sha256 校验(值取自 pins.env)→ 离线安装 → 基线与版本落盘(镜像内可查询,票 03 AC1)。
+# 版本自检用 grep 断言而非裸管道(管道退出码取末端,查空也"通过"是假门)。
 RUN mkdir -p /usr/local/share/fw-qemu-exec \
     && . /tmp/fw-qemu-pins.env \
     && echo "${QEMU_USER_STATIC_DEB_SHA256}  /tmp/qemu-user-static.deb" | sha256sum -c - \
     && dpkg -i /tmp/qemu-user-static.deb \
-    && printf 'base_image=%s\nbase_digest=%s\nqemu_user_static=%s\ndeb_sha256=%s\ndeb_size=%s\nbuilt_utc=%s\n' \
-         "${BASE_IMAGE}" "${BASE_IMAGE_DIGEST}" "${QEMU_USER_STATIC_VERSION}" \
+    && printf 'base_image=%s\nbase_image_id=%s\nqemu_user_static=%s\ndeb_sha256=%s\ndeb_size=%s\nbuilt_utc=%s\n' \
+         "${BASE_IMAGE}" "${BASE_IMAGE_ID}" "${QEMU_USER_STATIC_VERSION}" \
          "${QEMU_USER_STATIC_DEB_SHA256}" "${QEMU_USER_STATIC_DEB_SIZE}" \
          "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
          > /usr/local/share/fw-qemu-exec/BUILD-INFO.txt \
     && dpkg-query -W -f='installed: ${Version}\n' qemu-user-static \
-    && qemu-arm-static --version | head -1 \
-    && qemu-mips-static --version | head -1 \
+    && qemu-arm-static --version | grep -q 'qemu-arm version' \
+    && qemu-mips-static --version | grep -q 'qemu-mips version' \
     && rm -f /tmp/qemu-user-static.deb /tmp/fw-qemu-pins.env

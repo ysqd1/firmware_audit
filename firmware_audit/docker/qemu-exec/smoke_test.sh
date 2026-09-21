@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # QEMU 执行镜像冒烟(票 03)——在 firm_audit/qemu-exec 容器内运行,可重复执行。
 #
 # 宿主侧调用(或直接用同目录 run_smoke.sh):
@@ -15,8 +15,11 @@ fail=0
 
 echo "== 基线与 QEMU 版本查询(票 03 AC1)=="
 cat /usr/local/share/fw-qemu-exec/BUILD-INFO.txt || fail=1
-qemu-arm-static --version | head -1 || fail=1
-qemu-mips-static --version | head -1 || fail=1
+# 命令替换保留 qemu 自身退出码(--version | head 的管道退出码取 head,查空也过,是假门)
+ver=$(qemu-arm-static --version 2>&1) || fail=1
+echo "$ver" | head -1
+ver=$(qemu-mips-static --version 2>&1) || fail=1
+echo "$ver" | head -1
 dpkg-query -W -f='dpkg: ${Version}\n' qemu-user-static || fail=1
 
 echo "== binfmt 独立性对照:裸跑 ARM32 应 rc=126 =="
