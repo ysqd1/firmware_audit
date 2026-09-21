@@ -18,7 +18,8 @@ from .session import ProposalRejectedError
 from .store import StoreError
 
 # 声明为路径的参数统一反斜杠换算(Windows 习惯写入的参数不产生幽灵路径)。
-_PATH_ARGUMENTS = frozenset(("path", "file_ref", "directory", "target_dir"))
+_PATH_ARGUMENTS = frozenset(("path", "file_ref", "directory", "target_dir",
+                             "firmware_root"))
 
 
 def normalize_tool_arguments(

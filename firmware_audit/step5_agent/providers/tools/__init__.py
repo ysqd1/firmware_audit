@@ -24,6 +24,7 @@ from .ghidra_decompile import GhidraDecompileTool
 from .gitleaks_scan import GitleaksScanTool
 from .imports_query import ImportsQueryTool
 from .list_files import ListFilesTool
+from .qemu_precheck import QemuPrecheckTool
 from .r2_disassemble_function import R2DisassembleFunctionTool
 from .r2_list_functions import R2ListFunctionsTool
 from .r2_xref_query import R2XrefQueryTool
@@ -87,6 +88,10 @@ _TOOL_CONTRACTS: tuple[ToolContract, ...] = (
     ToolContract(SemgrepScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(GitleaksScanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(SandboxVerifyTool, _DEEP_ROLES, ReplayPolicy.NEVER),
+    # qemu_precheck 只读静态预检(票 05,ADR-0013):不执行目标不建会话,
+    # 幂等可重放;授权深挖角色,recon 不可见。sandbox_verify 所在基础镜像
+    # 零 qemu(票 03 结构性隔离),脚本路径无法触达 QEMU 执行。
+    ToolContract(QemuPrecheckTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(BinwalkRescanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(WebSearchTool, _NO_ROLES, ReplayPolicy.NEVER),
 )
@@ -168,4 +173,5 @@ __all__ = ["AgentTool", "ToolContext", "ToolResult", "make_tools",
            "GhidraDecompileTool",
            "CveBinToolScanTool", "CveLookupTool",
            "SemgrepScanTool", "GitleaksScanTool", "SandboxVerifyTool",
+           "QemuPrecheckTool",
            "BinwalkRescanTool", "WebSearchTool"]

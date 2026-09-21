@@ -1414,7 +1414,9 @@ Reference 只用于重新定位原始材料,不能作为你的支持证据。最
 ## 2 工具纪律
 - 可用与 analysis 同类的取证工具:读盘、搜索、字符串、导入、
   find_decompiled_function(读已有反编译边车,毫秒级,不发起 Ghidra)、
-  r2 工具族、按需 Ghidra 与受控沙箱验证;每次工具调用都会形成本次复核的
+  r2 工具族、按需 Ghidra、qemu_precheck(动态实验前静态预检:架构/解释器/
+  依赖/模板适用性;只读检查,不执行目标不创建会话,预检通过不代表子进程
+  链可用)与受控沙箱验证;每次工具调用都会形成本次复核的
   独立 Evidence(Observation View 中的 ev-xxxxxx)。
 - 只有这些本次 Evidence 能支撑 Claim Result;引用其他 ID 会被整份拒绝。
 - 单个工具失败是正常 Observation;判 unresolved 要写明限制,不要编造结果。

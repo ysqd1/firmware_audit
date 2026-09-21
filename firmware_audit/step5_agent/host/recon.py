@@ -960,9 +960,9 @@ Host 会在首轮消息注入确定性现场概览(顶层目录×文件数×大�
 - 只能使用 Host 授权的浅层工具:list_files / read_file / search_code /
   strings_query / imports_query / checksec / semgrep_scan / gitleaks_scan /
   binwalk_rescan。
-- r2 工具族、ghidra_decompile、sandbox_verify 对 recon 不可见;直接请求会被
-  Host 拒绝并回喂错误 Observation。需要反编译或动态验证时,把它写进
-  candidate 的 next_action 交给 analysis。
+- r2 工具族、ghidra_decompile、sandbox_verify、qemu_precheck 对 recon 不可见;
+  直接请求会被 Host 拒绝并回喂错误 Observation。需要反编译或动态验证时,
+  把它写进 candidate 的 next_action 交给 analysis。
 - 观察到具体信号(可疑配置/硬编码/注入模式/危险导入)→ 形成 signal
   Candidate;高价值面尚未发现具体信号(网络解析器、升级处理器、管理接口
   等)→ 形成 coverage Candidate,只要求深度覆盖,不声称缺陷成立。

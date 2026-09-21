@@ -30,7 +30,8 @@ _CONTRACT_TOOLS = [
     "read_file", "list_files", "search_code", "strings_query", "imports_query",
     "find_decompiled_function", "r2_list_functions", "r2_disassemble_function",
     "r2_xref_query", "ghidra_decompile", "checksec", "cve_bin_tool_scan",
-    "semgrep_scan", "gitleaks_scan", "sandbox_verify", "binwalk_rescan",
+    "semgrep_scan", "gitleaks_scan", "sandbox_verify", "qemu_precheck",
+    "binwalk_rescan",
     "cve_lookup", "web_search",
 ]
 
@@ -293,11 +294,12 @@ def test_blind_discovery_role_contract() -> list[str]:
         "binwalk_rescan",
     }
     # find_decompiled_function 读已有反编译边车(不发起 Ghidra),授权深挖
-    # 角色、拒绝 recon(ADR-0012 2026-09-16 D1)。
+    # 角色、拒绝 recon(ADR-0012 2026-09-16 D1);qemu_precheck 只读静态
+    # 预检(票 05,ADR-0013),同样只授权深挖角色。
     deep = shallow | {
         "find_decompiled_function",
         "r2_list_functions", "r2_disassemble_function", "r2_xref_query",
-        "ghidra_decompile", "sandbox_verify",
+        "ghidra_decompile", "sandbox_verify", "qemu_precheck",
     }
     expected = {"recon": shallow, "analysis": deep, "verification": deep}
     with tempfile.TemporaryDirectory() as td:

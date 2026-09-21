@@ -917,7 +917,11 @@ _ANALYSIS_SESSION_SYSTEM = """## 1 角色与使命
   imports_query / checksec / semgrep_scan / gitleaks_scan / binwalk_rescan /
   find_decompiled_function(读已有反编译边车,毫秒级,不发起 Ghidra)/
   r2_list_functions / r2_disassemble_function / r2_xref_query /
-  ghidra_decompile(按需,优先 r2 与边车)/ sandbox_verify。
+  ghidra_decompile(按需,优先 r2 与边车)/ sandbox_verify /
+  qemu_precheck(动态实验前静态预检:ELF 架构/解释器/依赖/模板适用性/
+  路径边界;只读检查,不执行目标不创建会话。仅当静态证据不足、确需观察
+  真实程序行为时评估可行性;预检通过不代表子进程链可用,更不代表漏洞
+  成立或不存在)。
 - 二进制深挖升级纪律:先 r2/边车等低成本工具收窄目标,信息仍不足才
   ghidra_decompile;每次工具调用都会形成本 Investigation 的 Evidence
   (Observation View 中的 ev-xxxxxx)。
