@@ -51,6 +51,7 @@ class FakeDocker:
         "fw.proot.version": "5.4.0",
         "fw.proot.patch.sha256": "d55abd0d8c0adb86d8a264368664fb4fbf0ea8273a27681119295bd126f41cdd",
         "fw.proot.execveat.patch.sha256": "d361d4b28c75029e89892a5283efcdddb99a89a0d752372b91bf07b1c98dae2e",
+        "fw.boundary": "proot-mixed-mode-inherit+raw-execveat-deny+strip(deny-by-absence)",
     }
     _UNSET = object()
 
@@ -82,7 +83,8 @@ class FakeDocker:
                 answer = self.count_queue.pop(0) if self.count_queue else "0"
                 return 0, answer + "\n", ""
             if args[1] == "cat":
-                return 0, "pid=9 exe=/session/stub/prooted-9-XYZ cmd=qemu\n", ""
+                return 0, ("pid=9 exe=/session/stub/prooted-9-XYZ size=123 "
+                           "sha256=" + "a" * 64 + " cmd=qemu\n"), ""
             if args[1] == "kill":
                 return 0, "2\n", ""
         if args[:1] == ["/usr/bin/timeout"]:
@@ -333,6 +335,10 @@ def test_execution_shape(tmp_path: Path, fake_docker: FakeDocker) -> None:
     assert env["FOO"] == "bar"
     # 观察者先于执行(detached watch)
     assert fake_docker.detached and fake_docker.detached[0][1] == "watch"
+    assert r.data["chain"]["stub_identities"] == [{
+        "pid": 9, "exe": "/session/stub/prooted-9-XYZ", "size_bytes": 123,
+        "sha256": "a" * 64, "cmd": "qemu", "identity_complete": True,
+    }]
     # 封存:容器拆除 + 台账 sealed
     assert fake_docker.removed, "容器必须拆除"
     ledger = json.loads((tmp_path / "qemu_sessions" / "ledger.json")
@@ -488,6 +494,8 @@ def test_real_timeout_classification(tmp_path: Path, monkeypatch) -> None:
     # 链存活期越过观察点(t+2s):快照应捕获 tracer/桩,短命子进程缺项由 note 明示
     assert d["chain"]["snapshot"], "存活链的 /proc 快照不应为空"
     assert "短命子进程" in d["chain"]["snapshot_note"]
+    assert d["chain"]["stub_identities"]
+    assert all(item["identity_complete"] for item in d["chain"]["stub_identities"])
 
 
 def test_real_mips_non_shell_parent(tmp_path: Path, monkeypatch) -> None:
@@ -531,6 +539,30 @@ def test_stale_image_without_execveat_patch_blocks_before_session(tmp_path, monk
     assert result.data["result_class"] == "facility_failure"
     assert "execveat" in result.data["backend"]["detail"]
     assert not any(c[0] in ("run_detached", "exec") for c in fake.calls)
+    assert not (tmp_path / "qemu_sessions/ledger.json").exists()
+
+
+@pytest.mark.parametrize("label", [
+    "fw.qemu.version", "fw.proot.version", "fw.proot.patch.sha256",
+    "fw.proot.execveat.patch.sha256", "fw.boundary",
+])
+@pytest.mark.parametrize("role", ["analysis", "verification"])
+def test_stale_image_with_any_backend_identity_drift_blocks_before_session(
+    tmp_path, monkeypatch, role, label
+):
+    """raw deny 标签不能单独 bless 一个漂移的 PRoot/QEMU 后端。"""
+    _arm_workspace(tmp_path)
+    labels = dict(FakeDocker.DEFAULT_LABELS)
+    labels[label] = "wrong"
+    fake = FakeDocker(labels=labels)
+    monkeypatch.setattr(qs, "docker_image_identity", fake.image_identity)
+    monkeypatch.setattr(qs, "docker_run_detached", fake.run_detached)
+    monkeypatch.setattr(qs, "docker_exec", fake.exec)
+    monkeypatch.setattr(qs, "docker_rm", fake.rm)
+    result = _tool(tmp_path, role=role).execute(**_default_kwargs())
+    assert result.data["result_class"] == "facility_failure"
+    assert label in result.data["backend"]["identity_mismatches"]
+    assert fake.calls == [("labels", qs.QEMU_EXEC_V2_IMAGE)]
     assert not (tmp_path / "qemu_sessions/ledger.json").exists()
 
 

@@ -46,10 +46,10 @@ from .base import AgentTool, ToolContext, ToolResult, resolve_within
 from .cli_base import extracted_root
 from .qemu_base import (
     QEMU_EXEC_V2_IMAGE,
-    QEMU_EXECVEAT_PATCH_SHA256,
     QEMU_ARCH_MATRIX,
     QemuArchProfile,
     QemuResultClass,
+    qemu_exec_v2_label_mismatches,
     resolve_max_sessions,
 )
 from .qemu_precheck import ElfParseError, find_in_root, parse_elf_runtime
@@ -68,6 +68,10 @@ _DEFAULT_GUEST_ENV = {"PATH": "/bin:/sbin:/usr/bin:/usr/sbin"}
 _KILL_GRACE_SECONDS = 5
 _DOCKER_OVERHEAD_SECONDS = 30
 _OUTPUT_EXCERPT_CHARS = 6000
+_STUB_SCAN_RE = re.compile(
+    r"^pid=(?P<pid>\d+) exe=(?P<exe>\S+) size=(?P<size>\d+|-) "
+    r"sha256=(?P<sha256>[0-9a-f]{64}|-) cmd=(?P<cmd>.*)$"
+)
 
 
 # 台账/报告固定限制句(措辞是 ADR-0012/0013 纪律落点,不得改写为能力宣称)
@@ -91,6 +95,26 @@ def sha256_file(path: Path) -> str:
 def _slug(text: str, limit: int = 32) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", (text or "").strip())
     return (cleaned.strip("-") or "scope")[:limit]
+
+
+def _parse_stub_identities(snapshot_text: str) -> list[dict]:
+    """Extract independent size/digest identities for observed prooted-* stubs."""
+    identities: list[dict] = []
+    for raw_line in snapshot_text.splitlines():
+        match = _STUB_SCAN_RE.match(raw_line.strip())
+        if match is None or "/prooted-" not in match["exe"]:
+            continue
+        size = match["size"]
+        digest = match["sha256"]
+        identities.append({
+            "pid": int(match["pid"]),
+            "exe": match["exe"],
+            "size_bytes": int(size) if size != "-" else None,
+            "sha256": digest if digest != "-" else None,
+            "cmd": match["cmd"],
+            "identity_complete": size != "-" and digest != "-",
+        })
+    return identities
 
 
 class SessionLedger:
@@ -214,8 +238,9 @@ class QemuExecuteTool(AgentTool):
                     "detail": (f"镜像 {QEMU_EXEC_V2_IMAGE} 不可用"
                                "(先运行 docker/qemu-exec-v2/build_image.sh)")}
         labels = identity["labels"]
+        mismatches = qemu_exec_v2_label_mismatches(labels)
         execveat_patch = labels.get("fw.proot.execveat.patch.sha256")
-        if execveat_patch != QEMU_EXECVEAT_PATCH_SHA256:
+        if mismatches:
             return {
                 "image_id": identity["image_id"],
                 "image": QEMU_EXEC_V2_IMAGE,
@@ -223,8 +248,9 @@ class QemuExecuteTool(AgentTool):
                 "qemu_binary": qemu_binary,
                 "proot_version": labels.get("fw.proot.version"),
                 "proot_execveat_patch_sha256": execveat_patch,
-                "detail": ("镜像缺少已验收的 PRoot raw execveat deny 补丁"
-                           f"(期望 {QEMU_EXECVEAT_PATCH_SHA256[:12]})"),
+                "identity_mismatches": mismatches,
+                "detail": "镜像执行后端身份不匹配: " + ", ".join(
+                    f"{key}={value!r}" for key, value in mismatches.items()),
             }
         return {
             "image_id": identity["image_id"],
@@ -519,13 +545,21 @@ class QemuExecuteTool(AgentTool):
         if snap_rc == 0 and snapshot_text.strip():
             (session_dir / "proc-snapshot.txt").write_text(
                 snapshot_text, encoding="utf-8", errors="replace")
+            stub_identities = _parse_stub_identities(snapshot_text)
             entry["chain"] = {
                 "snapshot": [line for line in snapshot_text.strip().splitlines()],
+                "stub_identities": stub_identities,
+                "stub_identity_note": (
+                    "每个可见 prooted-* 装载桩均记录容器内文件大小和 SHA-256"
+                    if stub_identities else
+                    "快照未捕获 prooted-* 装载桩；没有把 /proc 快照当作完整身份证明"),
                 "snapshot_note": ("延时一次快照,短命子进程可能未捕获;"
                                   "prooted-* 为装载桩(非固件/qemu 原件)"),
             }
         else:
             entry["chain"] = {"snapshot": [],
+                              "stub_identities": [],
+                              "stub_identity_note": "快照缺失，无法独立识别 prooted-* 装载桩",
                               "snapshot_note": "快照缺失(链先于观察点结束或观察失败),缺项明示"}
 
         if rc == 124 and elapsed >= (timeout_clamped + _KILL_GRACE_SECONDS
@@ -678,7 +712,14 @@ def _render_text(report: dict) -> str:
                      f"耗时 {execution.get('elapsed_seconds')}s;输出 digest 已入台账")
     chain = report.get("chain") or {}
     if chain:
-        lines.append(f"- 链观测: 快照 {len(chain.get('snapshot') or [])} 条;{chain.get('snapshot_note')}")
+        lines.append(f"- 链观测: 快照 {len(chain.get('snapshot') or [])} 条;"
+                     f"桩身份 {len(chain.get('stub_identities') or [])} 条;"
+                     f"{chain.get('snapshot_note')}")
+        if chain.get("stub_identity_note"):
+            lines.append(f"    桩身份: {chain['stub_identity_note']}")
+        for identity in (chain.get("stub_identities") or [])[:6]:
+            lines.append(f"    stub pid={identity['pid']} exe={identity['exe']} "
+                         f"size={identity['size_bytes']} sha256={identity['sha256']}")
         for line in (chain.get("snapshot") or [])[:6]:
             lines.append(f"    {line}")
     cleanup = report.get("cleanup") or {}

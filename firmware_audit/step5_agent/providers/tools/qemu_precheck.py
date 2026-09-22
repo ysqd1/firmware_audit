@@ -25,12 +25,12 @@ from ....docker.docker_utils import docker_available, docker_image_identity, run
 from .base import AgentTool, ToolResult, resolve_within
 from .cli_base import extracted_root
 from .qemu_base import (
-    QEMU_EXECVEAT_PATCH_SHA256,
     QEMU_EXEC_IMAGE,
     QEMU_EXEC_V2_IMAGE,
     QEMU_ARCH_MATRIX,
     QemuArchProfile,
     QemuResultClass,
+    qemu_exec_v2_label_mismatches,
 )
 
 # 动态段遍历的条目标签(只用到这三个)
@@ -223,8 +223,9 @@ class QemuPrecheckTool(AgentTool):
                     "detail": (f"镜像 {QEMU_EXEC_V2_IMAGE} 不可用"
                                "(先运行 docker/qemu-exec-v2/build_image.sh;"
                                f"历史镜像 {QEMU_EXEC_IMAGE} 仅作 5.2 对照)")}
+        mismatches = qemu_exec_v2_label_mismatches(labels)
         execveat_patch = labels.get("fw.proot.execveat.patch.sha256")
-        if execveat_patch != QEMU_EXECVEAT_PATCH_SHA256:
+        if mismatches:
             return {"image": QEMU_EXEC_V2_IMAGE,
                     "image_id": identity["image_id"],
                     "available": False,
@@ -232,8 +233,9 @@ class QemuPrecheckTool(AgentTool):
                     "proot_version": labels.get("fw.proot.version"),
                     "proot_patch_sha256": labels.get("fw.proot.patch.sha256"),
                     "proot_execveat_patch_sha256": execveat_patch,
-                    "detail": ("镜像缺少已验收的 PRoot raw execveat deny 补丁"
-                               f"(期望 {QEMU_EXECVEAT_PATCH_SHA256[:12]})")}
+                    "identity_mismatches": mismatches,
+                    "detail": "镜像执行后端身份不匹配: " + ", ".join(
+                        f"{key}={value!r}" for key, value in mismatches.items())}
         if not docker_available(QEMU_EXEC_V2_IMAGE):
             return {"image": QEMU_EXEC_V2_IMAGE, "available": False,
                     "qemu_binary": qemu_binary, "version": None,

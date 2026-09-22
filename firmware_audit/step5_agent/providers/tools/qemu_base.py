@@ -27,6 +27,26 @@ QEMU_EXEC_V2_IMAGE = "firm_audit/qemu-exec:p540q1111"
 QEMU_EXECVEAT_PATCH_SHA256 = (
     "d361d4b28c75029e89892a5283efcdddb99a89a0d752372b91bf07b1c98dae2e"
 )
+QEMU_EXEC_V2_EXPECTED_LABELS = {
+    "fw.qemu.version": "11.1.1",
+    "fw.proot.version": "5.4.0",
+    "fw.proot.patch.sha256": (
+        "d55abd0d8c0adb86d8a264368664fb4fbf0ea8273a27681119295bd126f41cdd"
+    ),
+    "fw.proot.execveat.patch.sha256": QEMU_EXECVEAT_PATCH_SHA256,
+    "fw.boundary": "proot-mixed-mode-inherit+raw-execveat-deny+strip(deny-by-absence)",
+}
+
+
+def qemu_exec_v2_label_mismatches(labels: dict[str, str] | None) -> dict[str, str | None]:
+    """Return missing or drifting execution-image identity labels."""
+    if not isinstance(labels, dict):
+        return {key: None for key in QEMU_EXEC_V2_EXPECTED_LABELS}
+    return {
+        key: labels.get(key)
+        for key, expected in QEMU_EXEC_V2_EXPECTED_LABELS.items()
+        if labels.get(key) != expected
+    }
 
 # 历史镜像(票 03,QEMU 5.2/Debian 包)——仅作对照保留,产品工具不再使用。
 QEMU_EXEC_IMAGE = "firm_audit/qemu-exec:latest"
