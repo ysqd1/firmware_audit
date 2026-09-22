@@ -14,8 +14,14 @@ timeout/cleanup_uncertain)在本票只定义不发出。
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from enum import Enum
+
+
+def timestamp() -> str:
+    """台账终态时间戳(本地时区,ISO 形态;会话/恢复路径共用单一出处)。"""
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 # 执行镜像(票 16 产物;钉 tag 不漂移,与票 03 的 5.2 历史镜像完全独立)。
 # 镜像 = PRoot 5.4.0(+mixed_mode 继承补丁)+ QEMU 11.1.1 静态双架构 +
@@ -164,6 +170,11 @@ def resolve_max_session_executions(
     (config.json 快照记录生效值与来源)经 execute_for_scope 显式下发,
     工具侧记录 source="host_config"。env 层缺失/非法/越界(≤0)回落默认
     并记 source="default"——与 RunBudget._env_value 同口径,不带病生效。
+
+    与 resolve_max_sessions"只能收紧"的策略差异是有意的:会话名额是
+    票 16 复审定下的防护性上限(防配置放大到 99);执行次数上限按
+    ADR-0013 是"可覆盖的显式预算参数",票 19 校准可能双向调整默认,
+    env 层覆盖不设方向限制。
     """
     import os
     raw = (os.environ if env is None else env).get(QEMU_MAX_SESSION_EXECUTIONS_ENV)

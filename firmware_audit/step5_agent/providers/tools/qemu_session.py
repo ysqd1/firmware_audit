@@ -63,6 +63,7 @@ from .qemu_base import (
     qemu_exec_v2_label_mismatches,
     resolve_max_session_executions,
     resolve_max_sessions,
+    timestamp,
 )
 from .qemu_precheck import ElfParseError, find_in_root, parse_elf_runtime
 
@@ -111,10 +112,6 @@ def sha256_file(path: Path) -> str:
 
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
-
-
-def _now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
 def _slug(text: str, limit: int = 32) -> str:
@@ -540,7 +537,28 @@ class QemuExecuteTool(AgentTool):
                                         declared=declared, input_mount=input_mount,
                                         root=root, target=target, elf=elf)
         if exec_entry is None:
+            # 预算在启动前耗尽:目标未运行。本次新开的单发会话立即封存
+            # (不留一个从未执行的活动会话);复用会话保持 running,交由
+            # agent 后续重试或 Host 终态收口。
+            if existing is None:
+                self._seal_session(ledger, entry, kind="agent_stop")
+                report.update({"result_class": QemuResultClass.PREP_BLOCKED.value,
+                               "result_class_label": QemuResultClass.PREP_BLOCKED.label,
+                               "detail": "案例剩余活动预算不足 1 秒;目标未启动,"
+                                         "本次开启的会话已封存",
+                               "sealed": entry.get("sealed"),
+                               "status": entry.get("status"),
+                               "container_removal": entry.get("cleanup")})
+                ledger.add("refusals", {
+                    "role": role, "investigation_ref": investigation_ref,
+                    "session_id": session_id, "reason": "budget_exhausted",
+                    "detail": "案例剩余活动预算不足 1 秒;未启动目标"})
+                return finish()
             return refuse("案例剩余活动预算不足 1 秒;未启动目标,请收束调查")
+        # 清理未确认(残留未清或观测异常):按边界销毁会话容器并封存,
+        # 不得带着不确定的进程状态进入下一次执行(spec 清理兜底;AC1/AC8)。
+        exec_cleanup_verdict = (exec_entry.get("cleanup") or {}).get("verdict")
+        cleanup_unresolved = exec_cleanup_verdict in ("leftover", "unknown")
         report.update({"session_id": entry["session_id"],
                        "declared": declared,
                        "result_class": exec_entry.get("result_class"),
@@ -553,9 +571,14 @@ class QemuExecuteTool(AgentTool):
                        "executions_total": len(entry["executions"]),
                        "execution_budget": entry["execution_budget"]})
 
-        # ---- 6) 会话去留:单发默认封存;keep_open/复用保持开启 ----
-        if stop or (existing is None and not keep_open):
+        # ---- 6) 会话去留:单发默认封存;keep_open/复用保持开启;
+        #      清理未确认时无条件封存(容器拆除兜底) ----
+        if stop or (existing is None and not keep_open) or cleanup_unresolved:
             self._seal_session(ledger, entry, kind="agent_stop")
+            if cleanup_unresolved:
+                report["detail"] = (
+                    f"本次执行清理未确认(残留进程判定: {exec_cleanup_verdict}),"
+                    "已销毁会话容器并封存;该会话不得复用,请以新会话继续")
         report.update({"sealed": entry.get("sealed", False),
                        "status": entry.get("status"),
                        # 容器拆除判定单列:与执行级清理验证(残留进程)分开,
@@ -731,6 +754,7 @@ class QemuExecuteTool(AgentTool):
             timeout=timeout_clamped + _KILL_GRACE_SECONDS + _DOCKER_OVERHEAD_SECONDS)
         elapsed = round(time.monotonic() - exec_started, 3)
         exec_entry["execution"] = {
+            "seq": seq,
             "elapsed_seconds": elapsed,
             "exit_code": rc,
             "stdout_sha256": sha256_text(out or ""),
@@ -820,7 +844,7 @@ class QemuExecuteTool(AgentTool):
         entry["sealed"] = verdict in ("container_removed", "absent")
         entry["status"] = "sealed" if entry["sealed"] else "seal_failed"
         entry["seal_kind"] = kind
-        entry["sealed_at"] = _now()
+        entry["sealed_at"] = timestamp()
         ledger.replace(entry["session_id"], entry)
 
     # ---- 清理验证与分类(执行侧) ----

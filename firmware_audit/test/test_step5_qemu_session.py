@@ -574,6 +574,9 @@ def test_execution_shape(tmp_path: Path, fake_docker: FakeDocker) -> None:
         "pid": 9, "exe": "/session/stub/prooted-9-XYZ", "size_bytes": 123,
         "sha256": "a" * 64, "cmd": "qemu", "identity_complete": True,
     }]
+    # Observation 文本如实反映台账事实(执行序号不渲染成 None)
+    assert "第 1 次执行" in r.text
+    assert "第 None 次执行" not in r.text
     # 封存:容器拆除 + 台账 sealed
     assert fake_docker.removed, "容器必须拆除"
     ledger = _read_ledger(tmp_path)
@@ -690,20 +693,22 @@ def test_interrupt_after_execution_persisted_keeps_execution_counted(
     r = tool.execute(**_default_kwargs(keep_open=True))
     assert r.ok, "观测异常转为分类承载,不是工具崩溃"
     entry = _read_ledger(tmp_path)["sessions"][0]
-    assert entry["status"] == "running"
+    # 清理未确认 → 容器拆除兜底 + 封存(不得带不确定状态进入下次执行)
+    assert entry["status"] == "sealed" and entry["sealed"] is True
     assert len(entry["executions"]) == 1
     assert entry["executions"][0]["execution"]["exit_code"] == 0
     assert entry["executions"][0]["result_class"] == "facility_failure"
     assert "输出采集" in entry["executions"][0]["result_note"]
-    assert not fake_docker.removed, "观测异常不即时拆容器(会话仍可恢复/停机)"
+    assert entry["execution_budget"]["used"] == 1
 
-    # 恢复:执行保留在台账(留档),收割容器;恢复后新会话执行次数从 0 起
-    report = reap_leftover_sessions(tmp_path)
-    assert entry["session_id"] in report["reaped"]
+    # 已持久化执行留档;新会话执行次数从 0 起(不重复扣减)
+    monkeypatch.setattr(qs, "docker_exec", original)  # 解除观测异常
+    r2 = tool.execute(**_default_kwargs())
+    assert r2.data["result_class"] == "normal_exit"
+    assert r2.data["session_id"] != entry["session_id"]
+    assert r2.data["execution_budget"]["used"] == 1
     entry = _read_ledger(tmp_path)["sessions"][0]
-    assert entry["status"] == "interrupted"
-    assert entry["execution_budget"]["used"] == 1, "已持久化执行不因恢复重复扣减"
-    assert len(entry["executions"]) == 1
+    assert len(entry["executions"]) == 1, "旧会话执行记录不被触碰"
 
 
 def test_interrupt_during_seal_marks_seal_failed_then_recovery_reaps(
@@ -721,19 +726,20 @@ def test_interrupt_during_seal_marks_seal_failed_then_recovery_reaps(
     assert entry["status"] == "seal_failed"
     assert entry["cleanup"]["verdict"] == "uncertain"
 
-    # seal_failed 会话不得复用执行;恢复收割成功后清理如实确认
+    # seal_failed 会话不得复用执行;恢复收割确认拆除后封存终于完成
     r2 = tool.execute(**_default_kwargs(session_id=sid))
     assert r2.data["result_class"] == "prep_blocked"
     report = reap_leftover_sessions(tmp_path)
     assert sid in report["reaped"]
     entry = _read_ledger(tmp_path)["sessions"][0]
-    assert entry["status"] == "interrupted"
+    assert entry["status"] == "sealed"
+    assert entry["seal_kind"] == "recovery_reap"
     assert entry["cleanup"]["verdict"] == "container_removed"
 
 
 def test_recovery_treats_absent_container_as_clean(tmp_path: Path,
                                                    fake_docker: FakeDocker) -> None:
-    """容器已不存在(开启前中断):absent 是已确认清理,不是不确定。"""
+    """执行窗口中断且容器已缺席:absent 是已确认清理,不是不确定。"""
     _arm_workspace(tmp_path)
     fake_docker.exec_results = [KeyboardInterrupt("died before exec")]
     tool = _tool(tmp_path)
@@ -921,8 +927,8 @@ def test_cleanup_removal_failure_overrides_success(tmp_path, fake_docker, monkey
     assert result.data["execution"]["exit_code"] == 0
 
 
-def test_post_start_exception_keeps_session_recoverable(tmp_path, fake_docker, monkeypatch):
-    """观测边界异常:执行事实保留;keep_open 会话留在 running,停机路径仍可用。"""
+def test_post_start_exception_seals_uncertain_cleanup(tmp_path, fake_docker, monkeypatch):
+    """观测边界异常:执行事实保留;清理未确认 → 立即销毁容器并封存(AC1/AC8)。"""
     _arm_workspace(tmp_path)
     original = qs.docker_exec
     def broken_snapshot(container, args, **kwargs):
@@ -932,17 +938,74 @@ def test_post_start_exception_keeps_session_recoverable(tmp_path, fake_docker, m
     monkeypatch.setattr(qs, "docker_exec", broken_snapshot)
     result = _tool(tmp_path).execute(**_default_kwargs(keep_open=True))
     assert result.data["result_class"] == "facility_failure"
-    assert result.data["status"] == "running", "观测异常不改变会话生命周期"
-    assert result.data["execution"]["exit_code"] == 0
-    entries = _read_ledger(tmp_path)["sessions"]
-    assert entries[0]["status"] == "running"
-    # 停机路径仍然可用:容器可拆、台账收口
+    assert result.data["execution"]["exit_code"] == 0, "执行已发生,退出码保留"
+    assert "清理未确认" in (result.data.get("detail") or "")
+    # 清理无法确认 → 容器拆除兜底 + 封存,不得复用
+    assert fake_docker.removed, "清理未确认必须拆容器"
+    entry = _read_ledger(tmp_path)["sessions"][0]
+    assert entry["status"] == "sealed" and entry["sealed"] is True
+    assert len(entry["executions"]) == 1
+    # 封存后的会话不可继续
     monkeypatch.setattr(qs, "docker_exec", original)
-    sid = entries[0]["session_id"]
-    sealed = _tool(tmp_path).execute(investigation_ref="inv-1",
-                                     session_id=sid, stop=True)
-    assert sealed.data["sealed"] is True
-    assert _read_ledger(tmp_path)["sessions"][0]["status"] == "sealed"
+    sid = entry["session_id"]
+    refused = _tool(tmp_path).execute(**_default_kwargs(session_id=sid))
+    assert refused.data["result_class"] == "prep_blocked"
+
+
+def test_cleanup_leftover_in_reused_session_forces_seal(tmp_path, fake_docker):
+    """残留未清(leftover)→ 销毁会话容器并封存;同容器不得继续执行(AC1/AC8)。"""
+    _arm_workspace(tmp_path)
+    fake_docker.count_queue = ["3", "3"]  # 升级击杀后仍残留
+    tool = _tool(tmp_path)
+    r = tool.execute(**_default_kwargs(keep_open=True))
+    assert r.data["cleanup"]["verdict"] == "leftover"
+    assert r.data["sealed"] is True and r.data["status"] == "sealed"
+    assert "不得复用" in (r.data.get("detail") or "")
+    entry = _read_ledger(tmp_path)["sessions"][0]
+    assert entry["status"] == "sealed"
+    refused = tool.execute(**_default_kwargs(session_id=entry["session_id"]))
+    assert refused.data["result_class"] == "prep_blocked"
+    assert "封存" in refused.data["detail"]
+
+
+def test_budget_exhausted_after_open_seals_fresh_session(tmp_path, fake_docker):
+    """预算在开启后、启动前耗尽:目标未运行,新开单发会话立即封存。"""
+    _arm_workspace(tmp_path)
+    tool = _tool(tmp_path)
+    remaining = iter((60, 0))  # 预备阶段还有预算,执行前耗尽
+    r = tool.execute_for_scope(
+        {"file_ref": "fw/usr/sbin/nvram", "firmware_root": "fw"},
+        investigation_ref="inv-1",
+        remaining_seconds=lambda: next(remaining))
+    assert r.ok and r.data["result_class"] == "prep_blocked"
+    assert r.data["sealed"] is True and r.data["status"] == "sealed"
+    assert fake_docker.containers_started, "容器已开启(名额已占)"
+    assert fake_docker.removed, "单发会话未执行也要封存拆除"
+    ledger = _read_ledger(tmp_path)
+    assert ledger["sessions"][0]["executions"] == []
+    assert [r["reason"] for r in ledger["refusals"]] == ["budget_exhausted"]
+
+
+def test_interrupt_at_open_boundary_leaves_reapable_placeholder(tmp_path, fake_docker,
+                                                                monkeypatch):
+    """AC9 开启边界中断:占位已入账,恢复路径按名收割(absent=确认清理)。"""
+    _arm_workspace(tmp_path)
+    def interrupt_start(*args, **kwargs):
+        raise KeyboardInterrupt("host died at open")
+    monkeypatch.setattr(qs, "docker_run_detached", interrupt_start)
+    tool = _tool(tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        tool.execute(**_default_kwargs(keep_open=True))
+    ledger = _read_ledger(tmp_path)
+    assert ledger["sessions"][0]["status"] == "running"
+    assert not fake_docker.removed
+    # 恢复:容器从未建成(rm 报 absent)= 确认清理;会话死亡
+    fake_docker.rm_results = [(1, "", "Error: No such container: fw-qemu-x")]
+    report = reap_leftover_sessions(tmp_path)
+    assert report["reaped"] == [ledger["sessions"][0]["session_id"]]
+    entry = _read_ledger(tmp_path)["sessions"][0]
+    assert entry["status"] == "interrupted"
+    assert entry["cleanup"]["verdict"] == "absent"
 
 
 # ---------- 离线:环境/依赖/输入身份(票 16 语义保持) ----------
@@ -1212,9 +1275,12 @@ def test_real_leftover_container_reaped_by_recovery(tmp_path: Path, monkeypatch)
     monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
     ws = _real_workspace(tmp_path)
     tool = _tool(ws, role="verification")
+    # 后台子孙探针:后台 sleep 与前台 sleep 同属容器 cgroup,
+    # 恢复收割按容器权威拆除,一并处置(固件 busybox 无 setsid,主动
+    # 脱离会话的专项探针受限,如实记录于票 17 Comments)。
     r = tool.execute(file_ref="fw/bin/busybox", firmware_root="fw",
                      investigation_ref="case-orphan", keep_open=True,
-                     args="sh -c '/bin/busybox sleep 6'")
+                     args="sh -c '/bin/busybox sleep 30 & /bin/busybox sleep 30'")
     assert r.data["status"] == "running", r.data
     session_id = r.data["session_id"]
     container = f"fw-qemu-{session_id}"
@@ -1238,7 +1304,7 @@ def test_real_leftover_container_reaped_by_recovery(tmp_path: Path, monkeypatch)
     assert entry["sealed"] is True
     assert entry["cleanup"]["verdict"] == "container_removed"
     assert entry["executions"] and entry["executions"][0]["declared"]["argv"] == [
-        "sh", "-c", "/bin/busybox sleep 6"]
+        "sh", "-c", "/bin/busybox sleep 30 & /bin/busybox sleep 30"]
 
     # 中断即会话死亡:不可继续,已持久化执行留档
     r2 = tool.execute(file_ref="fw/bin/busybox", firmware_root="fw",
