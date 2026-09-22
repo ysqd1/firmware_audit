@@ -429,12 +429,12 @@ class QemuExecuteTool(AgentTool):
         if root is None or not root.is_dir():
             return refuse(f"固件根不存在或越界(须为 extracted/ 内目录): {firmware_root}")
         if existing is not None:
+            report["session_id"] = session_id
             stored_root = ((existing.get("firmware_root") or {}).get("path") or "")
             if stored_root and Path(stored_root) != root.resolve():
                 return refuse("firmware_root 与会话开启时不一致;"
                               "会话容器的 guest 根在开启时已固化")
             entry = existing
-            report["session_id"] = session_id
             session_dir = sessions_root / session_id
         else:
             limit = resolve_max_sessions()
