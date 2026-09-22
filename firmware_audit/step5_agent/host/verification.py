@@ -1418,10 +1418,14 @@ Reference 只用于重新定位原始材料,不能作为你的支持证据。最
   find_decompiled_function(读已有反编译边车,毫秒级,不发起 Ghidra)、
   r2 工具族、按需 Ghidra、qemu_precheck(动态实验前静态预检:架构/解释器/
   依赖/模板适用性;只读检查,不执行目标不创建会话,预检通过不代表子进程
-  链可用)、qemu_execute(单发执行会话:隔离会话中真实执行一次原固件程序
-  及其派生链;每次调用消耗本案卷独立会话名额(有限,默认 3),传入
-  investigation_ref 归属本案卷;复核必须独立取得观察,不直接复用 analysis
-  的会话产物;动态 Observation 只是 Evidence,不构成漏洞结论)与受控沙箱
+  链可用)、qemu_execute(多步执行会话:隔离会话中真实执行原固件程序及其
+  派生链,keep_open/session_id 支持同一会话内多次执行、运行目录状态跨执行
+  积累,stop=true 停机封存;会话内执行次数有限且逐次计数;每个新会话消耗
+  本案卷独立会话名额(有限,默认 3);复核必须独立开启会话、按台账重放
+  关键执行序列取得独立观察,不直接复用
+  analysis 的会话产物;中断即会话死亡,续跑开新会话;动态 Observation 只是
+  Evidence,不构成漏洞结论;本案卷归属由 Host 绑定,无需自行填写归属参数)
+  与受控沙箱
   验证;每次工具调用都会形成本次复核的
   独立 Evidence(Observation View 中的 ev-xxxxxx)。
 - 只有这些本次 Evidence 能支撑 Claim Result;引用其他 ID 会被整份拒绝。

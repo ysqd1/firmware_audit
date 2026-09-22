@@ -26,6 +26,8 @@ BUDGET_SCHEMA_VERSION = 1
 CONFIG_SCHEMA_VERSION = 1
 
 # 初始单案例上限(ADR-0012 L71:实现与前三例试运行的初始值,不是成绩)。
+# qemu_max_session_executions(票 17):单会话执行次数上限,临时默认 4,
+# 最终默认由票 19 真实样本校准定稿;生效值与来源随 config.json 快照冻结。
 DEFAULT_BUDGET_CONFIG: dict[str, float] = {
     "recon_max_rounds": 30,
     "analysis_max_rounds": 30,
@@ -34,6 +36,7 @@ DEFAULT_BUDGET_CONFIG: dict[str, float] = {
     "max_tool_attempts": 320,
     "max_active_seconds": 7200.0,
     "max_candidates": 8,
+    "qemu_max_session_executions": 4,
 }
 
 # 本机环境覆盖层的键名单一出处;角色轮次旋钮沿用各 runner 既同名变量
@@ -47,11 +50,13 @@ ENV_KEYS: dict[str, str] = {
     "max_tool_attempts": "STEP5_MAX_TOOL_ATTEMPTS",
     "max_active_seconds": "STEP5_MAX_ACTIVE_SECONDS",
     "max_candidates": "STEP5_CANDIDATE_SLOTS",
+    "qemu_max_session_executions": "STEP5_QEMU_MAX_SESSION_EXECUTIONS",
 }
 
 _INT_KEYS = frozenset({
     "recon_max_rounds", "analysis_max_rounds", "verification_max_rounds",
     "max_llm_calls", "max_tool_attempts", "max_candidates",
+    "qemu_max_session_executions",
 })
 
 

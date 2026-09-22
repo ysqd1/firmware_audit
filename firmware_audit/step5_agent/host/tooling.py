@@ -60,7 +60,11 @@ def execute_tool(tool: object, arguments: dict[str, Any], *, method: str = "exec
             result = tool.execute_for_scope(
                 arguments, investigation_ref=investigation_ref,
                 remaining_seconds=lambda: (
-                    budget.resolved["max_active_seconds"] - budget.ledger.active_seconds))
+                    budget.resolved["max_active_seconds"] - budget.ledger.active_seconds),
+                # 会话内执行次数上限随 QEMU 预算块走分层配置(票 17):
+                # 生效值与来源已随 config.json 快照冻结;旧世代快照缺该键时
+                # 传 None,工具回落 env/默认并在台账记录实际来源。
+                max_executions=budget.resolved.get("qemu_max_session_executions"))
         else:
             result = getattr(tool, method)(**arguments)
     except Exception as exc:

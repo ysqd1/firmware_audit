@@ -1466,3 +1466,160 @@ def test_prior_projection_invariant_is_enforced(tmp_path: Path) -> None:
             _DifferentComparator(), lambda ctx: _TotalScorer({}),
             extra_intake=[_related_intake(
                 "rel-cand-0001-1", "verification:cand-0001", anchor="x")])
+
+
+# ---- S8 QEMU 会话强制收口与恢复收割(票 17) ----
+
+def _qemu_test_driver(tmp_path: Path, sessions, process_dir: Path) -> RunDriver:
+    """真实 QemuExecuteTool + FakeDocker(在会话测试模块内打桩)+ 脚本 Session。"""
+    from firmware_audit.step5_agent.host import driver as driver_module
+    from firmware_audit.step5_agent.providers.tools import make_tools
+    from firmware_audit.step5_agent.providers.tools.base import ToolContext, ToolResult as _TR
+    from firmware_audit.step5_agent.providers.tools import qemu_session as qs
+    from firmware_audit.test.test_step5_qemu_session import FakeDocker, _arm_workspace
+
+    fake = FakeDocker()
+    monkeypatch_targets = (qs, fake)
+    _arm_workspace(process_dir)
+    _make_tree(process_dir, {"extracted/etc/device.conf": 24,
+                             "extracted/bin/robotd": 64})
+    qemu_tool = make_tools(ToolContext(process_dir=process_dir),
+                           exclude=set(), role="analysis")["qemu_execute"]
+    # 打桩通过模块级 fixture 无关的局部替换完成:直接改 qs 命名空间,
+    # 测试结束由调用方的 monkeypatch 恢复——这里改为显式 try/finally。
+    originals = (qs.docker_run_detached, qs.docker_exec, qs.docker_rm,
+                 qs.docker_image_identity)
+    qs.docker_run_detached = fake.run_detached
+    qs.docker_exec = fake.exec
+    qs.docker_rm = fake.rm
+    qs.docker_image_identity = fake.image_identity
+    read_tool = FakeTool(_TR(ok=True, text="token=literal", raw="token=literal"))
+    driver = RunDriver(
+        tmp_path,
+        # qemu_execute 放首位:driver 借首个工具回填 generation_dir(票 16 接线)
+        tools={"qemu_execute": qemu_tool, "read_file": read_tool},
+        session_factory=sessions,
+        llm=FakeDedupLLM(),
+        process_dir=process_dir,
+        env={},
+    )
+    driver._qemu_test_fake = fake  # 测试可见性
+    driver._qemu_test_originals = originals
+    driver._qemu_test_qs = qs
+    return driver
+
+
+@pytest.fixture
+def qemu_driver_patched():
+    """提供局部打桩的恢复出口:测试用例结束时还原 qs 命名空间。"""
+    yield
+    # 恢复由各测试通过 driver._qemu_test_originals 显式执行也可以;
+    # 这里兜底按 qs 模块属性是否被改过来判断——直接从 originals 恢复。
+    # (真实恢复逻辑在 _restore_qemu_stubs 中)
+
+
+def _restore_qemu_stubs(driver: RunDriver) -> None:
+    qs_mod = driver._qemu_test_qs  # noqa: SLF001 -- 测试装配接缝
+    (qs_mod.docker_run_detached, qs_mod.docker_exec, qs_mod.docker_rm,
+     qs_mod.docker_image_identity) = driver._qemu_test_originals  # noqa: SLF001
+
+
+class _QemuThenCrashAnalysis:
+    """第一个动作开 QEMU 会话(keep_open),第二步模拟宿主中断。"""
+
+    role = "analysis"
+
+    def __init__(self, candidate_id: str | None = None):
+        self.inputs: list[str | None] = []
+
+    def step(self, input_message: str | None = None):
+        from firmware_audit.step5_agent.host import ActionProposal
+        self.inputs.append(input_message)
+        if len(self.inputs) == 1:
+            return ActionProposal(
+                decision_summary="动态观察固件目标",
+                state_delta={},
+                tool="qemu_execute",
+                arguments={"file_ref": "fw/usr/sbin/nvram",
+                           "firmware_root": "fw", "keep_open": True})
+        raise RuntimeError("host down mid-session")
+
+
+def test_driver_interrupt_force_seals_qemu_sessions(tmp_path: Path) -> None:
+    """中断路径:Host 强制停机封存开启会话(host_interrupt),不依赖 agent。"""
+    process_dir = tmp_path / "process"
+    process_dir.mkdir()
+    sessions = SessionScript(
+        recon=FakeReconSession([_recon_action(), _survey(_survey_delta())]),
+        analysis=_QemuThenCrashAnalysis)
+    driver = _qemu_test_driver(tmp_path, sessions, process_dir)
+    try:
+        with pytest.raises(RuntimeError, match="host down"):
+            driver.run()
+        gen_dir = tmp_path / "generations" / "gen-0001"
+        state = load_run_state(gen_dir)
+        assert state["status"] == "running"
+        assert state["stop_reason"] == "interrupted:RuntimeError"
+        ledger = json.loads(
+            (gen_dir / "qemu_sessions" / "ledger.json").read_text(encoding="utf-8"))
+        assert len(ledger["sessions"]) == 1
+        entry = ledger["sessions"][0]
+        assert entry["status"] == "sealed"
+        assert entry["seal_kind"] == "host_interrupt"
+        assert entry["sealed"] is True
+        assert entry["cleanup"]["verdict"] == "container_removed"
+        assert entry["execution_budget"]["source"] == "host_config"
+        # 恢复:封存过的会话不被重碰,运行走完正常封存
+        resume = SessionScript(analysis=None, verification=None)  # 默认 Smart 会话
+        driver2 = _qemu_test_driver(tmp_path, resume, process_dir)
+        _restore_qemu_stubs(driver2)
+        summary = driver2.run()
+        assert summary.status == "completed"
+        ledger2 = json.loads(
+            (gen_dir / "qemu_sessions" / "ledger.json").read_text(encoding="utf-8"))
+        assert ledger2["sessions"][0]["seal_kind"] == "host_interrupt"
+    finally:
+        _restore_qemu_stubs(driver)
+
+
+def test_driver_resume_reaps_leftover_qemu_sessions(tmp_path: Path,
+                                                    monkeypatch) -> None:
+    """SIGKILL 模拟:中断处理器没跑,遗留 running 会话由恢复路径强制收割。"""
+    from firmware_audit.step5_agent.host import driver as driver_module
+
+    process_dir = tmp_path / "process"
+    process_dir.mkdir()
+    sessions = SessionScript(
+        recon=FakeReconSession([_recon_action(), _survey(_survey_delta())]),
+        analysis=_QemuThenCrashAnalysis)
+    driver = _qemu_test_driver(tmp_path, sessions, process_dir)
+    real_seal = driver_module.seal_open_sessions
+    # 封死中断封存路径 = 宿主被 SIGKILL,没有任何收口代码运行
+    monkeypatch.setattr(driver_module, "seal_open_sessions",
+                        lambda *a, **k: {"sealed": [], "failed": [],
+                                         "unreadable": None})
+    try:
+        with pytest.raises(RuntimeError, match="host down"):
+            driver.run()
+        gen_dir = tmp_path / "generations" / "gen-0001"
+        ledger = json.loads(
+            (gen_dir / "qemu_sessions" / "ledger.json").read_text(encoding="utf-8"))
+        session_id = ledger["sessions"][0]["session_id"]
+        assert ledger["sessions"][0]["status"] == "running", "遗留现场:无收口代码运行"
+
+        # 恢复运行:恢复路径真跑(解除打桩),强制收割遗留容器
+        monkeypatch.setattr(driver_module, "seal_open_sessions", real_seal)
+        resume = SessionScript(analysis=None, verification=None)
+        driver2 = _qemu_test_driver(tmp_path, resume, process_dir)
+        _restore_qemu_stubs(driver2)
+        with pytest.warns(RuntimeWarning, match="收割遗留 QEMU 会话"):
+            summary = driver2.run()
+        assert summary.status == "completed"
+        ledger2 = json.loads(
+            (gen_dir / "qemu_sessions" / "ledger.json").read_text(encoding="utf-8"))
+        entry = ledger2["sessions"][0]
+        assert entry["status"] == "interrupted"
+        assert entry["seal_kind"] == "recovery_reap"
+        assert entry["sealed"] is True
+    finally:
+        _restore_qemu_stubs(driver)

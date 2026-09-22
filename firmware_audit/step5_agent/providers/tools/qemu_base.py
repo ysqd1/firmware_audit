@@ -134,8 +134,7 @@ def resolve_max_sessions(env: dict[str, str] | None = None) -> int:
     """同角色同归属的会话上限:默认 3(ADR-0013 由 4 收紧),env 层可覆盖。
 
     缺失/非法/越界(≤0)回落默认——与 STEP5_*_MAX_ITERS 的 resolver 同口径;
-    正式 QEMU 预算块并入 RunBudget 分层解析由票 17 收口,本 resolver 只覆盖
-    会话名额这一个旋钮。
+    只能收紧到默认值,不能放大(票 16 复审决定,防配置把名额抬到 99)。
     """
     import os
     raw = (os.environ if env is None else env).get(QEMU_MAX_SESSIONS_ENV)
@@ -148,3 +147,31 @@ def resolve_max_sessions(env: dict[str, str] | None = None) -> int:
     if value < 1:
         return DEFAULT_MAX_SESSIONS_PER_SCOPE
     return min(value, DEFAULT_MAX_SESSIONS_PER_SCOPE)
+
+
+# ---- 会话内执行次数(票 17:显式预算参数,临时默认 4,票 19 校准定稿) ----
+
+DEFAULT_MAX_SESSION_EXECUTIONS = 4
+QEMU_MAX_SESSION_EXECUTIONS_ENV = "STEP5_QEMU_MAX_SESSION_EXECUTIONS"
+
+
+def resolve_max_session_executions(
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
+    """单会话执行次数上限及其来源:显式(Host 配置)> env > 默认 4。
+
+    本函数只覆盖 env→默认 两层;Host 配置层由 RunBudget 的分层解析
+    (config.json 快照记录生效值与来源)经 execute_for_scope 显式下发,
+    工具侧记录 source="host_config"。env 层缺失/非法/越界(≤0)回落默认
+    并记 source="default"——与 RunBudget._env_value 同口径,不带病生效。
+    """
+    import os
+    raw = (os.environ if env is None else env).get(QEMU_MAX_SESSION_EXECUTIONS_ENV)
+    if raw is not None and str(raw).strip():
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            value = 0
+        if value >= 1:
+            return value, "environment"
+    return DEFAULT_MAX_SESSION_EXECUTIONS, "default"

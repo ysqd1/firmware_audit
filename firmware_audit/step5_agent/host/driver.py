@@ -58,6 +58,7 @@ from .reporting import (
     seal_run,
 )
 from .store import StoreError, read_json_object
+from ..providers.tools.qemu_recovery import reap_leftover_sessions, seal_open_sessions
 from .verification import (
     VERIFICATION_SESSION_SYSTEM,
     HostVerificationRunner,
@@ -298,6 +299,11 @@ class RunDriver:
         # 不再决定谁能看到谁的计数(票 10 遗留债务在本票收敛)。
         budget = RunBudget.load(
             gen_dir, clock=self._clock, config=resolved, persist=False)
+        # 票 17:恢复未完成的 running 世代前,先收割上一次 Host 死亡遗留的
+        # QEMU 会话容器(客户端死亡不等于清理完成;中断即会话死亡,收割后
+        # 会话不可复活,续跑由 Agent 开新会话,已持久化执行不重复扣名额)。
+        if not created and state is not None and state["status"] == "running":
+            self._reap_qemu_sessions(gen_dir)
         self._phase = None
         # 恢复 finalizing 世代时处理责任早已收束,异常回写必须保持 finalizing。
         self._finalizing = state is not None and state["status"] == "finalizing"
@@ -323,9 +329,11 @@ class RunDriver:
             # 调查级 stop_reason 分布承载。
             return self._settle_budget_exhaustion(
                 name, gen_dir, created, budget, tracer)
-        except Exception as exc:
-            # 模型服务中断等异常:现场已由既有 checkpoint 保存,这里只补一个
-            # 可解释的停止原因并原样上抛(StoreError 即票 17 的拒绝路径)。
+        except BaseException as exc:
+            # 票 17:中断(含 KeyboardInterrupt)即会话死亡——Host 强制停机
+            # 封存全部开启会话,再回写可解释的停止原因并原样上抛。SIGKILL
+            # 无人可拦,由下一次运行的恢复路径收割(reap_leftover_sessions)。
+            self._seal_qemu_sessions(gen_dir, kind="host_interrupt")
             self._record_failure(gen_dir, exc)
             raise
 
@@ -462,11 +470,51 @@ class RunDriver:
     def _seal(
         self, name: str, gen_dir: Path, created: bool, budget: RunBudget,
     ) -> RunSummary:
-        """封存阶段:可选 LLM 注记 → 确定性报告 → manifest seal → completed。"""
+        """封存阶段:强制停机会话 → 可选 LLM 注记 → 确定性报告 → seal。"""
         self._phase = "sealing"
+        # 票 17:正常完成与预算耗尽收束都经此封存——Host 强制停机全部开启
+        # 会话,不依赖 agent 自觉调用停机;finalizing 世代恢复也重入此处,
+        # 上次封存失败(seal_failed)的会话在此重试收割。
+        self._seal_qemu_sessions(gen_dir, kind="host_finalize")
         notes = self._analyst_notes(gen_dir, budget)
         seal_run(gen_dir, analyst_notes=notes)
         return self._summary(name, gen_dir, created, "completed", "sealed")
+
+    # ---- QEMU 会话强制收口(票 17;失败只告警,不阻断世代收束) ----
+
+    def _reap_qemu_sessions(self, gen_dir: Path) -> None:
+        try:
+            report = reap_leftover_sessions(gen_dir)
+        except Exception as exc:
+            warnings.warn(f"QEMU 会话恢复收割失败: {exc}", RuntimeWarning)
+            return
+        if report.get("unreadable"):
+            warnings.warn(
+                f"QEMU 会话台账不可读,遗留容器无法按名收割:"
+                f"{report['unreadable']}", RuntimeWarning)
+        for session_id in report.get("reaped", []):
+            warnings.warn(
+                f"恢复收割遗留 QEMU 会话容器: {session_id}", RuntimeWarning)
+        for session_id in report.get("uncertain", []):
+            warnings.warn(
+                f"QEMU 会话 {session_id} 清理不确定(容器拆除未确认),"
+                "已如实记录,不伪装清理完成", RuntimeWarning)
+
+    def _seal_qemu_sessions(self, gen_dir: Path, *, kind: str) -> None:
+        try:
+            report = seal_open_sessions(gen_dir, kind=kind)
+        except Exception as exc:
+            warnings.warn(
+                f"QEMU 会话强制停机封存失败({kind}): {exc}", RuntimeWarning)
+            return
+        if report.get("unreadable"):
+            warnings.warn(
+                f"QEMU 会话台账不可读,无法强制停机遗留会话:"
+                f"{report['unreadable']}", RuntimeWarning)
+        for session_id in report.get("failed", []):
+            warnings.warn(
+                f"QEMU 会话 {session_id} 容器拆除未确认(清理不确定),"
+                "留待恢复路径强制收割", RuntimeWarning)
 
     def _analyst_notes(self, gen_dir: Path, budget: RunBudget) -> str | None:
         """可选 LLM 注记:任何失败只告警跳过,绝不阻塞封存(ADR-0012 L81)。
