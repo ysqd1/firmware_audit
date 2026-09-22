@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 
@@ -1019,3 +1020,18 @@ def test_compaction_failure_restores_context_and_run_continues(
     assert len(context.recent) == 6  # 两轮动作 + 第三轮观察/回复,零丢失
     document = _ledger_document(tmp_path)
     assert document["llm_calls"] == 3  # 失败的压缩请求不记账
+
+
+def test_qemu_execution_knob_layers_and_invalid_fallback(tmp_path, monkeypatch) -> None:
+    """票 17:qemu_max_session_executions env 覆盖生效;非法回落默认并记来源。"""
+    from firmware_audit.step5_agent.host.budget import resolve_effective_config
+
+    monkeypatch.setenv("STEP5_QEMU_MAX_SESSION_EXECUTIONS", "7")
+    document = resolve_effective_config(env=os.environ)
+    assert document["resolved"]["qemu_max_session_executions"] == 7
+    assert document["sources"]["qemu_max_session_executions"] == "environment"
+    for bad in ("zero", "0", "-2", " ", "4.5"):
+        monkeypatch.setenv("STEP5_QEMU_MAX_SESSION_EXECUTIONS", bad)
+        document = resolve_effective_config(env=os.environ)
+        assert document["resolved"]["qemu_max_session_executions"] == 4
+        assert document["sources"]["qemu_max_session_executions"] == "default"

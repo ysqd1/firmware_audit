@@ -1359,3 +1359,20 @@ def test_real_mips_non_shell_parent(tmp_path: Path, monkeypatch) -> None:
     d = r.data
     assert d["result_class"] == "normal_exit", d
     assert "env-parent-mips-ok" in d["observation_excerpt"]["stdout"]["excerpt"]
+
+
+def test_execution_knob_env_name_consistent_across_layers() -> None:
+    """QEMU 预算旋钮的 env 名与默认值在 budget 层与工具层一致(分层不可互导,
+    用测试钉住单一来源)。"""
+    from firmware_audit.step5_agent.host.budget import (
+        DEFAULT_BUDGET_CONFIG,
+        ENV_KEYS,
+        QEMU_MAX_SESSION_EXECUTIONS_KEY,
+    )
+    from firmware_audit.step5_agent.providers.tools.qemu_base import (
+        DEFAULT_MAX_SESSION_EXECUTIONS,
+        QEMU_MAX_SESSION_EXECUTIONS_ENV,
+    )
+    assert ENV_KEYS[QEMU_MAX_SESSION_EXECUTIONS_KEY] == QEMU_MAX_SESSION_EXECUTIONS_ENV
+    assert (DEFAULT_BUDGET_CONFIG[QEMU_MAX_SESSION_EXECUTIONS_KEY]
+            == DEFAULT_MAX_SESSION_EXECUTIONS)

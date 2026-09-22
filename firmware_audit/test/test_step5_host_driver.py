@@ -1472,14 +1472,12 @@ def test_prior_projection_invariant_is_enforced(tmp_path: Path) -> None:
 
 def _qemu_test_driver(tmp_path: Path, sessions, process_dir: Path) -> RunDriver:
     """真实 QemuExecuteTool + FakeDocker(在会话测试模块内打桩)+ 脚本 Session。"""
-    from firmware_audit.step5_agent.host import driver as driver_module
     from firmware_audit.step5_agent.providers.tools import make_tools
     from firmware_audit.step5_agent.providers.tools.base import ToolContext, ToolResult as _TR
     from firmware_audit.step5_agent.providers.tools import qemu_session as qs
     from firmware_audit.test.test_step5_qemu_session import FakeDocker, _arm_workspace
 
     fake = FakeDocker()
-    monkeypatch_targets = (qs, fake)
     _arm_workspace(process_dir)
     _make_tree(process_dir, {"extracted/etc/device.conf": 24,
                              "extracted/bin/robotd": 64})
@@ -1507,15 +1505,6 @@ def _qemu_test_driver(tmp_path: Path, sessions, process_dir: Path) -> RunDriver:
     driver._qemu_test_originals = originals
     driver._qemu_test_qs = qs
     return driver
-
-
-@pytest.fixture
-def qemu_driver_patched():
-    """提供局部打桩的恢复出口:测试用例结束时还原 qs 命名空间。"""
-    yield
-    # 恢复由各测试通过 driver._qemu_test_originals 显式执行也可以;
-    # 这里兜底按 qs 模块属性是否被改过来判断——直接从 originals 恢复。
-    # (真实恢复逻辑在 _restore_qemu_stubs 中)
 
 
 def _restore_qemu_stubs(driver: RunDriver) -> None:

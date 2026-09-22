@@ -75,10 +75,11 @@ def _dispose_sessions(base: Path, *, kind: str, interrupted: bool) -> dict:
     """共享处置骨架:识别待处置会话 → 清扫 → 权威拆除 → 状态机回写。
 
     ``interrupted`` 决定 running 会话的去向(True=恢复收割/中断收口,会话
-    标 interrupted;False=调查终态封存,确认即 sealed、未确认留
-    seal_failed)。返回 ``{"sealed": [...], "failed": [...],
-    "unreadable": str|None}``;failed 收集拆除未确认的会话(含清理不确定
-    的 interrupted 重试)。
+    标 interrupted 并写 recovery 记录;False=调查终态封存,确认即 sealed、
+    未确认留 seal_failed,不写 recovery 记录)。interrupted 会话的清理不
+    确定重试不改变死亡标记(status/seal_kind/sealed_at 首判),只刷新
+    cleanup/sealed。返回 ``{"sealed": [...], "failed": [...],
+    "unreadable": str|None}``;failed 收集拆除未确认或台账回写失败的会话。
     """
     report: dict = {"sealed": [], "failed": [], "unreadable": None}
     path = _ledger_path(base)
@@ -105,12 +106,6 @@ def _dispose_sessions(base: Path, *, kind: str, interrupted: bool) -> dict:
         entry["cleanup"] = {"verdict": verdict, "detail": detail}
         entry["sealed"] = confirmed
         entry["sealed_at"] = timestamp()
-        entry["recovery"] = {
-            "reaped_at": entry["sealed_at"],
-            "seal_kind": kind,
-            "note": ("Host 恢复路径强制收割:中断即会话死亡,运行产物仅留档,"
-                     "不进入新会话,已持久化执行不重复扣名额"),
-        }
         if previous_status == "running":
             if interrupted:
                 # Host 死亡/中断:会话死亡与清理确认是两件事
@@ -118,17 +113,29 @@ def _dispose_sessions(base: Path, *, kind: str, interrupted: bool) -> dict:
             else:
                 entry["status"] = "sealed" if confirmed else "seal_failed"
             entry["seal_kind"] = kind
+            if interrupted:
+                # 恢复记录只属于恢复路径:中断即会话死亡,运行产物仅留档
+                entry["recovery"] = {
+                    "reaped_at": entry["sealed_at"],
+                    "seal_kind": kind,
+                    "note": ("Host 恢复路径强制收割:中断即会话死亡,运行产物"
+                             "仅留档,不进入新会话,已持久化执行不重复扣名额"),
+                }
         elif previous_status == "seal_failed":
             # 封存失败的重试:拆除确认即完成封存(恢复路径确认同样算,
             # 会话并非死于中断,死亡形态是"封存完成")。
             entry["status"] = "sealed" if confirmed else "seal_failed"
             entry["seal_kind"] = kind
-        # interrupted:死亡标记(seal_kind/sealed_at 首判)不动,只刷新清理事实
-        (report["sealed"] if confirmed else report["failed"]).append(session_id)
+        else:
+            # interrupted 的清理不确定重试:死亡标记(status/seal_kind/
+            # sealed_at 首判)不动,sealed/cleanup 刷新为最近一次处置事实
+            entry["status"] = previous_status
         try:
             ledger.replace(session_id, entry)
         except Exception:
             report["failed"].append(session_id)
+            continue
+        (report["sealed"] if confirmed else report["failed"]).append(session_id)
     return report
 
 

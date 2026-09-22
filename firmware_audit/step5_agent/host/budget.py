@@ -60,7 +60,7 @@ ENV_KEYS: dict[str, str] = {
 _INT_KEYS = frozenset({
     "recon_max_rounds", "analysis_max_rounds", "verification_max_rounds",
     "max_llm_calls", "max_tool_attempts", "max_candidates",
-    "qemu_max_session_executions",
+    QEMU_MAX_SESSION_EXECUTIONS_KEY,
 })
 
 

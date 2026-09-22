@@ -1014,14 +1014,14 @@ def _render_text(report: dict) -> str:
             lines.append(f"    {line}")
     cleanup = report.get("cleanup") or {}
     removal = report.get("container_removal") or {}
-    if cleanup or removal:
-        if cleanup:
-            lines.append(f"- 清理: {cleanup.get('verdict')}(残留 {cleanup.get('leftovers_after')})")
-        if removal:
-            lines.append(f"- 容器: {removal.get('verdict')}"
-                         + (";会话已停机封存" if report.get("sealed")
-                            else ";**拆除未确认,封存未完成**" if report.get("status") != "running"
-                            else ";会话保持开启(调查终态由 Host 强制停机封存)"))
+    if cleanup:
+        lines.append(f"- 清理: {cleanup.get('verdict')}(残留 {cleanup.get('leftovers_after')})")
+    if removal:
+        lines.append(f"- 容器: {removal.get('verdict')}"
+                     + (";会话已停机封存" if report.get("sealed")
+                        else ";**拆除未确认,封存未完成**"))
+    elif report.get("action") == "execute" and report.get("status") == "running":
+        lines.append("- 会话: 保持开启(传 session_id 继续执行;调查终态由 Host 强制封存)")
     obs = report.get("observation_excerpt") or {}
     for name in ("stdout", "stderr"):
         part = obs.get(name) or {}
