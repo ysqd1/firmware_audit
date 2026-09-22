@@ -282,6 +282,11 @@ class RunDriver:
             explicit=self._explicit, env=self._env, profile=self._profile)
         name, gen_dir, created = self._select_generation(force)
         self._run_dir = gen_dir
+        # 票 16:工具经共享 ToolContext 拿到世代目录,会话台账落世代内;
+        # 独立演示(无世代路径)由工具回落 process_dir 处理。
+        shared_ctx = getattr(next(iter(self.tools.values()), None), "ctx", None)
+        if shared_ctx is not None:
+            shared_ctx.generation_dir = gen_dir
         state = load_run_state(gen_dir)
         if state is not None and state["status"] not in ("running", "finalizing"):
             raise StoreError(

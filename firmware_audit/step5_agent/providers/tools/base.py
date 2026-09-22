@@ -33,6 +33,9 @@ class ToolContext:
     """一次 Step5 运行内不变的环境锚点。"""
 
     process_dir: Path  # target/<N>/process(工件根,也是 read_file 白名单根)
+    # 当前活动世代目录(票 16):Host 在建/选世代后回填,工具据此把会话台账
+    # 写进世代内;独立演示(None,默认)回落 process_dir 下 qemu_sessions/。
+    generation_dir: Path | None = None
 
 
 # 盘符前缀(C:/ 或 C:形态,反斜杠换算后)按绝对引用拒绝——Windows 上 Path
@@ -173,8 +176,11 @@ class AgentTool(ABC):
     # 素材类工具声明更大值(取值依据见 SummarizeTool 声明点)
     max_text_chars: int | None = None
 
-    def __init__(self, ctx: ToolContext):
+    def __init__(self, ctx: ToolContext, role: str | None = None):
         self.ctx = ctx
+        # 角色随构造传入(票 16:执行会话按 (角色, 归属) 记账);None = 未按
+        # 角色过滤的 legacy 实例化(测试/演示)。
+        self.role = role
 
     @property
     def text_limit(self) -> int:

@@ -1,12 +1,12 @@
 """qemu_precheck:QEMU 动态实验前的静态预检(票 05;spec 预检/会话两组能力的检查侧)。
 
-边界(ADR-0013 + 票 04 纪律):
+边界(ADR-0013 + 票 04/16 纪律):
 - 只做静态核查:ELF 头/程序头/动态段解析 + 固件根内文件存在性检查,
   **不执行目标、不运行固件或其加载器、不创建会话**。唯一容器调用是执行
   镜像内 qemu 二进制自报 --version(设施核查,不读不触固件字节)。
-- 通过≠可运行:架构/解释器/依赖检查通过**不代表子进程链能力已验证**——
-  票 04 实测 ARM(target/6 uClibc)链受阻且根因未定论、MIPS 链需
-  QEMU_LD_PREFIX 适配;限制句固定写入每份报告。
+- 通过≠可运行:架构/解释器/依赖检查通过**不代表该目标可运行**——票 16 已
+  完成组合验证(PRoot 5.4.0 + QEMU 11.1.1 的 ARM/MIPS 原链矩阵,见
+  investigation/proot540-qemu1111-2026-09-22/),链能力仍以会话期实测为准。
 - 结果分类只从 PRECHECK_RESULT_CLASSES 子集发出;解析原始信息全量进
   data,阻塞必有 detail,不静默丢弃。
 - 模板适用性(票 02 移交口径):NEEDED 含 NVRAM 系库 → 需模板注入;模板
@@ -21,11 +21,12 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from ....docker.docker_utils import docker_available, run_docker
+from ....docker.docker_utils import docker_available, docker_image_labels, run_docker
 from .base import AgentTool, ToolResult, resolve_within
 from .cli_base import extracted_root
 from .qemu_base import (
     QEMU_EXEC_IMAGE,
+    QEMU_EXEC_V2_IMAGE,
     QEMU_ARCH_MATRIX,
     QemuArchProfile,
     QemuResultClass,
@@ -43,18 +44,41 @@ _LIB_SEARCH_CAP = 20000  # 递归兜底的条目上限(防病态树;超出记入
 # 需符号级核实,基名匹配只标"需要 NVRAM 模板",不判定家族)
 _NVRAM_FAMILY_BASENAMES = ("libnvram.so", "libCfm.so", "libtpi.so")
 
-# 固定限制句(每份报告必带;措辞是票 04 纪律的落点,不得改写为能力宣称)
+# 固定限制句(每份报告必带;措辞是票 04/16 纪律的落点,不得改写为能力宣称)
 _LIMIT_NO_EXEC = ("预检是静态核查:不执行目标、不运行固件或其加载器、"
                   "不创建会话;预检结果只是 Evidence,不构成漏洞成立或不存在的依据。")
-_LIMIT_CHAIN = ("架构/解释器/依赖检查通过不代表子进程链能力已验证"
-                "(票 04 实测:ARM32 LE uClibc 链当前受阻且根因未定论,"
-                "MIPS32 BE 链需 QEMU_LD_PREFIX 环境适配);链能力以会话期实测为准。")
+_LIMIT_CHAIN = ("架构/解释器/依赖检查通过不代表该目标的子进程链能力已验证;"
+                "票 16 已实测 PRoot 5.4.0 + QEMU 11.1.1 组合的 ARM/MIPS 原链"
+                "矩阵(证据见 investigation/proot540-qemu1111-2026-09-22/),"
+                "样本级链能力以会话期实测为准,不得以组合验证外推宣称。")
 _LIMIT_MATRIX = ("矩阵内命名是档案不是能力承诺:不能据架构名称宣称所有程序可运行;"
                  "矩阵外架构仅表示不在首批范围,不表示永久不可行。")
 
 
 class ElfParseError(ValueError):
     """ELF 解析失败(非 ELF/截断/结构不可读)——预检转为准备阻塞,不崩溃。"""
+
+
+def find_in_root(root: Path, basename: str) -> tuple[str | None, bool]:
+    """在固件根内找库/加载器文件,返回 (相对 root 的 POSIX 路径|None, 检索是否截断)。
+
+    先按标准库目录布局,再限界递归兜底;超过 _LIB_SEARCH_CAP 时返回
+    (None, True)——"未找到"与"没找完"必须可区分,截断由调用方写入报告,
+    不得静默当作缺失(原始信息保留红线)。模块级单一出处:预检(票 05)
+    与执行会话的身份档案(票 16)共用。
+    """
+    for d in _LIB_DIRS:
+        cand = root / d / basename
+        if cand.is_file():
+            return cand.relative_to(root).as_posix(), False
+    seen = 0
+    for cand in root.rglob(basename):
+        seen += 1
+        if seen > _LIB_SEARCH_CAP:
+            return None, True
+        if cand.is_file():
+            return cand.relative_to(root).as_posix(), False
+    return None, False
 
 
 def _vaddr_to_offset(loads: list[tuple[int, int, int]], vaddr: int) -> int | None:
@@ -184,26 +208,44 @@ class QemuPrecheckTool(AgentTool):
     # ---- 设施核查(唯一容器调用;测试用 Docker 替身替换本方法) ----
 
     def _facility_check(self, qemu_binary: str) -> dict:
-        """执行镜像内 qemu 二进制自报版本。只跑 qemu 自身(x86 静态二进制),
-        不读不触固件字节(预检红线:不运行固件或其加载器)。
+        """执行镜像设施核查(票 16 升级):镜像 LABEL 承载 PRoot/QEMU/补丁/基线
+        身份,镜像内 qemu 自报 --version 证明二进制可用。唯一容器调用仍只跑
+        qemu 自身(x86 静态二进制),不读不触固件字节(预检红线)。
 
         命令按 AGENTS.md 踩坑纪律用纯字符串拼接(禁 .format/f-string)。
         """
-        if not docker_available(QEMU_EXEC_IMAGE):
-            return {"image": QEMU_EXEC_IMAGE, "qemu_binary": qemu_binary,
-                    "available": False, "version": None,
-                    "detail": f"镜像 {QEMU_EXEC_IMAGE} 不可用"
-                              "(docker image inspect 失败;先运行 build_image.sh)"}
-        cmd = qemu_binary + " --version 2>&1 | head -1"
-        rc, out, err = run_docker(QEMU_EXEC_IMAGE, ["-c", cmd],
-                                  entrypoint="bash", network="none", timeout=60)
+        labels = docker_image_labels(QEMU_EXEC_V2_IMAGE)
+        if labels is None:
+            return {"image": QEMU_EXEC_V2_IMAGE, "available": False,
+                    "qemu_binary": qemu_binary, "version": None,
+                    "detail": (f"镜像 {QEMU_EXEC_V2_IMAGE} 不可用"
+                               "(先运行 docker/qemu-exec-v2/build_image.sh;"
+                               f"历史镜像 {QEMU_EXEC_IMAGE} 仅作 5.2 对照)")}
+        if not docker_available(QEMU_EXEC_V2_IMAGE):
+            return {"image": QEMU_EXEC_V2_IMAGE, "available": False,
+                    "qemu_binary": qemu_binary, "version": None,
+                    "detail": "镜像 LABEL 可读但 image inspect 失败"}
+        # 镜像剥离后无 shell:--version 走直接 argv(entrypoint 覆盖)
+        rc, out, err = run_docker(QEMU_EXEC_V2_IMAGE, ["--version"],
+                                  entrypoint="/usr/local/bin/" + qemu_binary,
+                                  network="none", timeout=60)
         lines = (out or "").strip().splitlines()
         version = lines[0].strip() if lines else ""
         available = rc == 0 and "version" in version
         detail = version or (err or "").strip()[:200]
-        return {"image": QEMU_EXEC_IMAGE, "qemu_binary": qemu_binary,
+        return {"image": QEMU_EXEC_V2_IMAGE,
                 "available": available,
+                "qemu_binary": qemu_binary,
                 "version": version if available else None,
+                "proot_version": labels.get("fw.proot.version"),
+                "proot_patch_sha256": labels.get("fw.proot.patch.sha256"),
+                "qemu_tarball_sha256": labels.get("fw.qemu.tarball.sha256"),
+                "base_digest": labels.get("fw.base.digest"),
+                "boundary": labels.get("fw.boundary"),
+                "verification_note": ("组合验证条件:PRoot 5.4.0 + QEMU 11.1.1 的 "
+                                      "ARM/MIPS 矩阵、/host-rootfs 拒绝与清理边界"
+                                      "已于票 16 实测(investigation/"
+                                      "proot540-qemu1111-2026-09-22/)"),
                 "detail": detail or f"qemu --version 无有效输出(rc={rc})"}
 
     # ---- 路径解析 ----
@@ -218,24 +260,8 @@ class QemuPrecheckTool(AgentTool):
     # ---- 固件根内检索 ----
 
     def _find_in_root(self, root: Path, basename: str) -> tuple[str | None, bool]:
-        """在固件根内找库/加载器文件,返回 (相对 root 的 POSIX 路径|None, 检索是否截断)。
-
-        先按标准库目录布局,再限界递归兜底;超过 _LIB_SEARCH_CAP 时返回
-        (None, True)——"未找到"与"没找完"必须可区分,截断由调用方写入报告,
-        不得静默当作缺失(原始信息保留红线)。
-        """
-        for d in _LIB_DIRS:
-            cand = root / d / basename
-            if cand.is_file():
-                return cand.relative_to(root).as_posix(), False
-        seen = 0
-        for cand in root.rglob(basename):
-            seen += 1
-            if seen > _LIB_SEARCH_CAP:
-                return None, True
-            if cand.is_file():
-                return cand.relative_to(root).as_posix(), False
-        return None, False
+        """模块级 find_in_root 的方法包装(兼容既有调用)。"""
+        return find_in_root(root, basename)
 
     # ---- 主流程 ----
 
@@ -442,7 +468,8 @@ def _render_text(report: dict) -> str:
     if facility.get("available") is True:
         version = facility.get("version") or "版本可查"
         lines.append(f"- 执行设施: {facility['image']} "
-                     f"{facility.get('qemu_binary')}({version})")
+                     f"{facility.get('qemu_binary')}({version};"
+                     f"proot {facility.get('proot_version')})")
     elif facility.get("available") is False:
         lines.append(f"- 执行设施: 不可用({facility.get('detail')})")
     lines.append(f"- 路径边界: 目标与固件根均在 extracted/ 只读树内;"

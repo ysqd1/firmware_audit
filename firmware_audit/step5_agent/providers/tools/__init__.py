@@ -25,6 +25,7 @@ from .gitleaks_scan import GitleaksScanTool
 from .imports_query import ImportsQueryTool
 from .list_files import ListFilesTool
 from .qemu_precheck import QemuPrecheckTool
+from .qemu_session import QemuExecuteTool
 from .r2_disassemble_function import R2DisassembleFunctionTool
 from .r2_list_functions import R2ListFunctionsTool
 from .r2_xref_query import R2XrefQueryTool
@@ -92,6 +93,10 @@ _TOOL_CONTRACTS: tuple[ToolContract, ...] = (
     # 幂等可重放;授权深挖角色,recon 不可见。sandbox_verify 所在基础镜像
     # 零 qemu(票 03 结构性隔离),脚本路径无法触达 QEMU 执行。
     ToolContract(QemuPrecheckTool, _DEEP_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
+    # qemu_execute 单发执行会话(票 16,ADR-0013):每次调用即一个会话,消耗
+    # 名额且不可重放(NEVER——重放等于隐藏的额外执行);授权深挖角色且
+    # analysis/verification 名额独立记账,recon 不可见。
+    ToolContract(QemuExecuteTool, _DEEP_ROLES, ReplayPolicy.NEVER),
     ToolContract(BinwalkRescanTool, _ALL_ROLES, ReplayPolicy.READ_ONLY_IDEMPOTENT),
     ToolContract(WebSearchTool, _NO_ROLES, ReplayPolicy.NEVER),
 )
@@ -152,7 +157,10 @@ def make_tools(
         raw = os.environ.get("STEP5_EXCLUDE_TOOLS", "")
         exclude = {n.strip() for n in raw.split(",") if n.strip()}
     tools = {
-        contract.name: contract.tool_type(ctx)
+        contract.name: (
+            contract.tool_type(ctx, role=role) if role is not None
+            else contract.tool_type(ctx)
+        )
         for contract in _TOOL_CONTRACTS
         if contract.name not in exclude
         and (allowed is None or contract.name in allowed)
@@ -173,5 +181,5 @@ __all__ = ["AgentTool", "ToolContext", "ToolResult", "make_tools",
            "GhidraDecompileTool",
            "CveBinToolScanTool", "CveLookupTool",
            "SemgrepScanTool", "GitleaksScanTool", "SandboxVerifyTool",
-           "QemuPrecheckTool",
+           "QemuPrecheckTool", "QemuExecuteTool",
            "BinwalkRescanTool", "WebSearchTool"]

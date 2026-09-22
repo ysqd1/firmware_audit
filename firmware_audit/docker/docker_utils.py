@@ -123,3 +123,95 @@ def docker_available(image: str) -> bool:
         return proc.returncode == 0
     except Exception:
         return False
+
+
+# ---- 会话容器原语(票 16:qemu-exec-v2 执行会话;与 run_docker 同款 utf-8 纪律) ----
+# run_docker 只覆盖"一次性 docker run --rm"形态;会话容器需要 -d 常驻 +
+# 显式命名 + 逐条 docker exec + 终态 rm -f,原语在此收口,工具层不拼 docker 命令。
+
+def _run_docker_cmd(cmd: list[str], timeout: int) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"docker timed out after {timeout}s: {' '.join(cmd[:4])}..."
+    except OSError as exc:
+        return 125, "", f"docker invocation failed: {exc}"
+
+
+def docker_run_detached(
+    image: str,
+    args: list[str],
+    *,
+    name: str,
+    mounts: list[tuple[Path, str, str]] | None = None,
+    tmpfs: list[str] | None = None,
+    entrypoint: str | None = None,
+    network: str = "none",
+    read_only: bool = False,
+    init: bool = True,
+    timeout: int = 120,
+) -> tuple[int, str, str]:
+    """`docker run -d --rm --name <name>`:会话容器(stdout=容器 ID)。"""
+    cmd = ["docker", "run", "-d", "--rm", "--name", name]
+    if init:
+        cmd.append("--init")
+    if entrypoint:
+        cmd += ["--entrypoint", entrypoint]
+    if network:
+        cmd += ["--network", network]
+    if read_only:
+        cmd.append("--read-only")
+    for t in (tmpfs or []):
+        cmd += ["--tmpfs", t]
+    for host, container, mode in (mounts or []):
+        cmd += ["-v", f"{to_docker_path(Path(host).resolve())}:{container}:{mode}"]
+    cmd.append(image)
+    cmd += args
+    return _run_docker_cmd(cmd, timeout)
+
+
+def docker_exec(
+    container: str,
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    detach: bool = False,
+    timeout: int = 300,
+) -> tuple[int, str, str]:
+    """`docker exec [-d] [-e K=V...] <container> <args>`:直接 argv,不经 shell。"""
+    cmd = ["docker", "exec"]
+    if detach:
+        cmd.append("-d")
+    for k, v in (env or {}).items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd.append(container)
+    cmd += args
+    return _run_docker_cmd(cmd, timeout)
+
+
+def docker_rm(container: str, *, timeout: int = 60) -> tuple[int, str, str]:
+    """`docker rm -f`:会话停机封存的权威拆除(杀容器即杀全部进程)。"""
+    return _run_docker_cmd(["docker", "rm", "-f", container], timeout)
+
+
+def docker_image_labels(image: str) -> dict[str, str] | None:
+    """镜像 LABEL 字典;Docker/镜像不可用返回 None(设施核查用)。"""
+    rc, out, _ = _run_docker_cmd(
+        ["docker", "image", "inspect", "-f", "{{json .Config.Labels}}",
+         _ensure_tag(image)], 30)
+    if rc != 0:
+        return None
+    import json
+    try:
+        labels = json.loads(out.strip() or "{}")
+    except ValueError:
+        return None
+    return labels if isinstance(labels, dict) else None

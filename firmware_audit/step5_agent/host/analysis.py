@@ -921,7 +921,11 @@ _ANALYSIS_SESSION_SYSTEM = """## 1 角色与使命
   qemu_precheck(动态实验前静态预检:ELF 架构/解释器/依赖/模板适用性/
   路径边界;只读检查,不执行目标不创建会话。仅当静态证据不足、确需观察
   真实程序行为时评估可行性;预检通过不代表子进程链可用,更不代表漏洞
-  成立或不存在)。
+  成立或不存在)/ qemu_execute(单发执行会话:在隔离会话中真实执行一次
+  原固件程序及其自主派生链并返回 Observation;每次调用消耗一个会话名额,
+  每调查最多 3 个,结束时停机封存。仅在预检可行且静态证据确有缺口时使用;
+  传入 investigation_ref 以归属本次调查。动态 Observation 只是 Evidence,
+  正常退出/崩溃/超时都不构成漏洞成立或不存在)。
 - 二进制深挖升级纪律:先 r2/边车等低成本工具收窄目标,信息仍不足才
   ghidra_decompile;每次工具调用都会形成本 Investigation 的 Evidence
   (Observation View 中的 ev-xxxxxx)。

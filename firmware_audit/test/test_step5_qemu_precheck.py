@@ -41,6 +41,7 @@ from firmware_audit.step5_agent.providers.tools.base import ToolContext
 from firmware_audit.step5_agent.providers.tools.qemu_base import (
     PRECHECK_RESULT_CLASSES,
     QEMU_EXEC_IMAGE,
+    QEMU_EXEC_V2_IMAGE,
     QemuResultClass,
 )
 from firmware_audit.step5_agent.providers.tools.qemu_precheck import (
@@ -54,7 +55,7 @@ from firmware_audit.step5_agent.providers.tools.sandbox_verify import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PINS_PATH = REPO_ROOT / "firmware_audit" / "docker" / "qemu-exec" / "pins.env"
+PINS_PATH = REPO_ROOT / "firmware_audit" / "docker" / "qemu-exec-v2" / "pins.env"
 
 # 真实样本(票 01/03 实测代表二进制;workspace 工件,gitignored)
 TGT6_SQUASH = (REPO_ROOT / "target/6/process/extracted/"
@@ -587,7 +588,11 @@ def test_precheck_registry_contract() -> list[str]:
 
 
 def test_precheck_image_pin_matches_pins_env() -> list[str]:
-    """工具常量 QEMU_EXEC_IMAGE 与 pins.env 钉值同源(防双写漂移,票 03 口径)。"""
+    """工具常量与 pins.env 钉值同源(防双写漂移,票 03 口径;票 16 起新镜像)。
+
+    QEMU_EXEC_V2_IMAGE = pins.env 的 QEMU_EXEC_V2_IMAGE(产品工具使用);
+    QEMU_EXEC_IMAGE(票 03 历史镜像)保留常量,但其 pins 在旧目录,不在此查。
+    """
     fails: list[str] = []
     if not PINS_PATH.is_file():
         return [f"缺少钉值文件 {PINS_PATH}"]
@@ -597,11 +602,13 @@ def test_precheck_image_pin_matches_pins_env() -> list[str]:
         if line and not line.startswith("#"):
             key, _, value = line.partition("=")
             pins[key.strip()] = value.strip()
-    expected = pins.get("QEMU_EXEC_IMAGE", "")
+    expected = pins.get("QEMU_EXEC_V2_IMAGE", "")
     if not expected:
-        fails.append("pins.env 缺 QEMU_EXEC_IMAGE")
-    elif QEMU_EXEC_IMAGE.split(":")[0] != expected.split(":")[0]:
-        fails.append(f"QEMU_EXEC_IMAGE 常量 {QEMU_EXEC_IMAGE} 与 pins.env {expected} 不同源")
+        fails.append("pins.env 缺 QEMU_EXEC_V2_IMAGE")
+    elif QEMU_EXEC_V2_IMAGE != expected:
+        fails.append(f"QEMU_EXEC_V2_IMAGE 常量 {QEMU_EXEC_V2_IMAGE} 与 pins.env {expected} 不同源")
+    if ":latest" in QEMU_EXEC_V2_IMAGE:
+        fails.append("新镜像常量不得使用漂移 latest(票 16 AC)")
     return fails
 
 
@@ -636,10 +643,17 @@ def test_role_prompts_mention_precheck_scope() -> list[str]:
     )
     if "qemu_precheck" not in ANALYSIS_SESSION_SYSTEM:
         fails.append("analysis 提示词应列明 qemu_precheck 及适用场景")
+    if "qemu_execute" not in ANALYSIS_SESSION_SYSTEM:
+        fails.append("analysis 提示词应列明 qemu_execute 及会话名额语义(票 16)")
     if "qemu_precheck" not in VERIFICATION_SESSION_SYSTEM:
         fails.append("verification 提示词应列明 qemu_precheck")
-    if "qemu_precheck" in RECON_SESSION_SYSTEM and "不可见" not in RECON_SESSION_SYSTEM:
-        fails.append("recon 提示词提及 qemu_precheck 时必须声明不可见")
+    if "qemu_execute" not in VERIFICATION_SESSION_SYSTEM:
+        fails.append("verification 提示词应列明 qemu_execute(票 16)")
+    if "qemu_execute" in RECON_SESSION_SYSTEM and "不可见" not in RECON_SESSION_SYSTEM:
+        fails.append("recon 提示词提及 qemu_execute 时必须声明不可见")
+    # 授权一致性:执行会话对 recon 不可见(与提示词口径一致)
+    if "qemu_execute" in tool_names_for_role("recon"):
+        fails.append("recon 不得看见 qemu_execute")
     return fails
 
 
@@ -659,11 +673,11 @@ def _load_pins() -> dict[str, str]:
 def _require_exec_image() -> str:
     from firmware_audit.docker.docker_utils import docker_available
 
-    image = _load_pins()["QEMU_EXEC_IMAGE"]
+    image = _load_pins()["QEMU_EXEC_V2_IMAGE"]
     if not docker_available(image):
         pytest.skip(
             f"Docker 或镜像 {image} 不可用(先运行 "
-            "firmware_audit/docker/qemu-exec/build_image.sh 构建)")
+            "firmware_audit/docker/qemu-exec-v2/build_image.sh 构建)")
     return image
 
 
@@ -729,7 +743,7 @@ def test_real_precheck_tgt6_nvram_template_blocker() -> None:
     assert "不判定" in tpl["detail"]
     joined = " ".join(d["limitations"])
     assert "子进程链" in joined
-    assert "受阻" in joined or "未定论" in joined
+    assert "以会话期实测为准" in joined or "受阻" in joined or "未定论" in joined
 
 
 def test_main() -> int:

@@ -19,7 +19,7 @@ from .store import StoreError
 
 # 声明为路径的参数统一反斜杠换算(Windows 习惯写入的参数不产生幽灵路径)。
 _PATH_ARGUMENTS = frozenset(("path", "file_ref", "directory", "target_dir",
-                             "firmware_root"))
+                             "firmware_root", "input_ref"))
 
 
 def normalize_tool_arguments(

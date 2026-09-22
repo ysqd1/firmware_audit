@@ -17,7 +17,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-# 执行镜像(票 03 产物;ENTRYPOINT 保持基座值,调用侧显式覆盖)
+# 执行镜像(票 16 产物;钉 tag 不漂移,与票 03 的 5.2 历史镜像完全独立)。
+# 镜像 = PRoot 5.4.0(+mixed_mode 继承补丁)+ QEMU 11.1.1 静态双架构 +
+# 形状隔离剥离(bookworm-slim digest 钉定),构建见 docker/qemu-exec-v2/。
+QEMU_EXEC_V2_IMAGE = "firm_audit/qemu-exec:p540q1111"
+
+# 历史镜像(票 03,QEMU 5.2/Debian 包)——仅作对照保留,产品工具不再使用。
 QEMU_EXEC_IMAGE = "firm_audit/qemu-exec:latest"
 
 # ELF e_machine 常量(首批矩阵只用到这两个)
@@ -76,13 +81,44 @@ class QemuArchProfile:
 # 首批架构矩阵(spec:ARM32 小端/uClibc 与 MIPS32 大端/musl 为目标)。
 # 矩阵外(含 MIPS 小端/ARM 大端/64 位)不在此列——预检记"不在首批矩阵",
 # 不据此宣称该架构永久不可行。
+# observed_notes 为票 16 组合验证(PRoot 5.4.0 + QEMU 11.1.1,2026-09-22)实测:
+# investigation/proot540-qemu1111-2026-09-22/logs/82-matrix.txt、90-mmpatch-verify.txt。
 QEMU_ARCH_MATRIX: dict[tuple[int, str, int], QemuArchProfile] = {
     (32, "little", EM_ARM): QemuArchProfile(
         key="arm32le", name="ARM32 little-endian", qemu_binary="qemu-arm-static",
-        observed_notes=("票 01/04 实测:target/6 顶层程序经 -L 前缀可运行;"
-                        "子进程链当前受阻,根因未定论")),
+        observed_notes=("票 16 组合实测(PRoot 5.4.0 + QEMU 11.1.1,2026-09-22):"
+                        "target/6 顶层与原 sh 派生链(动态/静态子)均真实进入仿真;"
+                        "实测不代表所有 ARM 程序可运行")),
     (32, "big", EM_MIPS): QemuArchProfile(
         key="mips32be", name="MIPS32 big-endian", qemu_binary="qemu-mips-static",
-        observed_notes=("票 01/04 实测:target/8 顶层程序经 -L 前缀可运行;"
-                        "子进程链需 QEMU_LD_PREFIX 环境适配(实测可行)")),
+        observed_notes=("票 16 组合实测(PRoot 5.4.0 + QEMU 11.1.1,2026-09-22):"
+                        "target/8 顶层与派生链、busybox env 直接派生均真实进入仿真"
+                        "(无需 QEMU_LD_PREFIX);实测不代表所有 MIPS 程序可运行")),
 }
+
+
+# ---- 会话预算(票 16:每 Investigation/Case 独立最多 3 个会话) ----
+
+QEMU_SESSION_SCHEMA_VERSION = 1
+DEFAULT_MAX_SESSIONS_PER_SCOPE = 3
+QEMU_MAX_SESSIONS_ENV = "STEP5_QEMU_MAX_SESSIONS"
+
+
+def resolve_max_sessions(env: dict[str, str] | None = None) -> int:
+    """同角色同归属的会话上限:默认 3(ADR-0013 由 4 收紧),env 层可覆盖。
+
+    缺失/非法/越界(≤0)回落默认——与 STEP5_*_MAX_ITERS 的 resolver 同口径;
+    正式 QEMU 预算块并入 RunBudget 分层解析由票 17 收口,本 resolver 只覆盖
+    会话名额这一个旋钮。
+    """
+    import os
+    raw = (env or os.environ).get(QEMU_MAX_SESSIONS_ENV)
+    if raw is None or not str(raw).strip():
+        return DEFAULT_MAX_SESSIONS_PER_SCOPE
+    try:
+        value = int(str(raw).strip())
+    except ValueError:
+        return DEFAULT_MAX_SESSIONS_PER_SCOPE
+    if value < 1:
+        return DEFAULT_MAX_SESSIONS_PER_SCOPE
+    return value

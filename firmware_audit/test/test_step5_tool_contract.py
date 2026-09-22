@@ -31,7 +31,7 @@ _CONTRACT_TOOLS = [
     "find_decompiled_function", "r2_list_functions", "r2_disassemble_function",
     "r2_xref_query", "ghidra_decompile", "checksec", "cve_bin_tool_scan",
     "semgrep_scan", "gitleaks_scan", "sandbox_verify", "qemu_precheck",
-    "binwalk_rescan",
+    "qemu_execute", "binwalk_rescan",
     "cve_lookup", "web_search",
 ]
 
@@ -274,6 +274,7 @@ def test_tools_declare_replay_policy() -> list[str]:
     expected["ghidra_decompile"] = policies.CACHE_VALIDATED
     expected["sandbox_verify"] = policies.NEVER
     expected["web_search"] = policies.NEVER
+    expected["qemu_execute"] = policies.NEVER  # 票 16:执行会话不可自动重放
     actual = {name: contract.replay_policy for name, contract in contracts.items()}
     if actual != expected:
         fails.append(f"现有工具 replay policy 审计结果漂移: {actual}")
@@ -300,6 +301,7 @@ def test_blind_discovery_role_contract() -> list[str]:
         "find_decompiled_function",
         "r2_list_functions", "r2_disassemble_function", "r2_xref_query",
         "ghidra_decompile", "sandbox_verify", "qemu_precheck",
+        "qemu_execute",
     }
     expected = {"recon": shallow, "analysis": deep, "verification": deep}
     with tempfile.TemporaryDirectory() as td:
