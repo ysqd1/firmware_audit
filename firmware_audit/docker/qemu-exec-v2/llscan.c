@@ -123,7 +123,7 @@ static int kill_one(pid_t pid, const char *exe) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: llscan count|scan|kill|watch <sec> <file>\n");
+        fprintf(stderr, "usage: llscan count|scan|kill|watch <sec> <file>|cat <file>\n");
         return 2;
     }
     if (strcmp(argv[1], "count") == 0) {

@@ -180,7 +180,7 @@ class QemuExecuteTool(AgentTool):
     # ---- 会话目录与台账 ----
 
     def _sessions_root(self) -> Path:
-        gen = getattr(self.ctx, "generation_dir", None)
+        gen = self.ctx.generation_dir
         base = gen if gen is not None else self.ctx.process_dir
         return Path(base) / "qemu_sessions"
 
@@ -210,13 +210,22 @@ class QemuExecuteTool(AgentTool):
              timeout_seconds: int = 60, use_strace: bool = True) -> ToolResult:
         started = time.monotonic()
         ledger = SessionLedger(self._sessions_root() / "ledger.json")
-        role = getattr(self, "role", None) or "analysis"
+        role = self.role or "analysis"
         limit = resolve_max_sessions()
 
         def finish(report: dict, ok: bool = True) -> ToolResult:
             report.setdefault("limitations", [_LIMIT_EVIDENCE, _LIMIT_SNAPSHOT,
                                               _LIMIT_SESSION])
             return ToolResult(ok=ok, text=_render_text(report), data=report)
+
+        def refuse(detail: str) -> ToolResult:
+            ledger.add("refusals", {"role": role,
+                                    "investigation_ref": investigation_ref,
+                                    "reason": "prep_blocked", "detail": detail})
+            report["result_class"] = QemuResultClass.PREP_BLOCKED.value
+            report["result_class_label"] = QemuResultClass.PREP_BLOCKED.label
+            report["detail"] = detail
+            return finish(report)
 
         report: dict = {"schema_version": 1, "tool": self.name,
                         "mode": "session_execute", "role": role,
@@ -240,38 +249,31 @@ class QemuExecuteTool(AgentTool):
         target = self._resolve_extracted(file_ref)
         root = self._resolve_extracted(firmware_root)
         if target is None or root is None:
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      "目标或固件根路径越界/非法(须为 extracted/ 内相对路径)")
+            return refuse("目标或固件根路径越界/非法(须为 extracted/ 内相对路径)")
         if not root.is_dir():
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      f"固件根不存在或不是目录: {root}")
+            return refuse(f"固件根不存在或不是目录: {root}")
         if not target.is_file():
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      f"目标不存在或不是常规文件: {target}")
+            return refuse(f"目标不存在或不是常规文件: {target}")
         try:
             target.relative_to(root)
         except ValueError:
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      "目标必须位于 firmware_root 内(guest 根即固件根)")
+            return refuse("目标必须位于 firmware_root 内(guest 根即固件根)")
         try:
             blob = target.read_bytes()
             elf = parse_elf_runtime(blob)
         except (OSError, ElfParseError) as exc:
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      f"ELF 解析失败: {exc}")
+            return refuse(f"ELF 解析失败: {exc}")
         profile: QemuArchProfile | None = QEMU_ARCH_MATRIX.get(
             (elf["bits"], elf["endianness"], elf["e_machine"]))
         if profile is None:
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      f"架构 ELF{elf['bits']} {elf['endianness']}-endian "
+            return refuse(f"架构 ELF{elf['bits']} {elf['endianness']}-endian "
                                       f"e_machine={elf['e_machine']} 不在首批矩阵")
 
         # 3) 声明输入固化(参数面;无 shell 参与)
         try:
             argv_list = shlex.split(args or "")
         except ValueError as exc:
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      f"args 引号解析失败(POSIX 规则): {exc}")
+            return refuse(f"args 引号解析失败(POSIX 规则): {exc}")
         declared_env = dict(_DEFAULT_GUEST_ENV)
         for line in (env or "").splitlines():
             line = line.strip()
@@ -279,13 +281,11 @@ class QemuExecuteTool(AgentTool):
                 continue
             key, sep, value = line.partition("=")
             if not sep or not key.strip():
-                return self._prep_refusal(ledger, role, investigation_ref, report,
-                                          f"env 行必须是 K=V: {line!r}")
+                return refuse(f"env 行必须是 K=V: {line!r}")
             declared_env[key.strip()] = value
         guest_cwd = (cwd or "/").strip() or "/"
         if not guest_cwd.startswith("/") or ".." in guest_cwd.split("/"):
-            return self._prep_refusal(ledger, role, investigation_ref, report,
-                                      f"cwd 必须是 guest 内绝对路径且不含 ..: {cwd!r}")
+            return refuse(f"cwd 必须是 guest 内绝对路径且不含 ..: {cwd!r}")
         timeout_clamped = max(1, min(int(timeout_seconds), 180))
         input_path: Path | None = None
         input_guest: str | None = None
@@ -293,8 +293,7 @@ class QemuExecuteTool(AgentTool):
         if input_ref.strip():
             input_path = self._resolve_extracted(input_ref)
             if input_path is None or not input_path.is_file():
-                return self._prep_refusal(ledger, role, investigation_ref, report,
-                                          f"input_ref 不存在或越界: {input_ref}")
+                return refuse(f"input_ref 不存在或越界: {input_ref}")
             try:
                 input_guest = "/" + input_path.relative_to(root).as_posix()
             except ValueError:
@@ -311,9 +310,9 @@ class QemuExecuteTool(AgentTool):
             return finish(report)
 
         digest_map = {"target": sha256_file(target)}
-        for rel in self._runtime_dependencies(root, elf):
-            abs_path = root / rel
-            digest_map[rel] = sha256_file(abs_path)
+        dep_rels, deps_truncated = self._runtime_dependencies(root, elf)
+        for rel in dep_rels:
+            digest_map[rel] = sha256_file(root / rel)
 
         # 5) 开启会话(干净容器;命名可追溯)
         seq = used + 1
@@ -361,6 +360,9 @@ class QemuExecuteTool(AgentTool):
             "backend": facility,
             "container": {"name": container_name, "id": container_id[:12]},
         }
+        if deps_truncated:
+            entry["dependencies_search_truncated"] = (
+                "固件根检索达上限后截断,依赖身份档案可能缺项(明示,不当缺失)")
         report["session_id"] = session_id
         # 占位记账先于执行:执行窗口内宿主客户端死亡也有名额记录与收割锚点
         # (容器名 fw-qemu-<session_id> 可按名收割;终态由 replace 回写)。
@@ -385,15 +387,17 @@ class QemuExecuteTool(AgentTool):
             proot_argv += ["-b", f"{_GUEST_INPUT}:{_GUEST_INPUT}"]
         proot_argv += ["-w", guest_cwd,
                        "/" + target.relative_to(root).as_posix()] + argv_list
-        exec_env = {"PROOT_TMP_DIR": _GUEST_STUB, **declared_env}
+        exec_env = {**declared_env, "PROOT_TMP_DIR": _GUEST_STUB}
         if use_strace:
             exec_env["QEMU_STRACE"] = "1"
+        exec_started = time.monotonic()
         rc, out, err = docker_exec(
             container_id, proot_argv, env=exec_env,
             timeout=timeout_clamped + _KILL_GRACE_SECONDS + _DOCKER_OVERHEAD_SECONDS)
-        elapsed = round(time.monotonic() - started, 3)
+        elapsed = round(time.monotonic() - exec_started, 3)
         # 宿主侧 docker 超时(客户端被杀,容器仍在)≠ guest 预算触发:
-        # 设施失败处理,不得伪装为目标的超时结果。
+        # 设施失败处理,不得伪装为目标的超时结果。计时从 exec 起点算,
+        # 不含建容器/哈希等准备耗时。
         if rc == 124 and elapsed >= (timeout_clamped + _KILL_GRACE_SECONDS
                                      + _DOCKER_OVERHEAD_SECONDS - 1):
             docker_rm(container_name, timeout=60)
@@ -472,28 +476,25 @@ class QemuExecuteTool(AgentTool):
 
     # ---- 分步辅助 ----
 
-    def _prep_refusal(self, ledger: SessionLedger, role: str,
-                      investigation_ref: str, report: dict, detail: str) -> ToolResult:
-        ledger.add("refusals", {"role": role, "investigation_ref": investigation_ref,
-                                "reason": "prep_blocked", "detail": detail})
-        report["result_class"] = QemuResultClass.PREP_BLOCKED.value
-        report["result_class_label"] = QemuResultClass.PREP_BLOCKED.label
-        report["detail"] = detail
-        return ToolResult(ok=True, text=_render_text(report), data=report)
-
     @staticmethod
-    def _runtime_dependencies(root: Path, elf: dict) -> list[str]:
-        """解释器 + NEEDED 库在固件根内的相对路径(身份档案用,不阻塞)。"""
+    def _runtime_dependencies(root: Path, elf: dict) -> tuple[list[str], bool]:
+        """解释器 + NEEDED 库在固件根内的相对路径(身份档案用,不阻塞)。
+
+        返回 (相对路径列表, 检索是否截断);截断由调用方写入台账条目,
+        不得静默当缺失(find_in_root 红线)。
+        """
         rels: list[str] = []
+        truncated = False
         if elf.get("interp"):
             rel = elf["interp"].lstrip("/")
             if (root / rel).is_file():
                 rels.append(rel)
         for lib in elf.get("needed") or []:
-            hit, _trunc = find_in_root(root, lib.split("/")[-1])
+            hit, trunc = find_in_root(root, lib.split("/")[-1])
+            truncated = truncated or trunc
             if hit is not None:
                 rels.append(hit)
-        return rels
+        return rels, truncated
 
     @staticmethod
     def _reap_and_verify(container_id: str) -> dict:
@@ -523,7 +524,8 @@ class QemuExecuteTool(AgentTool):
             return (QemuResultClass.FACILITY_FAILURE.value,
                     QemuResultClass.FACILITY_FAILURE.label,
                     (err or "").strip()[:300] or "docker exec 失败")
-        proot_fatal = ("proot error" in (err or "")) or ("fatal error" in (err or ""))
+        proot_fatal = ("proot error" in (err or "")
+                       and "fatal error: see `proot --help`" in (err or ""))
         if proot_fatal and not out.strip():
             return (QemuResultClass.PREP_BLOCKED.value,
                     QemuResultClass.PREP_BLOCKED.label,

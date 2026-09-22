@@ -3,7 +3,7 @@
 # 覆盖:版本/身份可查询、形状隔离(无 sh/dash)、ARM32 LE 与 MIPS32 BE
 # 真实固件样本在 proot+qemu 下执行、补丁拒绝面在镜像内成立。
 # 用法: run_smoke.sh(可 TGT6_SQUASH/TGT8_SQUASH 覆盖样本根)
-set -u
+set -u -o pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$DIR/pins.env"
@@ -41,8 +41,9 @@ echo "== 2 形状隔离(剥离后无 shell/常规工具;以 docker 错误为证)
 dash_probe=$(docker run --rm --network none --entrypoint /usr/bin/test "$IMG" -e /usr/bin/dash 2>&1); rc=$?
 # test 已被剥离 → 容器内无 test 可执行即证明剥离生效;dash 不存在由工具测试覆盖
 check "镜像内无 test(dash/uname 等同批剥离)" 127 $rc "$dash_probe" "no such file"
-lsout=$(docker run --rm --network none --entrypoint /usr/local/bin/llscan "$IMG" count)
-check "llscan 可执行(匹配 0 进程)" 0 0 "$lsout" "^0$"
+docker run --rm --network none --entrypoint /usr/local/bin/llscan "$IMG" count > /tmp/llscan-count.txt 2>&1
+lrc=$?; lsout=$(cat /tmp/llscan-count.txt); rm -f /tmp/llscan-count.txt
+check "llscan 可执行(匹配 0 进程)" 0 $lrc "$lsout" "^0$"
 
 echo "== 3 ARM32 LE 真实样本(target/6 nvram,proot+qemu 显式) =="
 S=$(mktemp -d)

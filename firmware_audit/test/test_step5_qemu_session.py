@@ -46,13 +46,16 @@ TGT8_SQUASH = (REPO_ROOT / "target/8/process/extracted/"
 class FakeDocker:
     """会话原语替身:记录调用并按脚本回放;零真实容器。"""
 
+    DEFAULT_LABELS = {"fw.qemu.version": "11.1.1", "fw.proot.version": "5.4.0"}
+    _UNSET = object()
+
     def __init__(self, *, exec_script: list[tuple[int, str, str]] | None = None,
-                 labels: dict | None = {"fw.qemu.version": "11.1.1",
-                                        "fw.proot.version": "5.4.0"},
+                 labels=_UNSET,
                  count_queue: list[str] | None = None):
         self.calls: list[tuple[str, ...]] = []
         self.exec_results = list(exec_script or [])
-        self.labels = labels
+        # labels=None 表示镜像不可用(image_labels 返回 None);缺省 = 可用档案
+        self.labels = self.DEFAULT_LABELS if labels is self._UNSET else labels
         self.count_queue = list(count_queue or [])
         self.removed: list[str] = []
         self.detached: list[list[str]] = []
@@ -177,13 +180,8 @@ def test_registry_authorization() -> None:
     assert "qemu_execute" not in tool_names_for_role("recon")
     assert "qemu_execute" in tool_names_for_role("analysis")
     assert "qemu_execute" in tool_names_for_role("verification")
-    try:
-        make_tools(ToolContext(process_dir=Path("/tmp")), role="recon")
-    except Exception:
-        pass  # make_tools 对 recon 只是不构造
+    from firmware_audit.step5_agent.providers.tools import authorize_tool
     with pytest.raises(ToolAuthorizationError):
-        qs  # noqa: B018 — 占位保持 import 语义
-        from firmware_audit.step5_agent.providers.tools import authorize_tool
         authorize_tool("recon", "qemu_execute")
 
 
@@ -463,6 +461,9 @@ def test_real_timeout_classification(tmp_path: Path, monkeypatch) -> None:
     d = r.data
     assert d["result_class"] == "timeout", d
     assert d["sealed"] is True
+    # 链存活期越过观察点(t+2s):快照应捕获 tracer/桩,短命子进程缺项由 note 明示
+    assert d["chain"]["snapshot"], "存活链的 /proc 快照不应为空"
+    assert "短命子进程" in d["chain"]["snapshot_note"]
 
 
 def test_real_mips_non_shell_parent(tmp_path: Path, monkeypatch) -> None:

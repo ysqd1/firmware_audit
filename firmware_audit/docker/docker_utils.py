@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -209,7 +210,6 @@ def docker_image_labels(image: str) -> dict[str, str] | None:
          _ensure_tag(image)], 30)
     if rc != 0:
         return None
-    import json
     try:
         labels = json.loads(out.strip() or "{}")
     except ValueError:

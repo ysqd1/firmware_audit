@@ -164,6 +164,13 @@ def test_image_build_info_readable(image: str) -> None:
         subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
     for needle in (b"qemu=11.1.1", b"proot=5.4.0", b"proot-patch-sha256=", b"base="):
         assert needle in info, info
+    # LABEL ↔ BUILD-INFO 同源(防两处身份档案漂移)
+    from firmware_audit.docker.docker_utils import docker_image_labels
+    labels = docker_image_labels(image)
+    assert labels and labels.get("fw.qemu.version") == "11.1.1"
+    assert labels.get("fw.proot.version") == "5.4.0"
+    assert labels.get("fw.proot.patch.sha256", "") in info.decode("utf-8", "replace")
+    assert labels.get("fw.qemu.tarball.sha256", "") in info.decode("utf-8", "replace")
 
 
 def test_image_stripped_shape(image: str) -> None:
