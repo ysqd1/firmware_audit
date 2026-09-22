@@ -434,6 +434,7 @@ class QemuExecuteTool(AgentTool):
                 return refuse("firmware_root 与会话开启时不一致;"
                               "会话容器的 guest 根在开启时已固化")
             entry = existing
+            report["session_id"] = session_id
             session_dir = sessions_root / session_id
         else:
             limit = resolve_max_sessions()

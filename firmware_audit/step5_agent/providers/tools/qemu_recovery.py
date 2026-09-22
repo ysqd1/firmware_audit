@@ -77,8 +77,8 @@ def _dispose_sessions(base: Path, *, kind: str, interrupted: bool) -> dict:
     ``interrupted`` 决定 running 会话的去向(True=恢复收割/中断收口,会话
     标 interrupted 并写 recovery 记录;False=调查终态封存,确认即 sealed、
     未确认留 seal_failed,不写 recovery 记录)。interrupted 会话的清理不
-    确定重试不改变死亡标记(status/seal_kind/sealed_at 首判),只刷新
-    cleanup/sealed。返回 ``{"sealed": [...], "failed": [...],
+    确定重试不改变死亡判定(status/seal_kind/recovery 记录),只把
+    cleanup/sealed/sealed_at 刷新为最近一次处置的事实。返回 ``{"sealed": [...], "failed": [...],
     "unreadable": str|None}``;failed 收集拆除未确认或台账回写失败的会话。
     """
     report: dict = {"sealed": [], "failed": [], "unreadable": None}
@@ -127,8 +127,9 @@ def _dispose_sessions(base: Path, *, kind: str, interrupted: bool) -> dict:
             entry["status"] = "sealed" if confirmed else "seal_failed"
             entry["seal_kind"] = kind
         else:
-            # interrupted 的清理不确定重试:死亡标记(status/seal_kind/
-            # sealed_at 首判)不动,sealed/cleanup 刷新为最近一次处置事实
+            # interrupted 的清理不确定重试:死亡判定(status/seal_kind 与
+            # recovery 记录)不动;sealed_at/cleanup/sealed 刷新为最近一次
+            # 处置的事实
             entry["status"] = previous_status
         try:
             ledger.replace(session_id, entry)
