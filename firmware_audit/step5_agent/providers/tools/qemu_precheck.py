@@ -21,10 +21,11 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from ....docker.docker_utils import docker_available, docker_image_labels, run_docker
+from ....docker.docker_utils import docker_available, docker_image_identity, run_docker
 from .base import AgentTool, ToolResult, resolve_within
 from .cli_base import extracted_root
 from .qemu_base import (
+    QEMU_EXECVEAT_PATCH_SHA256,
     QEMU_EXEC_IMAGE,
     QEMU_EXEC_V2_IMAGE,
     QEMU_ARCH_MATRIX,
@@ -214,13 +215,25 @@ class QemuPrecheckTool(AgentTool):
 
         命令按 AGENTS.md 踩坑纪律用纯字符串拼接(禁 .format/f-string)。
         """
-        labels = docker_image_labels(QEMU_EXEC_V2_IMAGE)
-        if labels is None:
+        identity = docker_image_identity(QEMU_EXEC_V2_IMAGE)
+        labels = identity["labels"] if identity is not None else None
+        if identity is None or labels is None:
             return {"image": QEMU_EXEC_V2_IMAGE, "available": False,
                     "qemu_binary": qemu_binary, "version": None,
                     "detail": (f"镜像 {QEMU_EXEC_V2_IMAGE} 不可用"
                                "(先运行 docker/qemu-exec-v2/build_image.sh;"
                                f"历史镜像 {QEMU_EXEC_IMAGE} 仅作 5.2 对照)")}
+        execveat_patch = labels.get("fw.proot.execveat.patch.sha256")
+        if execveat_patch != QEMU_EXECVEAT_PATCH_SHA256:
+            return {"image": QEMU_EXEC_V2_IMAGE,
+                    "image_id": identity["image_id"],
+                    "available": False,
+                    "qemu_binary": qemu_binary, "version": None,
+                    "proot_version": labels.get("fw.proot.version"),
+                    "proot_patch_sha256": labels.get("fw.proot.patch.sha256"),
+                    "proot_execveat_patch_sha256": execveat_patch,
+                    "detail": ("镜像缺少已验收的 PRoot raw execveat deny 补丁"
+                               f"(期望 {QEMU_EXECVEAT_PATCH_SHA256[:12]})")}
         if not docker_available(QEMU_EXEC_V2_IMAGE):
             return {"image": QEMU_EXEC_V2_IMAGE, "available": False,
                     "qemu_binary": qemu_binary, "version": None,
@@ -234,11 +247,13 @@ class QemuPrecheckTool(AgentTool):
         available = rc == 0 and "version" in version
         detail = version or (err or "").strip()[:200]
         return {"image": QEMU_EXEC_V2_IMAGE,
+                "image_id": identity["image_id"],
                 "available": available,
                 "qemu_binary": qemu_binary,
                 "version": version if available else None,
                 "proot_version": labels.get("fw.proot.version"),
                 "proot_patch_sha256": labels.get("fw.proot.patch.sha256"),
+                "proot_execveat_patch_sha256": labels.get("fw.proot.execveat.patch.sha256"),
                 "qemu_tarball_sha256": labels.get("fw.qemu.tarball.sha256"),
                 "base_digest": labels.get("fw.base.digest"),
                 "boundary": labels.get("fw.boundary"),
@@ -275,6 +290,7 @@ class QemuPrecheckTool(AgentTool):
         def finish(report: dict) -> ToolResult:
             report["blockers"] = blockers
             report["limitations"] = [_LIMIT_NO_EXEC, _LIMIT_CHAIN, _LIMIT_MATRIX]
+            report["execution_gate"] = {"allowed": True, "reason": None}
             rank = {QemuResultClass.FACILITY_FAILURE: 0,
                     QemuResultClass.PREP_BLOCKED: 1,
                     QemuResultClass.DEPENDENCY_BLOCKED: 2}

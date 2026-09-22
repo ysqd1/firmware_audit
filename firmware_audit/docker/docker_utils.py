@@ -5,8 +5,49 @@
 from __future__ import annotations
 
 import json
+import os
+import selectors
 import subprocess
+import time
 from pathlib import Path
+
+
+_DEFAULT_SESSION_PIDS_LIMIT = 128
+_DEFAULT_MAX_OUTPUT_BYTES = 1 << 20
+_OUTPUT_READ_CHUNK = 64 << 10
+_PIPE_DRAIN_SECONDS = 1.0
+
+
+def _decode_bounded_output(
+    payload: bytes, truncated: bool, stream_name: str, limit: int,
+    incomplete: bool = False,
+) -> str:
+    """Decode retained child output and make truncation visible to callers."""
+    text = payload.decode("utf-8", errors="replace")
+    if truncated:
+        text += (f"\n...[{stream_name} output truncated after {limit} bytes; "
+                 "the child was drained to avoid blocking]...\n")
+    if incomplete:
+        text += (f"\n...[{stream_name} output incomplete: pipe did not close "
+                 "within the drain deadline]...\n")
+    return text
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+    """Kill and reap a child, including when the caller is being interrupted."""
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=1)
+    except BaseException:
+        # A second wait handles a test seam or platform that interrupts the first
+        # wait; failure to reap is still bounded and the original exception wins.
+        try:
+            proc.wait(timeout=1)
+        except BaseException:
+            pass
 
 
 def to_docker_path(host_path: Path | str) -> str:
@@ -130,21 +171,124 @@ def docker_available(image: str) -> bool:
 # run_docker 只覆盖"一次性 docker run --rm"形态;会话容器需要 -d 常驻 +
 # 显式命名 + 逐条 docker exec + 终态 rm -f,原语在此收口,工具层不拼 docker 命令。
 
-def _run_docker_cmd(cmd: list[str], timeout: int) -> tuple[int, str, str]:
+def _run_docker_cmd(
+    cmd: list[str], timeout: float, *, max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES
+) -> tuple[int, str, str]:
+    """Run a Docker CLI command with bounded, concurrently drained output."""
+    if (not isinstance(max_output_bytes, int)
+            or isinstance(max_output_bytes, bool)
+            or max_output_bytes < 1):
+        return 125, "", "invalid max_output_bytes: expected a positive integer"
+    proc = None
+    selector = None
+    streams: dict[str, dict[str, object]] = {}
+    timed_out = False
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        return proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired:
-        return 124, "", f"docker timed out after {timeout}s: {' '.join(cmd[:4])}..."
+        selector = selectors.DefaultSelector()
+        for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            if stream is not None:
+                selector.register(stream, selectors.EVENT_READ, name)
+                streams[name] = {
+                    "bytes": bytearray(), "truncated": False, "incomplete": False,
+                }
+
+        try:
+            proc.wait(timeout=0)
+        except subprocess.TimeoutExpired:
+            pass
+        deadline = time.monotonic() + timeout
+        drain_deadline: float | None = None
+        while selector.get_map() or proc.poll() is None:
+            now = time.monotonic()
+            returncode = proc.poll()
+            if returncode is None:
+                if now >= deadline:
+                    timed_out = True
+                    _stop_process(proc)
+                    returncode = proc.poll()
+                    drain_deadline = now + _PIPE_DRAIN_SECONDS
+                wait_until = deadline if not timed_out else drain_deadline
+            else:
+                if drain_deadline is None:
+                    drain_deadline = now + _PIPE_DRAIN_SECONDS
+                wait_until = drain_deadline
+            if wait_until is None or now >= wait_until:
+                for key in selector.get_map().values():
+                    streams[key.data]["incomplete"] = True
+                break
+            wait_for = min(0.05, wait_until - now)
+            if selector.get_map():
+                events = selector.select(wait_for)
+                for key, _ in events:
+                    name = key.data
+                    try:
+                        chunk = os.read(key.fd, _OUTPUT_READ_CHUNK)
+                    except (BlockingIOError, InterruptedError):
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                        continue
+                    state = streams[name]
+                    kept = state["bytes"]
+                    remaining = max_output_bytes - len(kept)
+                    if remaining > 0:
+                        kept.extend(chunk[:remaining])
+                    if len(chunk) > max(remaining, 0):
+                        state["truncated"] = True
+            else:
+                time.sleep(wait_for)
+
+        if proc.poll() is None:
+            _stop_process(proc)
+        returncode = proc.poll()
+        if returncode is None:
+            returncode = 124 if timed_out else 125
+        stdout_state = streams.get(
+            "stdout", {"bytes": b"", "truncated": False, "incomplete": False}
+        )
+        stderr_state = streams.get(
+            "stderr", {"bytes": b"", "truncated": False, "incomplete": False}
+        )
+        stdout = _decode_bounded_output(
+            bytes(stdout_state["bytes"]), stdout_state["truncated"],
+            "stdout", max_output_bytes, stdout_state["incomplete"]
+        )
+        stderr = _decode_bounded_output(
+            bytes(stderr_state["bytes"]), stderr_state["truncated"],
+            "stderr", max_output_bytes, stderr_state["incomplete"]
+        )
+        if timed_out:
+            stderr += f"\ndocker timed out after {timeout}s"
+            return 124, stdout, stderr
+        return returncode, stdout, stderr
     except OSError as exc:
+        if proc is not None:
+            _stop_process(proc)
         return 125, "", f"docker invocation failed: {exc}"
+    except BaseException:
+        if proc is not None:
+            _stop_process(proc)
+        raise
+    finally:
+        if selector is not None:
+            for key in list(selector.get_map().values()):
+                try:
+                    selector.unregister(key.fileobj)
+                except (KeyError, ValueError):
+                    pass
+                try:
+                    key.fileobj.close()
+                except OSError:
+                    pass
+            selector.close()
 
 
 def docker_run_detached(
@@ -159,11 +303,17 @@ def docker_run_detached(
     read_only: bool = False,
     init: bool = True,
     timeout: int = 120,
+    pids_limit: int = _DEFAULT_SESSION_PIDS_LIMIT,
 ) -> tuple[int, str, str]:
     """`docker run -d --rm --name <name>`:会话容器(stdout=容器 ID)。"""
+    if (not isinstance(pids_limit, int)
+            or isinstance(pids_limit, bool)
+            or pids_limit < 1):
+        raise ValueError("pids_limit must be a positive integer")
     cmd = ["docker", "run", "-d", "--rm", "--name", name]
     if init:
         cmd.append("--init")
+    cmd += ["--pids-limit", str(pids_limit)]
     if entrypoint:
         cmd += ["--entrypoint", entrypoint]
     if network:
@@ -186,8 +336,13 @@ def docker_exec(
     env: dict[str, str] | None = None,
     detach: bool = False,
     timeout: int = 300,
+    max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
 ) -> tuple[int, str, str]:
-    """`docker exec [-d] [-e K=V...] <container> <args>`:直接 argv,不经 shell。"""
+    """`docker exec [-d] [-e K=V...] <container> <args>`:直接 argv,不经 shell。
+
+    stdout/stderr are drained concurrently and retained only up to
+    ``max_output_bytes`` per stream; excess output is reported with a marker.
+    """
     cmd = ["docker", "exec"]
     if detach:
         cmd.append("-d")
@@ -195,7 +350,7 @@ def docker_exec(
         cmd += ["-e", f"{k}={v}"]
     cmd.append(container)
     cmd += args
-    return _run_docker_cmd(cmd, timeout)
+    return _run_docker_cmd(cmd, timeout, max_output_bytes=max_output_bytes)
 
 
 def docker_rm(container: str, *, timeout: int = 60) -> tuple[int, str, str]:
@@ -215,3 +370,22 @@ def docker_image_labels(image: str) -> dict[str, str] | None:
     except ValueError:
         return None
     return labels if isinstance(labels, dict) else None
+
+
+def docker_image_identity(image: str) -> dict | None:
+    """Read immutable image ID and its labels together; execution uses this ID."""
+    rc, out, _ = _run_docker_cmd(
+        ["docker", "image", "inspect", _ensure_tag(image)], 30)
+    if rc != 0:
+        return None
+    try:
+        item = json.loads(out)[0]
+        image_id = item["Id"]
+        labels = item["Config"].get("Labels") or {}
+        if not isinstance(image_id, str) or not image_id.startswith("sha256:"):
+            return None
+        if not isinstance(labels, dict):
+            return None
+        return {"image_id": image_id, "labels": labels}
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None

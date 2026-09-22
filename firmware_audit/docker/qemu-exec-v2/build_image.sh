@@ -30,10 +30,12 @@ echo "$QEMU_TARBALL_SHA256  $SRC_CACHE/$QEMU_FILE" | sha256sum -c -
 # proot 钉值副本入库(上游 auto-archive 非字节稳定,见 pins.env),同样强校验
 echo "$PROOT_TARBALL_SHA256  $DIR/$PROOT_TARBALL" | sha256sum -c -
 echo "$PROOT_PATCH_SHA256  $DIR/$PROOT_PATCH" | sha256sum -c -
+echo "$PROOT_EXECVEAT_PATCH_SHA256  $DIR/$PROOT_EXECVEAT_PATCH" | sha256sum -c -
 
 CTX=$(mktemp -d)
 trap 'rm -rf "$CTX"' EXIT
-cp "$DIR/Dockerfile" "$DIR/llscan.c" "$DIR/$PROOT_PATCH" "$DIR/$PROOT_TARBALL" "$CTX/"
+cp "$DIR/Dockerfile" "$DIR/llscan.c" "$DIR/$PROOT_PATCH" \
+   "$DIR/$PROOT_EXECVEAT_PATCH" "$DIR/$PROOT_TARBALL" "$CTX/"
 ln "$SRC_CACHE/$QEMU_FILE" "$CTX/$QEMU_FILE"
 
 echo "[build] docker build($QEMU_EXEC_V2_IMAGE;QEMU 静态构建约 10-25 分钟)"

@@ -1,0 +1,46 @@
+--- a/src/syscall/enter.c
++++ b/src/syscall/enter.c
+@@ -125,6 +125,13 @@
+ 		status = translate_execve_enter(tracee);
+ 		break;
+ 
++	case PR_execveat:
++		/* QEMU user-mode exposes guest raw execveat as host x86_64
++		 * execveat. Deny it before host path resolution can escape
++		 * the guest boundary; this build does not rewrite it. */
++		status = tracee->qemu != NULL ? -EACCES : 0;
++		break;
++
+ 	case PR_ptrace:
+ 		status = translate_ptrace_enter(tracee);
+ 		break;
+--- a/src/syscall/sysnums-x86_64.h
++++ b/src/syscall/sysnums-x86_64.h
+@@ -61,6 +61,7 @@
+ 	[ 57 ] = PR_fork,
+ 	[ 58 ] = PR_vfork,
+ 	[ 59 ] = PR_execve,
++	[ 322 ] = PR_execveat,
+ 	[ 60 ] = PR_exit,
+ 	[ 61 ] = PR_wait4,
+ 	[ 62 ] = PR_kill,
+--- a/src/syscall/sysnums.list
++++ b/src/syscall/sysnums.list
+@@ -56,6 +56,7 @@
+ SYSNUM(eventfd)
+ SYSNUM(eventfd2)
+ SYSNUM(execve)
++SYSNUM(execveat)
+ SYSNUM(exit)
+ SYSNUM(exit_group)
+ SYSNUM(faccessat)
+--- a/src/syscall/seccomp.c
++++ b/src/syscall/seccomp.c
+@@ -343,6 +343,7 @@
+ 	{ PR_connect,		0 },
+ 	{ PR_creat,		0 },
+ 	{ PR_execve,		FILTER_SYSEXIT },
++	{ PR_execveat,		FILTER_SYSEXIT },
+ 	{ PR_faccessat,		0 },
+ 	{ PR_fchdir,		FILTER_SYSEXIT },
+ 	{ PR_fchmodat,		0 },

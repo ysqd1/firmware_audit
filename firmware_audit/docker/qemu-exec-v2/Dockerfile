@@ -24,16 +24,19 @@ RUN /src/configure --static --prefix=/usr/local \
     && ninja -j"$(nproc)" \
     && ninja install
 
-# ---- 阶段 2:PRoot 5.4.0 源码构建(上游 tag + mixed_mode 继承补丁)+ llscan ----
+# ---- 阶段 2:PRoot 5.4.0 源码构建(继承 + QEMU raw execveat deny 补丁)+ llscan ----
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS toolsbuild
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       build-essential libtalloc-dev patch && rm -rf /var/lib/apt/lists/*
 COPY proot-5.4.0.tar.gz /tmp/proot.tar.gz
 COPY proot-mixed-mode-inherit.patch /tmp/proot-mixed-mode.patch
+COPY proot-execveat-deny.patch /tmp/proot-execveat.patch
 RUN echo "29248aac2a7ce10c3bd5ee5602742ec33b2532310ff9cf73b79f3c133e5a5f68  /tmp/proot.tar.gz" | sha256sum -c - \
     && echo "d55abd0d8c0adb86d8a264368664fb4fbf0ea8273a27681119295bd126f41cdd  /tmp/proot-mixed-mode.patch" | sha256sum -c - \
+    && echo "d361d4b28c75029e89892a5283efcdddb99a89a0d752372b91bf07b1c98dae2e  /tmp/proot-execveat.patch" | sha256sum -c - \
     && cd /tmp && tar xzf proot.tar.gz && cd proot-5.4.0 \
     && patch -p1 --forward < /tmp/proot-mixed-mode.patch \
+    && patch -p1 --forward < /tmp/proot-execveat.patch \
     && cd src && make -j"$(nproc)" && make install PREFIX=/usr/local
 COPY llscan.c /tmp/llscan.c
 RUN gcc -O2 -Wall -o /usr/local/bin/llscan /tmp/llscan.c
@@ -45,9 +48,10 @@ LABEL fw.qemu.version="11.1.1" \
       fw.proot.version="5.4.0" \
       fw.proot.tarball.sha256="29248aac2a7ce10c3bd5ee5602742ec33b2532310ff9cf73b79f3c133e5a5f68" \
       fw.proot.patch.sha256="d55abd0d8c0adb86d8a264368664fb4fbf0ea8273a27681119295bd126f41cdd" \
+      fw.proot.execveat.patch.sha256="d361d4b28c75029e89892a5283efcdddb99a89a0d752372b91bf07b1c98dae2e" \
       fw.qemu.build.params="--static --target-list=arm-linux-user,mips-linux-user --disable-system --disable-tools --disable-docs" \
       fw.base.digest="sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251" \
-      fw.boundary="proot-mixed-mode-inherit+strip(deny-by-absence)" \
+      fw.boundary="proot-mixed-mode-inherit+raw-execveat-deny+strip(deny-by-absence)" \
       org.opencontainers.image.title="firm_audit qemu-exec p540q1111"
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       libtalloc2 && rm -rf /var/lib/apt/lists/*
@@ -55,7 +59,7 @@ COPY --from=qemubuild /usr/local/bin/qemu-arm /usr/local/bin/qemu-arm-static
 COPY --from=qemubuild /usr/local/bin/qemu-mips /usr/local/bin/qemu-mips-static
 COPY --from=toolsbuild /usr/local/bin/proot /usr/local/bin/proot
 COPY --from=toolsbuild /usr/local/bin/llscan /usr/local/bin/llscan
-RUN printf 'image=firm_audit/qemu-exec:p540q1111\nproot=5.4.0-upstream-v5.4.0-tag+mixed-mode-inherit-patch\nproot-tarball-sha256=29248aac2a7ce10c3bd5ee5602742ec33b2532310ff9cf73b79f3c133e5a5f68\nproot-patch-sha256=d55abd0d8c0adb86d8a264368664fb4fbf0ea8273a27681119295bd126f41cdd\nqemu=11.1.1-official-tarball-static\nqemu-tarball-sha256=079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482\nqemu-build-params=--static --target-list=arm-linux-user,mips-linux-user --disable-system --disable-tools --disable-docs\nbase=debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251\nboundary=proot-mixed-mode-inherit+strip(deny-by-absence)\n' \
+RUN printf 'image=firm_audit/qemu-exec:p540q1111\nproot=5.4.0-upstream-v5.4.0-tag+mixed-mode-inherit+raw-execveat-deny\nproot-tarball-sha256=29248aac2a7ce10c3bd5ee5602742ec33b2532310ff9cf73b79f3c133e5a5f68\nproot-patch-sha256=d55abd0d8c0adb86d8a264368664fb4fbf0ea8273a27681119295bd126f41cdd\nproot-execveat-patch-sha256=d361d4b28c75029e89892a5283efcdddb99a89a0d752372b91bf07b1c98dae2e\nqemu=11.1.1-official-tarball-static\nqemu-tarball-sha256=079ffbff8a7111bbc89022107cbabf3bbfd614d5fc9d7cc675991196aca12482\nqemu-build-params=--static --target-list=arm-linux-user,mips-linux-user --disable-system --disable-tools --disable-docs\nbase=debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251\nboundary=proot-mixed-mode-inherit+raw-execveat-deny+strip(deny-by-absence)\n' \
        > /usr/local/share/BUILD-INFO.txt && chmod 0444 /usr/local/share/BUILD-INFO.txt
 # 形状隔离剥离必须单独成层且放在最后:本层内不再 exec 任何外部命令
 # (前一层已删过一次 127 的教训);尾斜杠穿透 usrmerge 符号链接。

@@ -22,6 +22,12 @@ from enum import Enum
 # 形状隔离剥离(bookworm-slim digest 钉定),构建见 docker/qemu-exec-v2/。
 QEMU_EXEC_V2_IMAGE = "firm_audit/qemu-exec:p540q1111"
 
+# 正式镜像的 raw execveat deny 补丁身份。会话/预检拒绝缺失或漂移的镜像，
+# 但不再以永久字符串闸阻断已完成验收的后端。
+QEMU_EXECVEAT_PATCH_SHA256 = (
+    "d361d4b28c75029e89892a5283efcdddb99a89a0d752372b91bf07b1c98dae2e"
+)
+
 # 历史镜像(票 03,QEMU 5.2/Debian 包)——仅作对照保留,产品工具不再使用。
 QEMU_EXEC_IMAGE = "firm_audit/qemu-exec:latest"
 
@@ -112,7 +118,7 @@ def resolve_max_sessions(env: dict[str, str] | None = None) -> int:
     会话名额这一个旋钮。
     """
     import os
-    raw = (env or os.environ).get(QEMU_MAX_SESSIONS_ENV)
+    raw = (os.environ if env is None else env).get(QEMU_MAX_SESSIONS_ENV)
     if raw is None or not str(raw).strip():
         return DEFAULT_MAX_SESSIONS_PER_SCOPE
     try:
@@ -121,4 +127,4 @@ def resolve_max_sessions(env: dict[str, str] | None = None) -> int:
         return DEFAULT_MAX_SESSIONS_PER_SCOPE
     if value < 1:
         return DEFAULT_MAX_SESSIONS_PER_SCOPE
-    return value
+    return min(value, DEFAULT_MAX_SESSIONS_PER_SCOPE)

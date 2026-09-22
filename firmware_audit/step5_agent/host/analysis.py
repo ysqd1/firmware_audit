@@ -584,7 +584,9 @@ class HostAnalysisTracer:
                                 investigation.tool_attempts += 1
                                 self._budget.record_tool_execution()
                                 self._checkpoint(candidate_id, kind)
-                                result = execute_tool(tool, arguments, method=execute_method)
+                                result = execute_tool(
+                                    tool, arguments, method=execute_method,
+                                    investigation_ref=investigation.investigation_id, budget=self._budget)
                             recovered = self._evidence_store.record(
                                 slot, candidate_id=candidate_id,
                                 investigation_id=investigation.investigation_id,

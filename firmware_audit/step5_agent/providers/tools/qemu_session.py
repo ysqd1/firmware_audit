@@ -9,8 +9,8 @@
 - 隔离边界是 Docker:断网、固件根只读挂载、只读容器根、独立可写运行目录、
   不挂 docker socket/其他 target;/host-rootfs 逃逸面由 proot --mixed-mode
   继承补丁(guest 派生树内原生 x86 ELF 的 execve 一律改写经 qemu 路由 → 架构
-  不符 → 拒绝)+ 镜像剥离(deny-by-absence)双重封死,实测覆盖路径规范化、
-  符号链接、植入 ELF 与 exec 系统调用变体(90-mmpatch-verify.txt)。
+  不符 → 拒绝)+ raw execveat deny 补丁(QEMU tracee 早期返回 EACCES)+
+  镜像剥离；正式镜像身份必须带已验收的补丁摘要。
 - 每会话执行命令以容器内 timeout -k 包裹(默认 60s,硬上限 180s);清理验证
   用镜像内 llscan(/proc 扫描),升级清理(连进程组 SIGKILL)后仍有残留则
   拆容器;客户端退出不等于清理完成(N4:客户端死后链仍存活)。
@@ -33,11 +33,12 @@ import os
 import re
 import shlex
 import time
+import uuid
 from pathlib import Path
 
 from ....docker.docker_utils import (
     docker_exec,
-    docker_image_labels,
+    docker_image_identity,
     docker_rm,
     docker_run_detached,
 )
@@ -45,6 +46,7 @@ from .base import AgentTool, ToolContext, ToolResult, resolve_within
 from .cli_base import extracted_root
 from .qemu_base import (
     QEMU_EXEC_V2_IMAGE,
+    QEMU_EXECVEAT_PATCH_SHA256,
     QEMU_ARCH_MATRIX,
     QemuArchProfile,
     QemuResultClass,
@@ -66,6 +68,7 @@ _DEFAULT_GUEST_ENV = {"PATH": "/bin:/sbin:/usr/bin:/usr/sbin"}
 _KILL_GRACE_SECONDS = 5
 _DOCKER_OVERHEAD_SECONDS = 30
 _OUTPUT_EXCERPT_CHARS = 6000
+
 
 # 台账/报告固定限制句(措辞是 ADR-0012/0013 纪律落点,不得改写为能力宣称)
 _LIMIT_EVIDENCE = ("动态执行 Observation 只是 Evidence:正常退出、崩溃、超时或"
@@ -157,6 +160,8 @@ class QemuExecuteTool(AgentTool):
                               "desc": "会话归属标识(当前调查/案卷 id);预算按角色+该标识独立计数"},
         "args": {"type": "str", "default": "",
                  "desc": "目标参数串;按 POSIX 引号规则切分后逐个传入(无 shell 参与)"},
+        "argv0": {"type": "str", "default": "",
+                  "desc": "目标 argv[0];为空时使用 guest 目标路径,不经过 shell"},
         "env": {"type": "str", "default": "",
                 "desc": "额外环境变量,换行分隔的 K=V(值可含 =);不继承宿主环境"},
         "cwd": {"type": "str", "default": "/",
@@ -168,6 +173,22 @@ class QemuExecuteTool(AgentTool):
         "use_strace": {"type": "bool", "default": True,
                        "desc": "QEMU_STRACE=1 辅助链路日志(仅日志,不充当隔离或完整台账)"},
     }
+
+    def execute_for_scope(self, arguments: dict, *, investigation_ref: str,
+                          remaining_seconds) -> ToolResult:
+        """Host 绑定实际调查/案卷及动态剩余预算，模型不能通过改名获得名额。"""
+        self._remaining_seconds = remaining_seconds
+        try:
+            return self.execute(**{**arguments, "investigation_ref": investigation_ref})
+        finally:
+            self._remaining_seconds = None
+
+    def _effective_timeout(self, requested: int) -> int:
+        seconds = max(1, min(int(requested), 180))
+        remaining = getattr(self, "_remaining_seconds", None)
+        if remaining is not None:
+            seconds = min(seconds, max(0, int(remaining())))
+        return seconds
 
     # ---- 工具路径解析 ----
 
@@ -187,18 +208,34 @@ class QemuExecuteTool(AgentTool):
     # ---- 设施身份 ----
 
     def _facility(self, qemu_binary: str) -> dict:
-        labels = docker_image_labels(QEMU_EXEC_V2_IMAGE)
-        if labels is None:
+        identity = docker_image_identity(QEMU_EXEC_V2_IMAGE)
+        if identity is None:
             return {"image": QEMU_EXEC_V2_IMAGE, "available": False,
                     "detail": (f"镜像 {QEMU_EXEC_V2_IMAGE} 不可用"
                                "(先运行 docker/qemu-exec-v2/build_image.sh)")}
+        labels = identity["labels"]
+        execveat_patch = labels.get("fw.proot.execveat.patch.sha256")
+        if execveat_patch != QEMU_EXECVEAT_PATCH_SHA256:
+            return {
+                "image_id": identity["image_id"],
+                "image": QEMU_EXEC_V2_IMAGE,
+                "available": False,
+                "qemu_binary": qemu_binary,
+                "proot_version": labels.get("fw.proot.version"),
+                "proot_execveat_patch_sha256": execveat_patch,
+                "detail": ("镜像缺少已验收的 PRoot raw execveat deny 补丁"
+                           f"(期望 {QEMU_EXECVEAT_PATCH_SHA256[:12]})"),
+            }
         return {
+            "image_id": identity["image_id"],
             "image": QEMU_EXEC_V2_IMAGE,
             "available": True,
             "qemu_binary": qemu_binary,
             "qemu_version": labels.get("fw.qemu.version"),
             "proot_version": labels.get("fw.proot.version"),
-            "proot_patch": "mixed_mode-inherit(" + labels.get("fw.proot.patch.sha256", "")[:12] + ")",
+            "proot_patch": ("mixed_mode-inherit(" + labels.get("fw.proot.patch.sha256", "")[:12]
+                            + ")+raw-execveat-deny(" + execveat_patch[:12] + ")"),
+            "proot_execveat_patch_sha256": execveat_patch,
             "base_digest": labels.get("fw.base.digest"),
             "boundary": labels.get("fw.boundary"),
         }
@@ -206,9 +243,8 @@ class QemuExecuteTool(AgentTool):
     # ---- 会话主流程 ----
 
     def _run(self, *, file_ref: str, firmware_root: str, investigation_ref: str,
-             args: str = "", env: str = "", cwd: str = "/", input_ref: str = "",
+             args: str = "", argv0: str = "", env: str = "", cwd: str = "/", input_ref: str = "",
              timeout_seconds: int = 60, use_strace: bool = True) -> ToolResult:
-        started = time.monotonic()
         ledger = SessionLedger(self._sessions_root() / "ledger.json")
         role = self.role or "analysis"
         limit = resolve_max_sessions()
@@ -218,12 +254,12 @@ class QemuExecuteTool(AgentTool):
                                               _LIMIT_SESSION])
             return ToolResult(ok=ok, text=_render_text(report), data=report)
 
-        def refuse(detail: str) -> ToolResult:
+        def refuse(detail: str, kind=QemuResultClass.PREP_BLOCKED) -> ToolResult:
             ledger.add("refusals", {"role": role,
                                     "investigation_ref": investigation_ref,
-                                    "reason": "prep_blocked", "detail": detail})
-            report["result_class"] = QemuResultClass.PREP_BLOCKED.value
-            report["result_class_label"] = QemuResultClass.PREP_BLOCKED.label
+                                    "reason": kind.value, "detail": detail})
+            report["result_class"] = kind.value
+            report["result_class_label"] = kind.label
             report["detail"] = detail
             return finish(report)
 
@@ -274,6 +310,9 @@ class QemuExecuteTool(AgentTool):
             argv_list = shlex.split(args or "")
         except ValueError as exc:
             return refuse(f"args 引号解析失败(POSIX 规则): {exc}")
+        declared_argv0 = (argv0 or "").strip()
+        if "\x00" in declared_argv0:
+            return refuse("argv0 不得包含 NUL 字节")
         declared_env = dict(_DEFAULT_GUEST_ENV)
         for line in (env or "").splitlines():
             line = line.strip()
@@ -282,11 +321,17 @@ class QemuExecuteTool(AgentTool):
             key, sep, value = line.partition("=")
             if not sep or not key.strip():
                 return refuse(f"env 行必须是 K=V: {line!r}")
-            declared_env[key.strip()] = value
+            key = key.strip()
+            if (not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                    or key.startswith(("PROOT_", "QEMU_", "LD_"))):
+                return refuse(f"env 不允许后端控制变量或非法名称 {key!r}；请使用声明的 guest 输入")
+            declared_env[key] = value
         guest_cwd = (cwd or "/").strip() or "/"
         if not guest_cwd.startswith("/") or ".." in guest_cwd.split("/"):
             return refuse(f"cwd 必须是 guest 内绝对路径且不含 ..: {cwd!r}")
-        timeout_clamped = max(1, min(int(timeout_seconds), 180))
+        timeout_clamped = self._effective_timeout(timeout_seconds)
+        if timeout_clamped < 1:
+            return refuse("案例剩余活动预算不足 1 秒；请停止执行并收束调查")
         input_path: Path | None = None
         input_guest: str | None = None
         input_mount: tuple[Path, str, str] | None = None
@@ -310,13 +355,16 @@ class QemuExecuteTool(AgentTool):
             return finish(report)
 
         digest_map = {"target": sha256_file(target)}
-        dep_rels, deps_truncated = self._runtime_dependencies(root, elf)
+        try:
+            dep_rels, deps_truncated = self._runtime_dependencies(root, elf)
+        except ValueError as exc:
+            return refuse(str(exc), QemuResultClass.DEPENDENCY_BLOCKED)
         for rel in dep_rels:
             digest_map[rel] = sha256_file(root / rel)
 
         # 5) 开启会话(干净容器;命名可追溯)
         seq = used + 1
-        session_id = f"{role}-{_slug(investigation_ref)}-{seq:03d}"
+        session_id = f"{role}-{_slug(investigation_ref)}-{seq:03d}-{uuid.uuid4().hex}"
         container_name = f"fw-qemu-{session_id}"
         session_dir = self._sessions_root() / session_id
         runtime_dir = session_dir / "runtime"
@@ -324,20 +372,6 @@ class QemuExecuteTool(AgentTool):
         mounts = [(root, _GUEST_ROOT, "ro"), (runtime_dir, _GUEST_RUNTIME, "rw")]
         if input_mount is not None:
             mounts.append(input_mount)
-        rc, cid_out, err = docker_run_detached(
-            QEMU_EXEC_V2_IMAGE, ["infinity"],
-            name=container_name,
-            mounts=mounts,
-            tmpfs=["/tmp:rw,noexec,nosuid,nodev", f"{_GUEST_STUB}:rw,exec,nosuid,nodev"],
-            entrypoint="/bin/sleep",
-            network="none", read_only=True, init=True, timeout=120)
-        if rc != 0:
-            report["result_class"] = QemuResultClass.FACILITY_FAILURE.value
-            report["result_class_label"] = QemuResultClass.FACILITY_FAILURE.label
-            report["facility_error"] = (err or "").strip()[:400]
-            return finish(report)
-        container_id = cid_out.strip().splitlines()[-1] if cid_out.strip() else container_name
-
         entry: dict = {
             "schema_version": 1,
             "session_id": session_id,
@@ -349,16 +383,18 @@ class QemuExecuteTool(AgentTool):
                            "guest_path": "/" + target.relative_to(root).as_posix()},
                 "firmware_root": {"ref": firmware_root},
                 "argv": argv_list,
+                "argv0": declared_argv0 or ("/" + target.relative_to(root).as_posix()),
                 "env": declared_env,
                 "cwd": guest_cwd,
-                "input": ({"ref": input_ref, "guest_path": input_guest}
+                "input": ({"ref": input_ref, "guest_path": input_guest,
+                           "sha256": sha256_file(input_path)}
                           if input_path is not None else None),
                 "timeout_seconds": timeout_clamped,
                 "use_strace": bool(use_strace),
             },
             "dependencies_sha256": {k: v for k, v in digest_map.items() if k != "target"},
             "backend": facility,
-            "container": {"name": container_name, "id": container_id[:12]},
+            "container": {"name": container_name},
         }
         if deps_truncated:
             entry["dependencies_search_truncated"] = (
@@ -368,16 +404,83 @@ class QemuExecuteTool(AgentTool):
         # (容器名 fw-qemu-<session_id> 可按名收割;终态由 replace 回写)。
         ledger.add("sessions", entry)
 
+        try:
+            self._execute_session(entry, mounts, input_mount, session_dir)
+        except Exception as exc:
+            entry.update(result_class=QemuResultClass.FACILITY_FAILURE.value,
+                         result_class_label=QemuResultClass.FACILITY_FAILURE.label,
+                         facility_error=f"{type(exc).__name__}: {exc}")
+        finally:
+            # 包含启动超时、观察/落盘异常和 KeyboardInterrupt；Host 被 SIGKILL
+            # 的恢复不属单次执行票，但启动前的占位保留收割锚点。
+            try:
+                rm_rc, _, rm_err = docker_rm(container_name, timeout=60)
+            except Exception as exc:
+                rm_rc, rm_err = 125, f"{type(exc).__name__}: {exc}"
+            entry["container"]["removed"] = rm_rc == 0
+            entry["sealed"] = rm_rc == 0
+            entry["status"] = "sealed" if rm_rc == 0 else "seal_failed"
+            entry["sealed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            if rm_rc != 0:
+                entry["execution_result_class"] = entry.get("result_class")
+                entry.update(result_class=QemuResultClass.CLEANUP_UNCERTAIN.value,
+                             result_class_label=QemuResultClass.CLEANUP_UNCERTAIN.label)
+                entry["cleanup"] = {"verdict": "uncertain", "detail": rm_err,
+                                    "leftovers_after": None}
+            else:
+                entry.setdefault("cleanup", {"verdict": "container_removed",
+                                             "leftovers_after": 0})
+            ledger.replace(session_id, entry)
+
+        report.update(entry)
+        report["artifacts"] = {
+            "session_dir": str(session_dir),
+            "stdout": str(session_dir / "stdout.txt"),
+            "stderr": str(session_dir / "stderr.txt"),
+            "ledger": str(self._sessions_root() / "ledger.json"),
+        }
+        return finish(report)
+
+    def _execute_session(self, entry: dict, mounts: list,
+                         input_mount: tuple | None, session_dir: Path) -> None:
+        """只负责一次容器执行/观察；调用方始终负责停机与终态记账。"""
+        container_name = entry["container"]["name"]
+        declared = entry["declared"]
+        timeout_clamped = declared["timeout_seconds"]
+        rc, cid_out, err = docker_run_detached(
+            entry["backend"]["image_id"], ["infinity"],
+            name=container_name,
+            mounts=mounts,
+            tmpfs=["/tmp:rw,noexec,nosuid,nodev", f"{_GUEST_STUB}:rw,exec,nosuid,nodev"],
+            entrypoint="/bin/sleep",
+            network="none", read_only=True, init=True, timeout=120)
+        if rc != 0:
+            entry["result_class"] = QemuResultClass.FACILITY_FAILURE.value
+            entry["result_class_label"] = QemuResultClass.FACILITY_FAILURE.label
+            entry["facility_error"] = (err or "").strip()[:400]
+            return
+        container_id = cid_out.strip().splitlines()[-1] if cid_out.strip() else container_name
+
+        entry["container"]["id"] = container_id[:12]
         # 6) 观察者(docker exec -d;延时后写快照到 guest 不可见的 stub tmpfs)
         snapshot_guest = f"{_GUEST_STUB}/.proc-snapshot.txt"
         docker_exec(container_id, [_LLSCAN_BIN, "watch", "2", snapshot_guest],
                     detach=True, timeout=30)
 
+        # 容器准备/哈希/观察器也消耗案例活动时间；实际执行前再次收紧。
+        timeout_clamped = self._effective_timeout(timeout_clamped)
+        entry["declared"]["timeout_seconds"] = timeout_clamped
+        if timeout_clamped < 1:
+            entry.update(result_class=QemuResultClass.PREP_BLOCKED.value,
+                         result_class_label=QemuResultClass.PREP_BLOCKED.label,
+                         detail="案例剩余活动预算不足 1 秒；未启动目标")
+            return
+
         # 7) 单次执行(容器内 timeout -k 包裹 proot;直接 argv,无 shell)
         proot_argv = [
             "/usr/bin/timeout", "-k", str(_KILL_GRACE_SECONDS), str(timeout_clamped),
             _PROOT_BIN, "--mixed-mode", "on", "--kill-on-exit",
-            "-q", f"/usr/local/bin/{profile.qemu_binary}",
+            "-q", f"/usr/local/bin/{entry['backend']['qemu_binary']}",
             "-r", _GUEST_ROOT,
             "-b", f"{_GUEST_RUNTIME}:/tmp",
         ]
@@ -385,31 +488,16 @@ class QemuExecuteTool(AgentTool):
             proot_argv += ["-b", dev]
         if input_mount is not None:
             proot_argv += ["-b", f"{_GUEST_INPUT}:{_GUEST_INPUT}"]
-        proot_argv += ["-w", guest_cwd,
-                       "/" + target.relative_to(root).as_posix()] + argv_list
-        exec_env = {**declared_env, "PROOT_TMP_DIR": _GUEST_STUB}
-        if use_strace:
+        proot_argv += ["-w", declared["cwd"],
+                       declared["target"]["guest_path"], declared["argv0"]] + declared["argv"]
+        exec_env = {**declared["env"], "PROOT_TMP_DIR": _GUEST_STUB}
+        if declared["use_strace"]:
             exec_env["QEMU_STRACE"] = "1"
         exec_started = time.monotonic()
         rc, out, err = docker_exec(
             container_id, proot_argv, env=exec_env,
             timeout=timeout_clamped + _KILL_GRACE_SECONDS + _DOCKER_OVERHEAD_SECONDS)
         elapsed = round(time.monotonic() - exec_started, 3)
-        # 宿主侧 docker 超时(客户端被杀,容器仍在)≠ guest 预算触发:
-        # 设施失败处理,不得伪装为目标的超时结果。计时从 exec 起点算,
-        # 不含建容器/哈希等准备耗时。
-        if rc == 124 and elapsed >= (timeout_clamped + _KILL_GRACE_SECONDS
-                                     + _DOCKER_OVERHEAD_SECONDS - 1):
-            docker_rm(container_name, timeout=60)
-            entry["status"] = "abandoned"
-            entry["sealed"] = False
-            entry["facility_error"] = "docker exec 宿主侧超时(容器已拆除);目标执行结果未知"
-            ledger.replace(session_id, entry)
-            report["result_class"] = QemuResultClass.FACILITY_FAILURE.value
-            report["result_class_label"] = QemuResultClass.FACILITY_FAILURE.label
-            report["facility_error"] = entry["facility_error"]
-            return finish(report)
-
         (session_dir / "stdout.txt").write_text(out or "", encoding="utf-8", errors="replace")
         (session_dir / "stderr.txt").write_text(err or "", encoding="utf-8", errors="replace")
         entry["execution"] = {
@@ -417,8 +505,8 @@ class QemuExecuteTool(AgentTool):
             "exit_code": rc,
             "stdout_sha256": hashlib.sha256((out or "").encode("utf-8", "replace")).hexdigest(),
             "stderr_sha256": hashlib.sha256((err or "").encode("utf-8", "replace")).hexdigest(),
-            "stdout_bytes": len(out or ""),
-            "stderr_bytes": len(err or ""),
+            "stdout_bytes": len((out or "").encode("utf-8", "replace")),
+            "stderr_bytes": len((err or "").encode("utf-8", "replace")),
         }
 
         # 8) 清理验证与升级(llscan 扫描;残留 → 连进程组 SIGKILL → 复扫 → 拆容器)
@@ -440,39 +528,18 @@ class QemuExecuteTool(AgentTool):
             entry["chain"] = {"snapshot": [],
                               "snapshot_note": "快照缺失(链先于观察点结束或观察失败),缺项明示"}
 
-        # 10) 停机封存:容器拆除(权威清理;残留不明时同样拆除)
-        rm_rc, _, rm_err = docker_rm(container_name, timeout=60)
-        entry["container"]["removed"] = rm_rc == 0
-        if rm_rc != 0 and cleanup["verdict"] != "clean":
-            entry["cleanup"]["verdict"] = "uncertain"
-            entry["cleanup"]["detail"] = (rm_err or "").strip()[:200]
-
-        # 11) 分类(边界拒绝不伪装为目标崩溃;原始退出码保留)
-        result_class, label, note = self._classify(rc, elapsed, timeout_clamped,
-                                                   out or "", err or "")
-        entry["result_class"] = result_class
-        entry["result_class_label"] = label
+        if rc == 124 and elapsed >= (timeout_clamped + _KILL_GRACE_SECONDS
+                                     + _DOCKER_OVERHEAD_SECONDS - 1):
+            entry.update(result_class=QemuResultClass.FACILITY_FAILURE.value,
+                         result_class_label=QemuResultClass.FACILITY_FAILURE.label,
+                         facility_error="docker exec 宿主侧超时；目标执行结果未知")
+            return
+        result_class, label, note = self._classify(
+            rc, elapsed, timeout_clamped, out or "", err or "")
+        entry.update(result_class=result_class, result_class_label=label)
         if note:
             entry["result_note"] = note
-        entry["sealed"] = rm_rc == 0
-        entry["status"] = "sealed" if rm_rc == 0 else "seal_failed"
-        entry["sealed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-
-        ledger.replace(session_id, entry)
-        report.update({k: entry[k] for k in
-                       ("session_id", "declared", "backend", "execution",
-                        "cleanup", "chain", "result_class",
-                        "result_class_label", "sealed")})
-        if note:
-            report["result_note"] = note
-        report["artifacts"] = {
-            "session_dir": str(session_dir),
-            "stdout": str(session_dir / "stdout.txt"),
-            "stderr": str(session_dir / "stderr.txt"),
-            "ledger": str(self._sessions_root() / "ledger.json"),
-        }
-        report["observation_excerpt"] = self._excerpt(out or "", err or "")
-        return finish(report)
+        entry["observation_excerpt"] = self._excerpt(out or "", err or "")
 
     # ---- 分步辅助 ----
 
@@ -487,13 +554,20 @@ class QemuExecuteTool(AgentTool):
         truncated = False
         if elf.get("interp"):
             rel = elf["interp"].lstrip("/")
-            if (root / rel).is_file():
-                rels.append(rel)
+            interpreter = resolve_within(root, rel)
+            if interpreter is None or not interpreter.is_file():
+                raise ValueError("解释器缺失或越出固件根；请先运行 qemu_precheck 检查依赖")
+            rels.append(interpreter.relative_to(root.resolve()).as_posix())
         for lib in elf.get("needed") or []:
             hit, trunc = find_in_root(root, lib.split("/")[-1])
             truncated = truncated or trunc
             if hit is not None:
-                rels.append(hit)
+                dependency = resolve_within(root, hit)
+                if dependency is None or not dependency.is_file():
+                    raise ValueError("依赖越出固件根；请先运行 qemu_precheck 检查依赖")
+                rels.append(dependency.relative_to(root.resolve()).as_posix())
+            elif not trunc:
+                raise ValueError(f"依赖 {lib} 缺失；请先运行 qemu_precheck 检查依赖")
         return rels, truncated
 
     @staticmethod
@@ -524,13 +598,23 @@ class QemuExecuteTool(AgentTool):
             return (QemuResultClass.FACILITY_FAILURE.value,
                     QemuResultClass.FACILITY_FAILURE.label,
                     (err or "").strip()[:300] or "docker exec 失败")
+        # 日志分类是提示，不据此宣称目标从未运行或漏洞成立；原始 rc 保留。
+        if rc != 0 and "Invalid ELF image for this architecture" in err:
+            return (QemuResultClass.PREP_BLOCKED.value,
+                    QemuResultClass.PREP_BLOCKED.label,
+                    "日志提示执行架构/边界拒绝；不归为目标崩溃")
+        if rc != 0 and ("error while loading shared libraries:" in err
+                        or "can't load library" in err):
+            return (QemuResultClass.DEPENDENCY_BLOCKED.value,
+                    QemuResultClass.DEPENDENCY_BLOCKED.label,
+                    "日志提示运行时依赖阻塞；请先运行 qemu_precheck 核查依赖")
         proot_fatal = ("proot error" in (err or "")
                        and "fatal error: see `proot --help`" in (err or ""))
         if proot_fatal and not out.strip():
             return (QemuResultClass.PREP_BLOCKED.value,
                     QemuResultClass.PREP_BLOCKED.label,
                     "proot 启动失败(目标未运行): " + (err or "").strip()[:300])
-        if rc == 124:
+        if rc == 124 and elapsed >= budget:
             return (QemuResultClass.TIMEOUT.value,
                     QemuResultClass.TIMEOUT.label,
                     f"预算 {budget}s 触发(timeout rc=124,已等待 {elapsed:.1f}s)")
@@ -577,7 +661,7 @@ def _render_text(report: dict) -> str:
         tgt = declared.get("target") or {}
         lines.append(f"- 目标: {tgt.get('ref')} sha256={str(tgt.get('sha256'))[:16]}… "
                      f"guest 路径 {tgt.get('guest_path')}")
-        lines.append(f"- 声明输入: argv={declared.get('argv')} cwd={declared.get('cwd')} "
+        lines.append(f"- 声明输入: argv0={declared.get('argv0')} argv={declared.get('argv')} cwd={declared.get('cwd')} "
                      f"env={list((declared.get('env') or {}).keys())} "
                      f"input={((declared.get('input') or {}) or {}).get('guest_path')}")
         lines.append(f"- 预算: {declared.get('timeout_seconds')}s(硬上限 180)"

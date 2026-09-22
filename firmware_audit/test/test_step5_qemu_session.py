@@ -46,7 +46,12 @@ TGT8_SQUASH = (REPO_ROOT / "target/8/process/extracted/"
 class FakeDocker:
     """会话原语替身:记录调用并按脚本回放;零真实容器。"""
 
-    DEFAULT_LABELS = {"fw.qemu.version": "11.1.1", "fw.proot.version": "5.4.0"}
+    DEFAULT_LABELS = {
+        "fw.qemu.version": "11.1.1",
+        "fw.proot.version": "5.4.0",
+        "fw.proot.patch.sha256": "d55abd0d8c0adb86d8a264368664fb4fbf0ea8273a27681119295bd126f41cdd",
+        "fw.proot.execveat.patch.sha256": "d361d4b28c75029e89892a5283efcdddb99a89a0d752372b91bf07b1c98dae2e",
+    }
     _UNSET = object()
 
     def __init__(self, *, exec_script: list[tuple[int, str, str]] | None = None,
@@ -90,18 +95,20 @@ class FakeDocker:
         self.removed.append(container)
         return 0, "", ""
 
-    def image_labels(self, image):
+    def image_identity(self, image):
         self.calls.append(("labels", image))
-        return self.labels
+        return ({"image_id": "sha256:test-image", "labels": self.labels}
+                if self.labels is not None else None)
 
 
 @pytest.fixture
 def fake_docker(monkeypatch):
     fake = FakeDocker()
+    # 仅离线 Docker 替身测试未放行后端的生命周期，不提供真实执行旁路。
     monkeypatch.setattr(qs, "docker_run_detached", fake.run_detached)
     monkeypatch.setattr(qs, "docker_exec", fake.exec)
     monkeypatch.setattr(qs, "docker_rm", fake.rm)
-    monkeypatch.setattr(qs, "docker_image_labels", fake.image_labels)
+    monkeypatch.setattr(qs, "docker_image_identity", fake.image_identity)
     return fake
 
 
@@ -278,7 +285,7 @@ def test_facility_failure(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(qs, "docker_run_detached", fake.run_detached)
     monkeypatch.setattr(qs, "docker_exec", fake.exec)
     monkeypatch.setattr(qs, "docker_rm", fake.rm)
-    monkeypatch.setattr(qs, "docker_image_labels", fake.image_labels)
+    monkeypatch.setattr(qs, "docker_image_identity", fake.image_identity)
     tool = _tool(tmp_path)
     r = tool.execute(**_default_kwargs())
     assert r.ok and r.data["result_class"] == "facility_failure"
@@ -288,7 +295,7 @@ def test_facility_failure(tmp_path: Path, monkeypatch) -> None:
 @pytest.mark.parametrize("rc,out,err,want", [
     (0, "usage\n", "", "normal_exit"),
     (1, "", "guest err", "nonzero_exit"),
-    (124, "", "", "timeout"),
+    (124, "", "", "nonzero_exit"),
     (137, "", "", "target_signal"),
     (139, "", "", "target_signal"),
     (255, "", "bad", "nonzero_exit"),
@@ -332,6 +339,23 @@ def test_execution_shape(tmp_path: Path, fake_docker: FakeDocker) -> None:
                         .read_text(encoding="utf-8"))
     assert ledger["sessions"][0]["sealed"] is True
     assert ledger["sessions"][0]["declared"]["argv"] == ["get", "foo"]
+
+
+def test_explicit_argv0_is_recorded_and_passed(tmp_path: Path, fake_docker: FakeDocker) -> None:
+    _arm_workspace(tmp_path)
+    result = _tool(tmp_path).execute(**_default_kwargs(argv0="nvram-wrapper", args="get foo"))
+    assert result.data["declared"]["argv0"] == "nvram-wrapper"
+    exec_call = next(call for call in fake_docker.calls if call[0] == "exec")
+    argv = exec_call[1]
+    target_index = argv.index("/usr/sbin/nvram")
+    assert argv[target_index + 1 : target_index + 4] == ("nvram-wrapper", "get", "foo")
+
+
+def test_argv0_rejects_nul_injection(tmp_path: Path, fake_docker: FakeDocker) -> None:
+    _arm_workspace(tmp_path)
+    result = _tool(tmp_path).execute(**_default_kwargs(argv0="bad\x00name"))
+    assert result.data["result_class"] == "prep_blocked"
+    assert not any(call[0] == "run_detached" for call in fake_docker.calls)
 
 
 def test_cleanup_escalation_and_leftover(tmp_path: Path, fake_docker: FakeDocker) -> None:
@@ -437,7 +461,7 @@ def test_real_arm_session_chain_boundary_and_quota(tmp_path: Path,
                      args="sh -c '/usr/sbin/nvram; "
                           "/host-rootfs/usr/local/bin/qemu-arm-static --version'")
     d = r.data
-    assert d["result_class"] in ("nonzero_exit", "target_signal"), d
+    assert d["result_class"] == "prep_blocked", d
     assert "Invalid ELF image" in (d["observation_excerpt"]["stderr"]["excerpt"]
                                    + d["observation_excerpt"]["stdout"]["excerpt"])
     assert d["cleanup"]["verdict"] in ("clean", "clean_after_kill")
@@ -479,14 +503,183 @@ def test_real_mips_non_shell_parent(tmp_path: Path, monkeypatch) -> None:
     import shutil
     fw = tmp_path / "extracted" / "fw8"
     fw.mkdir(parents=True)
-    shutil.copy2(TGT8_SQUASH / "bin/busybox", fw / "busybox", follow_symlinks=True)
+    (fw / "bin").mkdir()
+    shutil.copy2(TGT8_SQUASH / "bin/busybox", fw / "bin" / "busybox",
+                 follow_symlinks=True)
     libdir = TGT8_SQUASH / "lib"
     if libdir.is_dir():
         shutil.copytree(libdir, fw / "lib", dirs_exist_ok=True, symlinks=False)
     tool = _tool(tmp_path, role="analysis")
-    r = tool.execute(file_ref="fw8/busybox", firmware_root="fw8",
+    r = tool.execute(file_ref="fw8/bin/busybox", firmware_root="fw8",
                      investigation_ref="case-mips",
-                     args="env /busybox echo env-parent-mips-ok")
+                     argv0="sh", args="-c '/bin/busybox echo env-parent-mips-ok'")
     d = r.data
     assert d["result_class"] == "normal_exit", d
     assert "env-parent-mips-ok" in d["observation_excerpt"]["stdout"]["excerpt"]
+
+
+@pytest.mark.parametrize("role", ["analysis", "verification"])
+def test_stale_image_without_execveat_patch_blocks_before_session(tmp_path, monkeypatch, role):
+    """旧镜像缺少 raw execveat deny 身份时不得创建执行会话。"""
+    _arm_workspace(tmp_path)
+    fake = FakeDocker(labels={"fw.qemu.version": "11.1.1", "fw.proot.version": "5.4.0"})
+    monkeypatch.setattr(qs, "docker_image_identity", fake.image_identity)
+    monkeypatch.setattr(qs, "docker_run_detached", fake.run_detached)
+    monkeypatch.setattr(qs, "docker_exec", fake.exec)
+    monkeypatch.setattr(qs, "docker_rm", fake.rm)
+    result = _tool(tmp_path, role).execute(**_default_kwargs())
+    assert result.data["result_class"] == "facility_failure"
+    assert "execveat" in result.data["backend"]["detail"]
+    assert not any(c[0] in ("run_detached", "exec") for c in fake.calls)
+    assert not (tmp_path / "qemu_sessions/ledger.json").exists()
+
+
+def test_scope_slug_collision_keeps_distinct_evidence(tmp_path, fake_docker):
+    _arm_workspace(tmp_path)
+    tool = _tool(tmp_path)
+    first = tool.execute(**_default_kwargs(investigation_ref="inv/a"))
+    second = tool.execute(**_default_kwargs(investigation_ref="inv?a"))
+    assert first.data["session_id"] != second.data["session_id"]
+    entries = json.loads((tmp_path / "qemu_sessions/ledger.json").read_text())["sessions"]
+    assert [s["investigation_ref"] for s in entries] == ["inv/a", "inv?a"]
+
+
+def test_cleanup_removal_failure_overrides_success(tmp_path, fake_docker, monkeypatch):
+    _arm_workspace(tmp_path)
+    monkeypatch.setattr(qs, "docker_rm", lambda *a, **kw: (1, "", "daemon lost"))
+    result = _tool(tmp_path).execute(**_default_kwargs())
+    assert result.data["result_class"] == "cleanup_uncertain"
+    assert result.data["sealed"] is False
+    assert result.data["execution"]["exit_code"] == 0
+
+
+def test_post_start_exception_still_removes_container(tmp_path, fake_docker, monkeypatch):
+    _arm_workspace(tmp_path)
+    original = qs.docker_exec
+    def broken_snapshot(container, args, **kwargs):
+        if args[:2] == ["/usr/local/bin/llscan", "cat"]:
+            raise OSError("snapshot read failed")
+        return original(container, args, **kwargs)
+    monkeypatch.setattr(qs, "docker_exec", broken_snapshot)
+    result = _tool(tmp_path).execute(**_default_kwargs())
+    assert fake_docker.removed
+    assert result.data["result_class"] == "facility_failure"
+    entries = json.loads((tmp_path / "qemu_sessions/ledger.json").read_text())["sessions"]
+    assert entries[0]["sealed"] is True
+    assert entries[0]["status"] != "running"
+
+
+def test_start_timeout_has_ledger_and_cleanup(tmp_path, fake_docker, monkeypatch):
+    _arm_workspace(tmp_path)
+    def uncertain_start(*args, **kwargs):
+        entries = json.loads((tmp_path / "qemu_sessions/ledger.json").read_text())["sessions"]
+        assert len(entries) == 1, "容器启动前必须有占位，避免启动超时后不可收割"
+        return 124, "", "docker timed out"
+    monkeypatch.setattr(qs, "docker_run_detached", uncertain_start)
+    result = _tool(tmp_path).execute(**_default_kwargs())
+    assert fake_docker.removed
+    assert result.data["result_class"] == "facility_failure"
+
+
+def test_host_binds_scope_and_remaining_time(tmp_path, fake_docker, monkeypatch):
+    from firmware_audit.step5_agent.host.tooling import execute_tool
+    from firmware_audit.step5_agent.host.budget import RunBudget
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    _arm_workspace(tmp_path)
+    tool = _tool(tmp_path)
+    budget = RunBudget.load(tmp_path / "budget", persist=False)
+    budget.resolved["max_active_seconds"] = 2.8
+    for index in range(3):
+        result = execute_tool(tool, _default_kwargs(investigation_ref=f"forged-{index}"),
+                              investigation_ref="host-inv-1", budget=budget)
+        assert result.data["declared"]["timeout_seconds"] <= 2
+        assert result.data["investigation_ref"] == "host-inv-1"
+    result = execute_tool(tool, _default_kwargs(investigation_ref="forged-4"),
+                          investigation_ref="host-inv-1", budget=budget)
+    assert result.data["refused"]["reason"] == "session_quota_exhausted"
+    budget.resolved["max_active_seconds"] = 0.5
+    before = len(fake_docker.calls)
+    result = execute_tool(tool, _default_kwargs(), investigation_ref="host-inv-2", budget=budget)
+    assert result.data["result_class"] == "prep_blocked"
+    assert len(fake_docker.calls) == before
+
+
+@pytest.mark.parametrize("env", ["PROOT_NO_SECCOMP=1", "PROOT_TMP_DIR=/tmp",
+                                  "QEMU_LD_PREFIX=/host-rootfs", "LD_PRELOAD=/tmp/x.so"])
+def test_guest_environment_cannot_configure_native_backend(tmp_path, fake_docker, env):
+    _arm_workspace(tmp_path)
+    result = _tool(tmp_path).execute(**_default_kwargs(env=env))
+    assert result.data["result_class"] == "prep_blocked"
+    assert not any(c[0] == "run_detached" for c in fake_docker.calls)
+
+
+def test_dependency_digest_does_not_read_outside_firmware(tmp_path, fake_docker):
+    _arm_workspace(tmp_path)
+    fw = tmp_path / "extracted/fw"
+    external = tmp_path / "host-only-loader"
+    external.write_text("not firmware")
+    loader = fw / "lib/ld-uClibc.so.0"
+    loader.unlink()
+    loader.symlink_to(external)
+    result = _tool(tmp_path).execute(**_default_kwargs())
+    assert result.data["result_class"] == "dependency_blocked"
+    assert not any(c[0] == "run_detached" for c in fake_docker.calls)
+
+
+def test_session_configuration_cannot_exceed_three(tmp_path, fake_docker, monkeypatch):
+    monkeypatch.setenv("STEP5_QEMU_MAX_SESSIONS", "99")
+    _arm_workspace(tmp_path)
+    tool = _tool(tmp_path)
+    for _ in range(3):
+        assert tool.execute(**_default_kwargs()).data["result_class"] == "normal_exit"
+    assert tool.execute(**_default_kwargs()).data["result_class"] == "prep_blocked"
+
+
+def test_input_digest_and_output_byte_count(tmp_path, fake_docker):
+    import hashlib
+    _arm_workspace(tmp_path)
+    data = b"request=known"
+    (tmp_path / "extracted/input.txt").write_bytes(data)
+    fake_docker.exec_results = [(0, "中文", "")]
+    result = _tool(tmp_path).execute(**_default_kwargs(input_ref="input.txt"))
+    assert result.data["declared"]["input"]["sha256"] == hashlib.sha256(data).hexdigest()
+    assert result.data["execution"]["stdout_bytes"] == len("中文".encode())
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("qemu-arm-static: Invalid ELF image for this architecture", "prep_blocked"),
+    ("error while loading shared libraries: libfoo.so: cannot open shared object file", "dependency_blocked"),
+])
+def test_boundary_and_runtime_dependency_are_not_target_crashes(tmp_path, fake_docker, message, expected):
+    _arm_workspace(tmp_path)
+    fake_docker.exec_results = [(139, "", message)]
+    result = _tool(tmp_path).execute(**_default_kwargs())
+    assert result.data["result_class"] == expected
+    assert result.data["execution"]["exit_code"] == 139
+
+
+def test_fast_exit_124_is_not_a_timeout():
+    kind, _, note = qs.QemuExecuteTool._classify(124, 0.1, 60, "", "")
+    assert kind == "nonzero_exit"
+    kind, _, _ = qs.QemuExecuteTool._classify(124, 60.2, 60, "", "")
+    assert kind == "timeout"
+
+
+def test_static_precheck_allows_execution_after_execveat_boundary(tmp_path, monkeypatch):
+    _arm_workspace(tmp_path)
+    from firmware_audit.step5_agent.providers.tools.qemu_precheck import QemuPrecheckTool
+    monkeypatch.setattr(QemuPrecheckTool, "_facility_check", lambda *a: {"available": False})
+    precheck = make_tools(ToolContext(process_dir=tmp_path), role="analysis")["qemu_precheck"]
+    result = precheck.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw")
+    assert result.data["execution_gate"]["allowed"] is True
+    assert result.data["execution_gate"]["reason"] is None
+    assert "尚未闭合" not in result.text
+    assert not (tmp_path / "qemu_sessions").exists()
+
+
+def test_session_pins_inspected_image_id(tmp_path, fake_docker):
+    _arm_workspace(tmp_path)
+    result = _tool(tmp_path).execute(**_default_kwargs())
+    assert result.data["backend"]["image_id"] == "sha256:test-image"
+    call = next(c for c in fake_docker.calls if c[0] == "run_detached")
+    assert call[1] == "sha256:test-image"

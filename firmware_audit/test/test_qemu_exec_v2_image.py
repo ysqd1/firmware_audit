@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,6 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 IMG_DIR = REPO_ROOT / "firmware_audit" / "docker" / "qemu-exec-v2"
 PINS_PATH = IMG_DIR / "pins.env"
 PATCH_PATH = IMG_DIR / "proot-mixed-mode-inherit.patch"
+EXECVEAT_PATCH_PATH = IMG_DIR / "proot-execveat-deny.patch"
 
 TGT6_SQUASH = (REPO_ROOT / "target/6/process/extracted/"
                "000000_DIR890LA1_FW111b02_20170519_beta01.bin.extracted/"
@@ -76,7 +78,8 @@ def test_pins_required_keys(pins: dict[str, str]) -> list[str]:
     fails: list[str] = []
     for key in ("QEMU_VERSION", "QEMU_TARBALL_SHA256", "QEMU_TARBALL_SIZE",
                 "PROOT_VERSION", "PROOT_TARBALL_SHA256", "PROOT_PATCH",
-                "PROOT_PATCH_SHA256", "QEMU_BUILD_PARAMS",
+                "PROOT_PATCH_SHA256", "PROOT_EXECVEAT_PATCH",
+                "PROOT_EXECVEAT_PATCH_SHA256", "QEMU_BUILD_PARAMS",
                 "BASE_IMAGE_DIGEST", "BUILDER_IMAGE_DIGEST",
                 "QEMU_EXEC_V2_IMAGE"):
         if not pins.get(key):
@@ -97,11 +100,16 @@ def test_dockerfile_matches_pins(pins: dict[str, str]) -> list[str]:
     """Dockerfile 与 pins.env 同源:源码 sha256、补丁 sha256、digest、构建参数。"""
     fails: list[str] = []
     dockerfile = (IMG_DIR / "Dockerfile").read_text(encoding="utf-8")
-    for needle in (pins["QEMU_TARBALL_SHA256"], pins["PROOT_TARBALL_SHA256"],
-                   pins["PROOT_PATCH_SHA256"], pins["BASE_IMAGE_DIGEST"],
-                   pins["BUILDER_IMAGE_DIGEST"], "arm-linux-user,mips-linux-user"):
+    for key in ("QEMU_TARBALL_SHA256", "PROOT_TARBALL_SHA256",
+                "PROOT_PATCH_SHA256", "PROOT_EXECVEAT_PATCH_SHA256",
+                "BASE_IMAGE_DIGEST", "BUILDER_IMAGE_DIGEST"):
+        needle = pins.get(key)
+        if not needle:
+            continue
         if needle not in dockerfile:
             fails.append(f"Dockerfile 缺钉值/参数: {needle}")
+    if "arm-linux-user,mips-linux-user" not in dockerfile:
+        fails.append("Dockerfile 缺钉值/参数: arm-linux-user,mips-linux-user")
     if not pins["QEMU_EXEC_V2_IMAGE"].split(":")[-1] in dockerfile:
         fails.append("Dockerfile 的 BUILD-INFO 应记录目标镜像 tag")
     return fails
@@ -122,10 +130,34 @@ def test_patch_and_helper_present(pins: dict[str, str]) -> list[str]:
     return fails
 
 
+def test_execveat_patch_contract(pins: dict[str, str]) -> list[str]:
+    """正式构建必须带原型验证过的 QEMU raw execveat deny 边界。"""
+    fails: list[str] = []
+    if not EXECVEAT_PATCH_PATH.is_file():
+        return ["缺 PRoot raw execveat deny 补丁文件"]
+    digest = hashlib.sha256(EXECVEAT_PATCH_PATH.read_bytes()).hexdigest()
+    expected = pins.get("PROOT_EXECVEAT_PATCH_SHA256")
+    if expected and digest != expected:
+        fails.append(f"execveat 补丁 sha256 漂移: {digest} != "
+                     f"{expected}")
+    text = EXECVEAT_PATCH_PATH.read_text(encoding="utf-8")
+    for needle in ("PR_execveat", "[ 322 ] = PR_execveat", "SYSNUM(execveat)",
+                   "FILTER_SYSEXIT", "tracee->qemu", "EACCES"):
+        if needle not in text:
+            fails.append(f"execveat 补丁缺少 {needle}")
+    dockerfile = (IMG_DIR / "Dockerfile").read_text(encoding="utf-8")
+    if pins.get("PROOT_EXECVEAT_PATCH") and pins["PROOT_EXECVEAT_PATCH"] not in dockerfile:
+        fails.append("Dockerfile 未复制 execveat deny 补丁")
+    if "proot-execveat.patch" not in dockerfile:
+        fails.append("Dockerfile 未应用 execveat deny 补丁")
+    return fails
+
+
 def test_main() -> int:
     failures = 0
     for test in (test_pins_required_keys, test_pins_no_drifting_latest,
-                 test_dockerfile_matches_pins, test_patch_and_helper_present):
+                 test_dockerfile_matches_pins, test_patch_and_helper_present,
+                 test_execveat_patch_contract):
         result = test(_load_pins())
         for f in (result or []):
             print(f"FAIL: {f}")
@@ -162,7 +194,9 @@ def test_image_build_info_readable(image: str) -> None:
         info = proc.stdout
     finally:
         subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
-    for needle in (b"qemu=11.1.1", b"proot=5.4.0", b"proot-patch-sha256=", b"base="):
+    for needle in (b"qemu=11.1.1", b"proot=5.4.0",
+                   b"proot-patch-sha256=", b"proot-execveat-patch-sha256=",
+                   b"base="):
         assert needle in info, info
     # LABEL ↔ BUILD-INFO 同源(防两处身份档案漂移)
     from firmware_audit.docker.docker_utils import docker_image_labels
@@ -170,6 +204,7 @@ def test_image_build_info_readable(image: str) -> None:
     assert labels and labels.get("fw.qemu.version") == "11.1.1"
     assert labels.get("fw.proot.version") == "5.4.0"
     assert labels.get("fw.proot.patch.sha256", "") in info.decode("utf-8", "replace")
+    assert labels.get("fw.proot.execveat.patch.sha256", "") in info.decode("utf-8", "replace")
     assert labels.get("fw.qemu.tarball.sha256", "") in info.decode("utf-8", "replace")
 
 
@@ -238,6 +273,32 @@ def test_mips_real(image: str) -> None:
     assert rc == 0 and "mips-v2-ok" in out, (rc, out)
 
 
+def test_raw_execveat_variants_denied_real(image: str) -> None:
+    """真实 ARM/MIPS QEMU→PRoot 链中四种 raw execveat 均为 EACCES。
+
+    helper 在固定 Docker 交叉编译器内构建；同一探针分别跑 seccomp 默认和
+    PROOT_NO_SECCOMP=1，避免把 seccomp 加速层误当成 ptrace fallback。
+    """
+    _require_sample(TGT6_SQUASH, "bin/busybox")
+    _require_sample(TGT8_SQUASH, "bin/busybox")
+    inv = (REPO_ROOT / ".scratch/qemu-user-mode-experiments/investigation/"
+           "proot540-qemu1111-2026-09-22/scripts")
+    build = subprocess.run(["bash", str(inv / "94-build-execveat-probe.sh")],
+                           cwd=REPO_ROOT, capture_output=True, text=True,
+                           timeout=TEST_TIMEOUT)
+    assert build.returncode == 0, build.stdout + build.stderr
+    for no_seccomp in ("0", "1"):
+        run = subprocess.run(
+            ["bash", str(inv / "95-run-execveat-probe.sh"), image, no_seccomp],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=TEST_TIMEOUT)
+        output = run.stdout + run.stderr
+        assert run.returncode == 0, output
+        for variant in ("absolute", "dirfd-relative", "empty-path", "proc-fd-alias"):
+            assert output.count(f"{variant}: syscall_rc=-1 errno=13") == 2, output
+            assert output.count(f"{variant}: child_exit=113") == 2, output
+        assert "qemu-arm version 11.1.1" not in output, output
+
+
 def test_boundary_host_rootfs_denied(image: str) -> None:
     """guest 派生链内借 /host-rootfs 执行容器原生 qemu 必须被拒(拒绝语义)。"""
     _require_sample(TGT6_SQUASH, "bin/busybox")
@@ -247,3 +308,15 @@ def test_boundary_host_rootfs_denied(image: str) -> None:
          "/host-rootfs/usr/local/bin/qemu-arm-static --version"]))
     assert rc != 0, f"/host-rootfs 逃逸未被拒绝: {out}"
     assert "Invalid ELF image" in out or "not found" in out, out
+
+
+def test_pinned_proot_source_is_deliverable(pins):
+    """构建所需的固定源码必须可纳入交付，不能只存在于本机忽略缓存。"""
+    import subprocess
+    source = IMG_DIR / pins["PROOT_TARBALL"]
+    assert source.is_file()
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == pins["PROOT_TARBALL_SHA256"]
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", str(source)], cwd=REPO_ROOT,
+        capture_output=True, check=False)
+    assert ignored.returncode == 1, "固定 PRoot 源码包被忽略，干净检出无法构建"

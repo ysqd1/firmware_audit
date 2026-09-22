@@ -50,10 +50,19 @@ def normalize_tool_arguments(
     return clone_json_value(normalized, "normalized tool arguments")
 
 
-def execute_tool(tool: object, arguments: dict[str, Any], *, method: str = "execute") -> ToolResult:
+def execute_tool(tool: object, arguments: dict[str, Any], *, method: str = "execute",
+                 investigation_ref: str | None = None, budget=None) -> ToolResult:
     """工具 adapter 失约也转为失败 ToolResult,保留本次逻辑调用身份。"""
     try:
-        result = getattr(tool, method)(**arguments)
+        if getattr(tool, "name", None) == "qemu_execute":
+            if investigation_ref is None or budget is None:
+                raise ValueError("qemu_execute 缺少 Host 调查归属或案例预算")
+            result = tool.execute_for_scope(
+                arguments, investigation_ref=investigation_ref,
+                remaining_seconds=lambda: (
+                    budget.resolved["max_active_seconds"] - budget.ledger.active_seconds))
+        else:
+            result = getattr(tool, method)(**arguments)
     except Exception as exc:
         return ToolResult(
             ok=False,

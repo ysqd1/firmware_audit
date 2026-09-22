@@ -452,6 +452,14 @@ _Avoid_: 沙箱(指具体镜像 firm_audit/sandbox), Docker 命令
 **沙箱 (sandbox)**:
 具体镜像 `firm_audit/sandbox`,ENTRYPOINT 是 Ghidra analyzeHeadless,内置 checksec/r2/cve-bin-tool/semgrep/gitleaks/解释器;调非 Ghidra CLI 必须覆盖 entrypoint。
 
+**固件执行实验 (firmware execution experiment)**:
+在明确记录的输入和环境条件下运行固件程序、观察其行为的取证活动。实验观察是否支持漏洞主张仍需独立判断，不因成功运行或崩溃直接成为已确认 Finding。
+_Avoid_: 漏洞验证成功（仅执行成功时）, 实机复现（未在真实设备执行时）
+
+**实验环境适配 (experiment environment adaptation)**:
+为固件执行实验补充有来源依据的运行目录、配置或依赖行为，同时记录与原环境的差异。不等同于修补被测程序或证明真实设备具有相同条件；这是已确认、待实现的实验术语。
+_Avoid_: 修复固件, 无差别返回成功
+
 **引导解包 (guided extraction)**:
 Step1 主路径——按文件魔数决策逐层解包(替代 binwalk -Me 盲解,避免 fdt 分解成数十万节点),manifest 落盘支持断点续解。binwalk -Me 仅是兜底。解包路由与 binwalk 签名库的可解集对齐(对齐表 + 漂移守护测试防表落后于镜像能力);binwalk 也解不了的厂商魔数明确终止报"解不了"。大体积无签名文件 finalize 前做一次守卫全偏移复扫(binwalk -e -M,副本递容器原件永存;内核藏 initramfs 型 rootfs 物化,票04)。
 _Avoid_: 解包(特指 binwalk -Me), 魔数解包

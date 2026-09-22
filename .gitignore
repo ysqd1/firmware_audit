@@ -42,3 +42,5 @@ firmware_audit/docker/ghidra/ghidra_11.3.2_PUBLIC.zip
 # ---- QEMU 执行镜像的 .deb 下载缓存(41MB 二进制,不入仓,radare2 tar.gz 同款) ----
 firmware_audit/docker/qemu-exec/deb-cache/
 firmware_audit/docker/qemu-exec-v2/src-cache/
+# Ticket 16: pinned PRoot source is a build input, not a disposable archive cache.
+!firmware_audit/docker/qemu-exec-v2/proot-5.4.0.tar.gz
