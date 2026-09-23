@@ -8,7 +8,9 @@
   firm_audit/sandbox 不回归——缺 Docker/镜像/解包树时 SKIP 并记录原因,不假绿。
 
 冒烟命令与票 01 证据同源(investigation/01/04-arm-runs.txt、05-mips-runs.txt、
-07-probe-smoke.txt):裸跑 rc=126 对照 + 显式 qemu 调用不依赖宿主 binfmt。
+07-probe-smoke.txt):裸跑 rc=126 对照(环境感知,票 17 Comments:仅当确认
+执行容器内核未注册 ARM binfmt 才算验证通过,已注册/无法确认标"未验证")
++ 显式 qemu 调用不依赖宿主 binfmt。
 钉值权威来源:bullseye/main binary-amd64 Packages 索引(apt 安装同源校验)。
 """
 from __future__ import annotations
@@ -171,18 +173,188 @@ def test_mips32_be_execution() -> None:
 def test_binfmt_independence_control() -> None:
     """裸跑外来 ELF 应 rc=126(Exec format error):显式调用不依赖 binfmt 注册。
 
-    宿主若注册了 arm 的 binfmt,此对照会以 rc=0 失败——那是运行环境漂移信号,
-    按票 01 边界(不改宿主 binfmt)应查明,不是测试误报。
+    环境感知(票 17 Comments E):只有确认执行容器所在内核不对 ARM ELF 做
+    binfmt 转译,否定对照才算验证通过。已注册转译或无法确认时,明确报告
+    原因并以 skip 标"未验证"——rc=255/转译执行不得当作通过,skip 也不计入
+    验证成功。判定顺序:
+    ① 宿主侧 binfmt_misc 表可读 → 有 enabled 条目按 magic/mask 匹配 ARM32
+       小端即"已注册",直接未验证(不跑对照);
+    ② 行为探测(权威):裸跑目标,ENOEXEC(rc=126 + Exec format error)才算
+       对照成立;被转译(rc=0 或输出带 qemu- 前缀)或其它结果一律未验证。
     """
     image = _require_exec_image()
     _require_smoke_binary(TGT6_SQUASH, "usr/sbin/nvram")
+    registered, table_note = _arm_binfmt_registered()
+    if registered is True:
+        pytest.skip(
+            "binfmt 独立性对照未验证(非通过):执行容器所在内核已注册 ARM "
+            f"binfmt 转译({table_note});按票 01 边界不改宿主,对照在此环境失效")
     rc, out, err = run_docker(
         image,
         ["-c", "/work/tgt6/usr/sbin/nvram"],
         mounts=[(TGT6_SQUASH, "/work/tgt6", "ro")],
         entrypoint="bash", network="none", timeout=TEST_TIMEOUT)
-    assert rc == 126, f"裸跑对照预期 126,实得 rc={rc}(宿主 binfmt 漂移?) out={out[:200]} err={err[:200]}"
-    assert "Exec format error" in (out + err)
+    combined = (out + err).strip()
+    if rc == 126 and "Exec format error" in combined:
+        return  # 对照成立:内核未转译外来 ELF,显式调用不依赖 binfmt
+    if rc == 0 or "qemu-" in combined:
+        verdict = "裸跑被内核转译给 qemu(已注册 binfmt)"
+    else:
+        verdict = "裸跑未产生 ENOEXEC,无法确认内核 binfmt 状态"
+    pytest.skip(
+        "binfmt 独立性对照未验证(非通过):"
+        + (f"{table_note};" if table_note else "")
+        + f"{verdict};实测 rc={rc},输出 {combined[:200]!r}")
+
+
+_ARM32LE_HEADER = (
+    b"\x7fELF" + bytes([1, 1, 1, 0]) + b"\x00" * 8   # e_ident:ELF32 小端
+    + (2).to_bytes(2, "little")                       # e_type = ET_EXEC
+    + (40).to_bytes(2, "little")                      # e_machine = EM_ARM
+)
+
+
+def _arm_binfmt_registered(table_dir: Path | None = None) -> tuple[bool | None, str]:
+    """读测试进程可见的内核 binfmt_misc 表,判定是否注册 ARM32 小端转译。
+
+    返回 (判定, 说明):True=表可读且有 enabled 条目按 magic/mask 匹配;
+    False=表可读且无匹配(含全局 status=disabled);None=表不可读(测试
+    进程与容器内核可能不同,如 Docker Desktop 非 WSL2 后端)。按 magic/
+    mask 匹配,不依赖条目命名;只读,不修改任何条目。行为层面的最终裁决
+    由 test_binfmt_independence_control 的裸跑探测承担——本函数是保守
+    预检:宁可漏报"未注册",不误报(误报会让对照假通过)。
+    """
+    base = Path(table_dir) if table_dir is not None else Path("/proc/sys/fs/binfmt_misc")
+    try:
+        paths = sorted(base.iterdir())
+    except OSError:
+        return None, "宿主侧 binfmt_misc 表不可读"
+    global_status = ""
+    matched: list[str] = []
+    for path in paths:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        if path.name == "status":
+            global_status = text.strip()
+            continue
+        if path.name == "register" or not text.startswith("enabled"):
+            continue
+        if _entry_matches_arm32le(text):
+            matched.append(path.name)
+    if global_status == "disabled":
+        return False, "binfmt_misc 全局禁用"
+    if matched:
+        return True, "binfmt_misc 条目: " + ", ".join(matched)
+    return False, "宿主侧 binfmt_misc 表可读且无 ARM 条目"
+
+
+def _entry_matches_arm32le(entry_text: str) -> bool:
+    """单条 binfmt_misc 条目是否匹配 ARM32 小端 ELF(按 magic/mask)。"""
+    fields: dict[str, str] = {}
+    for line in entry_text.splitlines()[1:]:
+        key, _, value = line.partition(" ")
+        fields[key.strip().rstrip(":")] = value.strip()
+    magic_hex = fields.get("magic", "")
+    if not magic_hex:
+        return False  # 扩展名匹配条目与 ELF 无关
+    try:
+        magic = bytes.fromhex(magic_hex)
+        mask = (bytes.fromhex(fields["mask"]) if fields.get("mask")
+                else b"\xff" * len(magic))
+        offset = int(fields.get("offset", "0"), 0)
+    except ValueError:
+        return False  # 形态异常的条目不据此判定"未注册"
+    if len(mask) < len(magic):
+        mask = mask.ljust(len(magic), b"\xff")  # 内核语义:缺省按 0xff
+    segment = _ARM32LE_HEADER[offset:offset + len(magic)]
+    if not segment:
+        return True  # 探测头覆盖不到的偏移:保守当作可能匹配
+    overlap = min(len(segment), len(magic))
+    return bytes(a & b for a, b in zip(segment[:overlap], mask[:overlap])) \
+        == magic[:overlap]
+
+
+# ---------- 离线:binfmt 注册表解析(无 Docker,始终跑) ----------
+
+# 本机 /proc/sys/fs/binfmt_misc 实测条目原样形状(2026-09-23;解析器夹具)。
+_ARM_ENTRY = """enabled
+interpreter /usr/bin/qemu-arm
+flags: POCF
+offset 0
+magic 7f454c4601010100000000000000000002002800
+mask ffffffffffffff00fffffffffffffffffeffffff
+"""
+_AARCH64_ENTRY = """enabled
+interpreter /usr/bin/qemu-aarch64
+flags: POCF
+offset 0
+magic 7f454c460201010000000000000000000200b700
+mask ffffffffffffff00fffffffffffffffffeffffff
+"""
+_PYTHON_ENTRY = """enabled
+interpreter /usr/bin/python3.13
+flags:
+offset 0
+magic f30d0d0a
+"""
+
+
+def _write_binfmt_table(tmp_path: Path, entries: dict[str, str],
+                        *, status: str = "enabled") -> Path:
+    table = tmp_path / "binfmt_misc"
+    table.mkdir(parents=True, exist_ok=True)
+    (table / "register").write_text("", encoding="utf-8")
+    (table / "status").write_text(status, encoding="utf-8")
+    for name, text in entries.items():
+        (table / name).write_text(text, encoding="utf-8")
+    return table
+
+
+def test_arm_binfmt_registered_matches_real_arm_entry(tmp_path: Path) -> None:
+    verdict, note = _arm_binfmt_registered(
+        _write_binfmt_table(tmp_path, {"arm": _ARM_ENTRY}))
+    assert verdict is True and "arm" in note
+
+
+def test_arm_binfmt_registered_ignores_non_arm_entries(tmp_path: Path) -> None:
+    verdict, note = _arm_binfmt_registered(_write_binfmt_table(tmp_path, {
+        "aarch64": _AARCH64_ENTRY,      # ELF64/e_machine=183:类或机器号不匹配
+        "python3.13": _PYTHON_ENTRY,    # 无 mask(缺省 0xff):magic 不是 ELF
+    }))
+    assert verdict is False and "无 ARM 条目" in note
+
+
+def test_arm_binfmt_registered_respects_disabled(tmp_path: Path) -> None:
+    table = _write_binfmt_table(tmp_path, {"arm": _ARM_ENTRY}, status="disabled")
+    verdict, note = _arm_binfmt_registered(table)
+    assert verdict is False and "全局禁用" in note
+
+
+def test_arm_binfmt_registered_ignores_per_entry_disabled(tmp_path: Path) -> None:
+    verdict, _ = _arm_binfmt_registered(_write_binfmt_table(tmp_path, {
+        "arm": _ARM_ENTRY.replace("enabled", "disabled", 1)}))
+    assert verdict is False
+
+
+def test_arm_binfmt_registered_unreadable_table_is_indeterminate(tmp_path: Path) -> None:
+    verdict, note = _arm_binfmt_registered(tmp_path / "no-such-dir")
+    assert verdict is None and "不可读" in note
+
+
+def test_arm_binfmt_registered_partial_mask_pad_and_offset(tmp_path: Path) -> None:
+    # mask 短于 magic:缺省按 0xff 补齐(内核语义)→ 仍判匹配
+    short_mask = _ARM_ENTRY.replace(
+        "mask ffffffffffffff00fffffffffffffffffeffffff", "mask ffffffffffffff00")
+    verdict, _ = _arm_binfmt_registered(
+        _write_binfmt_table(tmp_path / "a", {"arm": short_mask}))
+    assert verdict is True
+    # offset 大到探测头(ELF 头 20 字节)覆盖不到:保守判可能匹配,不当"未注册"
+    far_offset = _ARM_ENTRY.replace("offset 0", "offset 64")
+    verdict, _ = _arm_binfmt_registered(
+        _write_binfmt_table(tmp_path / "b", {"arm": far_offset}))
+    assert verdict is True
 
 
 # ---------- 真实容器:基础镜像不回归(AC3) ----------
