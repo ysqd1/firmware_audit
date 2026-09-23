@@ -187,8 +187,9 @@ def test_binfmt_independence_control() -> None:
     registered, table_note = _arm_binfmt_registered()
     if registered is True:
         pytest.skip(
-            "binfmt 独立性对照未验证(非通过):执行容器所在内核已注册 ARM "
-            f"binfmt 转译({table_note});按票 01 边界不改宿主,对照在此环境失效")
+            "binfmt 独立性对照未验证(非通过):宿主侧 binfmt_misc 表可见 ARM "
+            f"转译条目({table_note}),按宿主与容器同内核判定对照失效;"
+            "按票 01 边界不改宿主")
     rc, out, err = run_docker(
         image,
         ["-c", "/work/tgt6/usr/sbin/nvram"],
@@ -265,7 +266,7 @@ def _entry_matches_arm32le(entry_text: str) -> bool:
                 else b"\xff" * len(magic))
         offset = int(fields.get("offset", "0"), 0)
     except ValueError:
-        return False  # 形态异常的条目不据此判定"未注册"
+        return False  # 形态异常的条目跳过匹配;误漏由行为探测兜底
     if len(mask) < len(magic):
         mask = mask.ljust(len(magic), b"\xff")  # 内核语义:缺省按 0xff
     segment = _ARM32LE_HEADER[offset:offset + len(magic)]
