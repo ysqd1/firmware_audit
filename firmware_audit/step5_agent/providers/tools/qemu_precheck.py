@@ -539,24 +539,27 @@ class QemuPrecheckTool(AgentTool):
                   f"NEEDED 库 {lib} 在固件根内未找到{truncated_note}"
                   "(运行期加载将失败;确认固件根是否完整或需适配模板补齐)")
 
-        # 6) 模板适用性(票 18 决定性支持表:目标 dynsym 符号级家族判定)
+        # 6) 模板适用性(票 18 决定性支持表:目标 dynsym 符号级家族判定)。
+        #    dynsym 对无 NVRAM 系基名的目标也要解析(复审 S7 盲区):导入
+        #    已核实读取接口/envram 系而无已核实库基名时,维持不判定/阻塞
+        #    并明示,不当"无 NVRAM 依赖"放行;dynsym 不可解析(如静态形态)
+        #    只留 note,不新增阻塞。
         nvram_needed = [lib for lib in elf["needed"]
                         if lib.split("/")[-1] in _NVRAM_FAMILY_BASENAMES]
         tpl: dict = {"nvram_family_needed": nvram_needed}
-        if not nvram_needed:
-            tpl["family"] = "none"
-            tpl["base_templates"] = ("基础适配(目录/配置/argv/环境/stdin/"
-                                     "CGI 输入/夹具)按会话声明提供,预检不校验具体值")
-            report["template_applicability"] = tpl
-        else:
-            try:
-                syms = parse_elf_dynsym(blob)
-                family = nvram_family_for_target(
-                    elf["needed"], syms["undefined"], syms["defined"])
-            except ElfParseError as exc:
+        try:
+            syms = parse_elf_dynsym(blob)
+        except ElfParseError as exc:
+            syms = None
+            dynsym_error = str(exc)
+        if nvram_needed:
+            if syms is None:
                 family = {"family": "unknown", "libs": nvram_needed,
                           "undefined_supported": [], "undefined_envram": [],
-                          "note": f"目标 dynsym 解析失败,家族不可判定: {exc}"}
+                          "note": f"目标 dynsym 解析失败,家族不可判定: {dynsym_error}"}
+            else:
+                family = nvram_family_for_target(
+                    elf["needed"], syms["undefined"], syms["defined"])
             tpl.update({k: family.get(k) for k in
                         ("family", "libs", "undefined_supported",
                          "undefined_envram", "note")})
@@ -589,6 +592,28 @@ class QemuPrecheckTool(AgentTool):
                                  + (family.get("note") or "维持不判定/阻塞(票 18 口径)"))
                 block("template_applicability", QemuResultClass.DEPENDENCY_BLOCKED,
                       tpl["detail"])
+            report["template_applicability"] = tpl
+        else:
+            family = (nvram_family_for_target(elf["needed"], syms["undefined"],
+                                              syms["defined"])
+                      if syms is not None else None)
+            tpl["base_templates"] = ("基础适配(目录/配置/argv/环境/stdin/"
+                                     "CGI 输入/夹具)按会话声明提供,预检不校验具体值")
+            if family is not None and family["family"] != "none":
+                tpl.update({k: family.get(k) for k in
+                            ("family", "libs", "undefined_supported",
+                             "undefined_envram", "note")})
+                tpl["supported_reads"] = []
+                tpl["template_status"] = "undetermined"
+                tpl["detail"] = ("目标导入 NVRAM 系符号但 NEEDED 无已核实库基名;"
+                                 + (family.get("note") or "维持不判定/阻塞(票 18 口径)"))
+                block("template_applicability", QemuResultClass.DEPENDENCY_BLOCKED,
+                      tpl["detail"])
+            else:
+                tpl["family"] = "none"
+                if syms is None:
+                    tpl["dynsym_note"] = (f"dynsym 不可解析({dynsym_error});"
+                                          "按无动态导入符号处理,不据此宣称无 NVRAM 调用")
             report["template_applicability"] = tpl
 
         # 7) 执行设施(镜像内 qemu 自报版本;能走到这里说明架构已入选)
@@ -629,7 +654,7 @@ def _render_text(report: dict) -> str:
     else:
         lines.append("- 依赖: 无 NEEDED(静态或不可解析)")
     tpl = report.get("template_applicability") or {}
-    if tpl.get("nvram_family_needed"):
+    if tpl.get("nvram_family_needed") or tpl.get("family") not in (None, "none"):
         status = tpl.get("template_status")
         if status == "supported_reads_unlocked":
             lines.append(f"- 模板适用性: NVRAM[{tpl.get('family')}] 已核实读取接口"
@@ -642,7 +667,8 @@ def _render_text(report: dict) -> str:
             lines.append(f"- 模板适用性: NVRAM[{tpl.get('family')}] 未解锁"
                          f"({tpl.get('note') or status});当前为运行阻塞")
     elif "nvram_family_needed" in tpl:
-        lines.append("- 模板适用性: 无 NVRAM 系依赖(基础适配按会话声明提供)")
+        lines.append("- 模板适用性: 无 NVRAM 系依赖(基础适配按会话声明提供)"
+                     + (f";{tpl['dynsym_note']}" if tpl.get("dynsym_note") else ""))
     facility = report.get("execution_facility") or {}
     if facility.get("available") is True:
         version = facility.get("version") or "版本可查"

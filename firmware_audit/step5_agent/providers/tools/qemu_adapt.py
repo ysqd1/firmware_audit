@@ -33,7 +33,7 @@ from .base import resolve_within
 # ---- 适配桩身份(docker/nvram-shim/build_shim.sh 产物的钉值;漂移拒绝) ----
 
 NVRAM_SHIM_BASENAME = "libnvram_shim.so"
-NVRAM_SHIM_SHA256 = "d5bda54811bec49ca376ce4e7d2266feb48bc5e6f0907d36d421b17176170a15"
+NVRAM_SHIM_SHA256 = "2de58934a38003c2de871fe858a9476ab30b1b02b06e834e6bc437ab5fcf73ca"
 _SHIM_SOURCE = Path(__file__).resolve().parents[3] / "docker" / "nvram-shim" / NVRAM_SHIM_BASENAME
 
 # 容器内固定形状(与 nvram_shim.c 的常量一一对应,改动必须两侧同步)。
@@ -60,9 +60,10 @@ NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # NVRAM 系库基名(票 02 三方 /dev/nvram 同协议库;预检闸门与家族判定共用)。
 NVRAM_FAMILY_BASENAMES = ("libnvram.so", "libCfm.so", "libtpi.so")
 
-# bind 目标保留前缀(guest 视角):/session 是后端挂载命名空间,/dev 是
-# 固定设备绑定形状,/tmp 是会话运行目录本体,/host-rootfs 是执行边界。
-_RESERVED_GUEST_PREFIXES = ("/session", "/dev", "/tmp", "/host-rootfs")
+# bind/argv0 等 guest 目标路径保留前缀(guest 视角;声明与 argv0 bind 两
+# 通道共用的单一出处):/session 是后端挂载命名空间,/dev 是固定设备绑定
+# 形状,/tmp 是会话运行目录本体,/host-rootfs 是执行边界。
+RESERVED_GUEST_PREFIXES = ("/session", "/dev", "/tmp", "/host-rootfs")
 
 
 class AdaptationError(ValueError):
@@ -140,7 +141,7 @@ def parse_binds(text: str, root: Path, fixtures: dict[str, bytes]) -> list[dict]
         if ".." in guest.split("/"):
             raise AdaptationError(f"bind 目标折叠后仍含 ..: {guest}")
         if any(guest == p or guest.startswith(p + "/")
-               for p in _RESERVED_GUEST_PREFIXES):
+               for p in RESERVED_GUEST_PREFIXES):
             raise AdaptationError(
                 f"bind 目标命中保留前缀(后端命名空间/设备/运行目录/执行边界): {guest}")
         if guest in seen_guests:
@@ -394,13 +395,22 @@ def nvram_family_for_target(needed: list[str], undefined: list[str],
     - 两类并存 → mixed(模板覆盖 /dev/nvram 读取,envram 调用将失败);
     - NEEDED 命中 NVRAM 系基名但导入/导出符号都不能定家族 → unknown
       (维持不判定/阻塞,不因同名库放行);
-    - NEEDED 无 NVRAM 系基名 → none(无需模板)。
+    - 无已知基名但导入 NVRAM 系符号 → unknown(复审 S7:符号证据明示,
+      支持表无法分族,维持不判定/阻塞,不因导入符号放行模板);
+    - NEEDED 无 NVRAM 系基名且无 NVRAM 系导入符号 → none(无需模板)。
     """
     libs = sorted({lib.split("/")[-1] for lib in needed
                    if lib.split("/")[-1] in NVRAM_FAMILY_BASENAMES})
     und_supported = sorted(set(undefined) & set(NVRAM_SUPPORTED_READS))
     und_envram = sorted({s for s in undefined if s.startswith(_ENVGRAM_PREFIX)})
     if not libs:
+        if und_supported or und_envram:
+            return {"family": "unknown", "libs": [],
+                    "undefined_supported": und_supported,
+                    "undefined_envram": und_envram,
+                    "note": ("目标导入 NVRAM 系符号但 NEEDED 无已核实库基名:"
+                             "支持表无法分族,维持不判定/阻塞,不因导入符号放行"
+                             "模板(相关调用运行期将如实失败)")}
         return {"family": "none", "libs": [], "undefined_supported": [],
                 "undefined_envram": [], "note": None}
     exported_set = set(exported)

@@ -16,11 +16,14 @@
  * 映像格式与 getall 一致:"k=v\0" 串表(票 02 消费侧印证)。
  *
  * 支持表边界(票 18 AC,依据票 02 支持表草案):
- *   - 只覆盖读取:未声明键 read 返回 0 + 键名追加到未决日志,不伪造值;
+ *   - 只覆盖读取:键查询按协议形状判定(read(fd,name,strlen+1) 才是键查询;
+ *     getall/show 等输出缓冲 read 形状不符,按缺失键语义返回 0 且不写日志、
+ *     不改写缓冲——复审 P-c2);未声明键 read 返回 0 + 键名追加到未决日志,
+ *     不伪造值;
  *   - 写不支持:重定向 fd 强制只读,write 返回 EBADF → set/unset/commit
  *     由真实库代码如实失败;
- *   - nvram_getall 走同一 read 协议得到协议响应而非整表填充,库按 ret!=len
- *     判失败——第二批次接口,如实不成功;
+ *   - nvram_getall 不在支持表:其 read 非键查询形状,得 0 后库按 ret!=len
+ *     如实判失败,模板值不整表泄漏;
  *   - envram(MTD)系不经本桩(不拦其 MTD 路径),对着缺失 MTD 如实失败。
  *
  * 实现约束:-nostdlib 纯内联 svc syscall(ARM EABI:调用号 r7,svc 0),
@@ -303,26 +306,24 @@ long read(int fd, void *buf, unsigned long count) {
         long off;
         load_image();
         if (count == 0) return 0;
+        /* 键查询判定(票 02 协议形状):合法键查询是 read(fd,name,strlen+1),
+         * 缓冲内含名字与终止 NUL。形状不符(getall/show 的输出缓冲等)不是
+         * 键查询:按缺失键语义返回 0(库按 ret!=len 如实判失败),不把缓冲
+         * 内容当键名写未决日志,也不改写调用方缓冲(复审 P-c2)。 */
         while (len < count && p[len] != '\0') len++;
-        if (len == count) {
-            /* 缓冲内无 NUL:截断到最后一个字节再判,不越界 */
-            len = count - 1;
-            p[len] = '\0';
-        }
+        if (len == 0 || len + 1 != count) return 0;
         off = lookup_offset(p, len);
-        if (off >= 0) {
-            u32 v = (u32)off;
-            if (count >= 4) {
-                p[0] = (char)(v & 0xff);
-                p[1] = (char)((v >> 8) & 0xff);
-                p[2] = (char)((v >> 16) & 0xff);
-                p[3] = (char)((v >> 24) & 0xff);
-                return 4;
-            }
-            return 0; /* 调用方缓冲不足,按缺失键语义处理 */
+        if (off < 0) {
+            log_unresolved(p, len);
+            return 0; /* 固件缺失键语义:ret≠4 → 库返回 NULL */
         }
-        log_unresolved(p, len);
-        return 0; /* 固件缺失键语义:ret≠4 → 库返回 NULL */
+        if (count < 4) return 0; /* 调用方缓冲不足,按缺失键语义处理 */
+        u32 v = (u32)off;
+        p[0] = (char)(v & 0xff);
+        p[1] = (char)((v >> 8) & 0xff);
+        p[2] = (char)((v >> 16) & 0xff);
+        p[3] = (char)((v >> 24) & 0xff);
+        return 4;
     }
     return sys3(SYS_read, (long)fd, (long)buf, (long)count);
 }

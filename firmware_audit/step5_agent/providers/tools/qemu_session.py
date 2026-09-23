@@ -269,7 +269,7 @@ class QemuExecuteTool(AgentTool):
                           "argv[0]):默认为目标 guest 路径;多路复用 CGI 传"
                           "真实调用路径(如 /htdocs/web/conntrack.cgi),目标"
                           "会以同一文件身份 bind 到该路径呈现,不遮蔽固件根内"
-                          "已有文件"},
+                          "已有文件;/session、/dev、/tmp、/host-rootfs 保留"},
         "env": {"type": "str", "default": "",
                 "desc": "额外环境变量,换行分隔的 K=V(值可含 =);不继承宿主环境"},
         "cwd": {"type": "str", "default": "/",
@@ -704,6 +704,17 @@ class QemuExecuteTool(AgentTool):
             raise _PrepError("argv0 必须是 guest 内绝对路径(多路复用 CGI 的"
                              "真实调用形态)且不含 .. 或 NUL")
         guest_target = "/" + target.relative_to(root).as_posix()
+        # argv0 的 bind 通道与声明 bind 同受保留前缀约束(复审 S1):模型
+        # 不能借 argv0 把目标呈现到后端命名空间/设备/运行目录/执行边界,
+        # 防止遮蔽适配桩、模板映像或声明输入。默认形态(argv0==guest 路径,
+        # 固件根相对路径)不进 bind 分支,不受此闸影响。
+        if (declared_argv0 and declared_argv0 != guest_target
+                and any(declared_argv0 == p
+                        or declared_argv0.startswith(p + "/")
+                        for p in qemu_adapt.RESERVED_GUEST_PREFIXES)):
+            raise _PrepError(
+                f"argv0 命中保留前缀(后端命名空间/设备/运行目录/执行边界): "
+                f"{declared_argv0}")
         if declared_argv0 and declared_argv0 != guest_target:
             existing = root / declared_argv0.lstrip("/")
             if existing.exists() and existing.resolve() != target.resolve():
@@ -748,6 +759,12 @@ class QemuExecuteTool(AgentTool):
             stdin_path = self._resolve_extracted(stdin_ref)
             if stdin_path is None or not stdin_path.is_file():
                 raise _PrepError(f"stdin_ref 不存在或越界: {stdin_ref}")
+            # stat 先行:超限在整文件读入内存前拒绝(复审 S2,超大文件不得
+            # 造成宿主内存尖峰);读后再校验一次,stat 与读取之间的窗口
+            # 不放大上限。
+            if stdin_path.stat().st_size > _STDIN_MAX_BYTES:
+                raise _PrepError(
+                    f"stdin_ref 超过上限 {_STDIN_MAX_BYTES} 字节: {stdin_ref}")
             stdin_bytes = stdin_path.read_bytes()
             if len(stdin_bytes) > _STDIN_MAX_BYTES:
                 raise _PrepError(

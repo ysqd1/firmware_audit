@@ -540,6 +540,83 @@ def test_precheck_nvram_mixed_family_unlocks_reads_with_caveat() -> list[str]:
     return fails
 
 
+def test_precheck_nvram_import_without_family_basename_blocked() -> list[str]:
+    """票 18 复审 S7:导入已核实读取接口/envram 系但 NEEDED 无已核实库基名
+    → 家族不可判定,维持阻塞并明示符号证据(AC8 口径);不因导入符号放行
+    模板,也不当"无 NVRAM 依赖"放行。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        ws, fref, rref = _make_workspace(
+            Path(td),
+            blob=elf32_blob(machine=40, interp=ARM_LE_LOADER,
+                            needed=["libc.so.0", "libmystery.so"],
+                            dynsym=[("nvram_get", False), ("printf", False)]),
+            loader=ARM_LE_LOADER,
+            libs={"libc.so.0": _fake_loader(), "libmystery.so": _fake_loader()})
+        with stub_facility():
+            r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        tpl = d.get("template_applicability") or {}
+        if tpl.get("family") != "unknown":
+            fails.append(f"导入 nvram_get 而无已核实基名应 unknown: {tpl.get('family')}")
+        if tpl.get("template_status") != "undetermined":
+            fails.append(f"应记 undetermined: {tpl.get('template_status')}")
+        if tpl.get("undefined_supported") != ["nvram_get"]:
+            fails.append(f"符号证据应明示: {tpl.get('undefined_supported')}")
+        if tpl.get("supported_reads"):
+            fails.append(f"不得因导入符号解锁模板: {tpl.get('supported_reads')}")
+        if d.get("result_class") != "dependency_blocked":
+            fails.append(f"应 dependency_blocked: {d.get('result_class')} "
+                         f"{[b['detail'] for b in d.get('blockers') or []]}")
+        detail = " ".join(b["detail"] for b in d.get("blockers") or [])
+        if "无已核实库基名" not in detail:
+            fails.append(f"阻塞应说明缺已核实库基名: {detail}")
+    return fails
+
+
+def test_precheck_nvram_absent_family_none_and_static_note() -> list[str]:
+    """票 18 复审 P-a1(AC6):无 NVRAM 系基名且无 NVRAM 系导入符号
+    → family none、无阻塞(target/8 形态);静态形态 dynsym 不可解析只留
+    note,不新增阻塞、不据此宣称无 NVRAM 调用。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        # ① 动态形态:普通 libc 依赖 + 无 NVRAM 符号
+        ws, fref, rref = _make_workspace(
+            Path(td),
+            blob=elf32_blob(machine=40, interp=ARM_LE_LOADER,
+                            needed=["libc.so.0"],
+                            dynsym=[("printf", False)]),
+            loader=ARM_LE_LOADER, libs={"libc.so.0": _fake_loader()})
+        with stub_facility():
+            r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        tpl = d.get("template_applicability") or {}
+        if tpl.get("family") != "none":
+            fails.append(f"无 NVRAM 依赖应 none: {tpl}")
+        if d.get("result_class") != "ok":
+            fails.append(f"none 族不应阻塞: {d.get('result_class')} "
+                         f"{[b['detail'] for b in d.get('blockers') or []]}")
+    with tempfile.TemporaryDirectory() as td:
+        # ② 静态形态(无动态段):none + dynsym note,不阻塞
+        ws, fref, rref = _make_workspace(
+            Path(td),
+            blob=elf32_blob(machine=8, little=False, interp=None,
+                            needed=[], with_dynamic=False),
+            loader=None, libs={})
+        with stub_facility():
+            r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        tpl = d.get("template_applicability") or {}
+        if tpl.get("family") != "none":
+            fails.append(f"静态形态应 none: {tpl}")
+        if "dynsym 不可解析" not in (tpl.get("dynsym_note") or ""):
+            fails.append(f"静态形态应留 dynsym note: {tpl.get('dynsym_note')}")
+        if d.get("result_class") != "ok":
+            fails.append(f"静态形态不因 dynsym 缺失阻塞: {d.get('result_class')} "
+                         f"{[b['detail'] for b in d.get('blockers') or []]}")
+    return fails
+
+
 def test_precheck_unsupported_arch_prep_blocked_no_facility_call() -> list[str]:
     fails: list[str] = []
     with tempfile.TemporaryDirectory() as td:
@@ -863,6 +940,10 @@ def test_real_precheck_tgt8_busybox_ready() -> None:
     assert d["interpreter"]["present"] is True
     assert d["dependencies"]["missing"] == []
     assert set(d["dependencies"]["needed"]) == {"libgcc_s.so.1", "libc.so"}
+    # 票 18 复审 P-a1(AC6):target/8 不在 NVRAM 支持表——无 NVRAM 系基名
+    # 且导入无 NVRAM 系符号,支持表排除必须有直接断言
+    assert d["template_applicability"]["family"] == "none"
+    assert not d["template_applicability"].get("supported_reads")
     assert d["execution_facility"]["available"] is True
     assert image in d["execution_facility"]["image"]
     # 限制句纪律(票 04 约束 1/2):通过≠子进程链已验证
@@ -952,6 +1033,8 @@ def test_main() -> int:
         ("precheck_nvram_dev_family_unlocks_supported_reads", test_precheck_nvram_dev_family_unlocks_supported_reads),
         ("precheck_nvram_envram_family_stays_blocked", test_precheck_nvram_envram_family_stays_blocked),
         ("precheck_nvram_mixed_family_unlocks_reads_with_caveat", test_precheck_nvram_mixed_family_unlocks_reads_with_caveat),
+        ("precheck_nvram_import_without_family_basename_blocked", test_precheck_nvram_import_without_family_basename_blocked),
+        ("precheck_nvram_absent_family_none_and_static_note", test_precheck_nvram_absent_family_none_and_static_note),
         ("precheck_unsupported_arch_prep_blocked_no_facility_call", test_precheck_unsupported_arch_prep_blocked_no_facility_call),
         ("precheck_not_elf_prep_blocked", test_precheck_not_elf_prep_blocked),
         ("precheck_facility_failure", test_precheck_facility_failure),

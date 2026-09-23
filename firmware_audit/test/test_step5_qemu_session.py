@@ -630,6 +630,20 @@ def test_argv0_rejects_nul_injection(tmp_path: Path, fake_docker: FakeDocker) ->
     assert not any(call[0] == "run_detached" for call in fake_docker.calls)
 
 
+def test_argv0_rejects_reserved_guest_prefixes(tmp_path: Path,
+                                               fake_docker: FakeDocker) -> None:
+    """票 18 复审 S1:argv0 bind 通道与声明 bind 同受保留前缀约束——
+    /session(后端挂载命名空间/模板材料)、/dev、/tmp、/host-rootfs 不得
+    借 argv0 把目标呈现到这些路径,防止遮蔽适配桩/模板映像或声明输入。"""
+    _arm_workspace(tmp_path)
+    for bad in ("/session/adapt/nvram.img", "/session/input",
+                "/dev/nvram", "/tmp/probe", "/host-rootfs/etc/passwd"):
+        r = _tool(tmp_path).execute(**_default_kwargs(argv0=bad))
+        assert r.data["result_class"] == "prep_blocked", (bad, r.data)
+        assert "保留前缀" in r.data["detail"], (bad, r.data.get("detail"))
+        assert not any(call[0] == "run_detached" for call in fake_docker.calls), bad
+
+
 def test_cleanup_escalation_and_leftover(tmp_path: Path, fake_docker: FakeDocker) -> None:
     _arm_workspace(tmp_path)
     fake_docker.count_queue = ["2", "0"]
@@ -1303,6 +1317,37 @@ def test_stdin_delivery_records_digest(tmp_path: Path, fake_docker) -> None:
     assert entry["executions"][0]["declared"]["stdin"]["size_bytes"] == 15
 
 
+def test_stdin_oversized_refused_before_full_read(tmp_path: Path, fake_docker,
+                                                  monkeypatch) -> None:
+    """票 18 复审 S2:超限 stdin_ref 必须在整文件读入内存前拒绝(stat 先行),
+    超大 extracted 文件不得造成宿主内存尖峰;拒绝走 prep_blocked 台账通道。"""
+    ws = tmp_path / "ws"
+    _arm_workspace(ws)
+    big = ws / "extracted" / "fw" / "big-stdin.bin"
+    with open(big, "wb") as f:
+        f.truncate(qs._STDIN_MAX_BYTES + 1)  # 稀疏文件:仅尺寸越限
+    tool = _tool(ws, role="analysis")
+
+    real_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(self: Path) -> bytes:
+        if self == big:
+            raise AssertionError("超限 stdin_ref 不得整文件读入内存")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    r = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                     investigation_ref="case-bigstdin",
+                     stdin_ref="fw/big-stdin.bin")
+    d = r.data
+    assert d["result_class"] == "prep_blocked", d
+    assert "上限" in d["detail"], d.get("detail")
+    assert fake_docker.stdin_sizes == [], "超限声明不得到达执行"
+    ledger = _read_ledger(ws)
+    assert any(ref["reason"] == "prep_blocked" and "上限" in ref["detail"]
+               for ref in ledger["refusals"])
+
+
 def _require_real():
     from firmware_audit.docker.docker_utils import docker_available
     if not docker_available(QEMU_EXEC_V2_IMAGE):
@@ -1723,6 +1768,38 @@ def test_real_t6_nvram_abi_known_missing_unknown(tmp_path: Path,
     assert ledger_entry["executions"][2]["adaptation_gaps"] == gaps
 
 
+def test_real_t6_nvram_getall_honest_fail_without_gap_pollution(
+        tmp_path: Path, monkeypatch) -> None:
+    """票 18 复审 P-c2:getall/show(nvram_getall)不在支持表——其 read 是
+    输出缓冲形状(大 count),不符合键查询协议(read(fd,name,strlen+1)),
+    桩按缺失键语义返回 0 后库如实判失败:模板值不得整表泄漏,输出缓冲内容
+    不得被当键名写入未决日志污染 adaptation_gaps。"""
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    if not TGT6_SQUASH.is_dir():
+        pytest.skip(f"target/6 解包树缺失: {TGT6_SQUASH}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    assert _copy_rel(TGT6_SQUASH, root, "usr/sbin/nvram")
+    _copy_lib_tree(TGT6_SQUASH, root)
+    tool = _tool(ws, role="analysis")
+    r = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                     investigation_ref="case-t6getall", use_strace=False,
+                     args="show",
+                     nvram_values="wl0_ssid=fwtest_ssid\nrouter_mode=ap\n",
+                     nvram_sources="wl0_ssid=declared_test_input\n"
+                                   "router_mode=declared_test_input\n")
+    d = r.data
+    out = (d["observation_excerpt"]["stdout"]["excerpt"]
+           + d["observation_excerpt"]["stderr"]["excerpt"])
+    # getall 不在支持表:模板值不得经整表读取泄漏(桩按缺失键语义应答)
+    assert "fwtest_ssid" not in out and "router_mode" not in out, out[:400]
+    # 输出缓冲内容不得被当键名写未决日志:本次执行无未决 gap
+    assert d["adaptation_gaps"] is None, d.get("adaptation_gaps")
+
+
 def test_real_t7_nvram_abi_and_envram_negative(tmp_path: Path,
                                                monkeypatch) -> None:
     """票 18 AC(target/7):真实固件库读取设备真实默认值
@@ -1847,11 +1924,13 @@ def test_real_t6_conntrack_cgi_honest_block(tmp_path: Path, monkeypatch) -> None
         timeout_seconds=45)
     d = r.data
     # 会话门(argv0 分发、/var 会话存储、sesscfg 解析)真实运行过;
-    # 在产出业务输出前 SIGSEGV——崩溃如实分类,不冒充业务输出
+    # 在产出业务输出前 SIGSEGV——崩溃如实分类,不冒充业务输出。
+    # 复审 P-c3:会话门运行证据钉在 stderr(QEMU_STRACE 的 /var/session
+    # 文件操作),不接受 stdout 兜底(复审前为 stderr/合并流的 OR 弱断言)。
     stderr = (d["observation_excerpt"]["stderr"]["excerpt"]
               + d["observation_excerpt"]["stdout"]["excerpt"])
-    assert "/var/session/1" in d["observation_excerpt"]["stderr"]["excerpt"] or \
-        "/var/session" in stderr, stderr[:400]
+    assert "/var/session" in d["observation_excerpt"]["stderr"]["excerpt"], \
+        d["observation_excerpt"]["stderr"]["excerpt"][:400]
     assert d["result_class"] in ("nonzero_exit", "target_signal"), d
     assert "<conntrack>" not in d["observation_excerpt"]["stdout"]["excerpt"]
     assert "uncaught target signal" in stderr or d["result_class"] == "target_signal"
