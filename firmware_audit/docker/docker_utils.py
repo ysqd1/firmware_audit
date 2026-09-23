@@ -8,6 +8,7 @@ import json
 import os
 import selectors
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -172,9 +173,14 @@ def docker_available(image: str) -> bool:
 # 显式命名 + 逐条 docker exec + 终态 rm -f,原语在此收口,工具层不拼 docker 命令。
 
 def _run_docker_cmd(
-    cmd: list[str], timeout: float, *, max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES
+    cmd: list[str], timeout: float, *, max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+    stdin_bytes: bytes | None = None,
 ) -> tuple[int, str, str]:
-    """Run a Docker CLI command with bounded, concurrently drained output."""
+    """Run a Docker CLI command with bounded, concurrently drained output.
+
+    ``stdin_bytes`` 走 ``docker exec -i`` 通道:写入在独立线程完成(输入超过
+    管道容量时不会阻塞输出排水;子进程不读也只丢写入线程,不影响主流程)。
+    """
     if (not isinstance(max_output_bytes, int)
             or isinstance(max_output_bytes, bool)
             or max_output_bytes < 1):
@@ -188,7 +194,18 @@ def _run_docker_cmd(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if stdin_bytes is not None else None,
         )
+        if stdin_bytes is not None and proc.stdin is not None:
+            def _feed(pipe, payload):
+                try:
+                    pipe.write(payload)
+                    pipe.close()
+                except OSError:
+                    pass
+
+            threading.Thread(target=_feed, args=(proc.stdin, stdin_bytes),
+                             daemon=True).start()
         selector = selectors.DefaultSelector()
         for name, stream in (("stdout", proc.stdout), ("stderr", proc.stderr)):
             if stream is not None:
@@ -337,20 +354,26 @@ def docker_exec(
     detach: bool = False,
     timeout: int = 300,
     max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
+    stdin_bytes: bytes | None = None,
 ) -> tuple[int, str, str]:
-    """`docker exec [-d] [-e K=V...] <container> <args>`:直接 argv,不经 shell。
+    """`docker exec [-d] [-i] [-e K=V...] <container> <args>`:直接 argv,不经 shell。
 
     stdout/stderr are drained concurrently and retained only up to
     ``max_output_bytes`` per stream; excess output is reported with a marker.
+    ``stdin_bytes`` 提供时加 ``-i`` 并把字节作为目标进程 stdin(票 18 stdin
+    模板;有界写入线程,不阻塞输出排水)。
     """
     cmd = ["docker", "exec"]
     if detach:
         cmd.append("-d")
+    if stdin_bytes is not None:
+        cmd.append("-i")
     for k, v in (env or {}).items():
         cmd += ["-e", f"{k}={v}"]
     cmd.append(container)
     cmd += args
-    return _run_docker_cmd(cmd, timeout, max_output_bytes=max_output_bytes)
+    return _run_docker_cmd(cmd, timeout, max_output_bytes=max_output_bytes,
+                           stdin_bytes=stdin_bytes)
 
 
 def docker_rm(container: str, *, timeout: int = 60) -> tuple[int, str, str]:

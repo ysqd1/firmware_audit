@@ -48,8 +48,10 @@ def test_detached_session_accepts_explicit_pids_limit(monkeypatch) -> None:
 def test_docker_exec_forwards_output_limit(monkeypatch) -> None:
     seen: dict[str, object] = {}
 
-    def fake_run(cmd: list[str], timeout: int, *, max_output_bytes: int):
-        seen.update(cmd=cmd, timeout=timeout, max_output_bytes=max_output_bytes)
+    def fake_run(cmd: list[str], timeout: int, *, max_output_bytes: int,
+                 stdin_bytes: bytes | None = None):
+        seen.update(cmd=cmd, timeout=timeout, max_output_bytes=max_output_bytes,
+                    stdin_bytes=stdin_bytes)
         return 0, "", ""
 
     monkeypatch.setattr(docker_utils, "_run_docker_cmd", fake_run)
@@ -57,6 +59,9 @@ def test_docker_exec_forwards_output_limit(monkeypatch) -> None:
     docker_utils.docker_exec("container", ["command"], max_output_bytes=4096)
 
     assert seen["max_output_bytes"] == 4096
+    # 未声明 stdin 时不加 -i、不传字节(票 18)
+    assert "-i" not in seen["cmd"]
+    assert seen["stdin_bytes"] is None
 
 
 def test_bounded_capture_marks_each_flooded_stream() -> None:
@@ -166,3 +171,37 @@ def test_immutable_image_identity_is_read_from_inspect(monkeypatch):
         0, json.dumps([{"Id": "sha256:abc", "Config": {"Labels": {"fw.qemu.version": "11.1.1"}}}]), ""))
     identity = docker_utils.docker_image_identity("example:fixed")
     assert identity == {"image_id": "sha256:abc", "labels": {"fw.qemu.version": "11.1.1"}}
+
+
+def test_docker_exec_stdin_bytes_adds_interactive_flag(monkeypatch) -> None:
+    """票 18:stdin_bytes 走 docker exec -i 通道并原样转发给底层命令。"""
+    seen: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], timeout: int, *, max_output_bytes: int,
+                 stdin_bytes: bytes | None = None):
+        seen.update(cmd=cmd, stdin_bytes=stdin_bytes)
+        return 0, "", ""
+
+    monkeypatch.setattr(docker_utils, "_run_docker_cmd", fake_run)
+
+    docker_utils.docker_exec("container", ["command"], stdin_bytes=b"payload")
+
+    assert "-i" in seen["cmd"]
+    assert seen["stdin_bytes"] == b"payload"
+
+
+def test_run_docker_cmd_feeds_stdin_to_child(monkeypatch) -> None:
+    """票 18:_run_docker_cmd 的 stdin 通道用真实子进程验证——字节完整
+    馈入、写完关闭(子进程读到 EOF),不阻塞输出排水。"""
+    import sys
+
+    payload = b"uid=admin&pwd=x" * 10000  # 150 KB,超过管道容量,验证写线程
+    rc, out, err = docker_utils._run_docker_cmd(
+        [sys.executable, "-c",
+         "import sys; data = sys.stdin.buffer.read(); "
+         "sys.stdout.write(str(len(data))); "
+         "sys.stderr.write('eof' if data else 'empty')"],
+        60, stdin_bytes=payload)
+    assert rc == 0
+    assert out.strip() == str(len(payload))
+    assert "eof" in err

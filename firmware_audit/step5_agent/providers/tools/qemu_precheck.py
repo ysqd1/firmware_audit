@@ -9,9 +9,11 @@
   investigation/proot540-qemu1111-2026-09-22/),链能力仍以会话期实测为准。
 - 结果分类只从 PRECHECK_RESULT_CLASSES 子集发出;解析原始信息全量进
   data,阻塞必有 detail,不静默丢弃。
-- 模板适用性(票 02 移交口径):NEEDED 含 NVRAM 系库 → 需模板注入;模板
-  支持表未定稿(票 11)按 ADR-0013 记运行阻塞;/dev/nvram 系与
-  envram(MTD)系的家族归属需符号级核实,预检不判定。
+- 模板适用性(票 18 口径,支持表决定性):NEEDED 含 NVRAM 系库 → 目标
+  dynsym 符号级家族判定(导入 nvram_get/bcm_nvram_get = /dev/nvram 系,
+  已核实+实测接口解锁;导入 envram_* = MTD 未支持族阻塞;基名命中但
+  符号不可判定 = 维持阻塞)。target/8 不在 NVRAM 支持表;模板值须会话
+  声明且逐项有来源(见 qemu_adapt)。
 
 ToolResult.ok 语义:预检报告成功产出即为 True(阻塞是发现,不是预检失败);
 分类与阻塞项看 data.result_class / data.blockers。参数未过契约才 ok=False。
@@ -24,6 +26,11 @@ from pathlib import Path
 from ....docker.docker_utils import docker_available, docker_image_identity, run_docker
 from .base import AgentTool, ToolResult, resolve_within
 from .cli_base import extracted_root
+from .qemu_adapt import (
+    NVRAM_FAMILY_BASENAMES,
+    NVRAM_SUPPORTED_READS,
+    nvram_family_for_target,
+)
 from .qemu_base import (
     QEMU_EXEC_IMAGE,
     QEMU_EXEC_V2_IMAGE,
@@ -43,7 +50,7 @@ _LIB_SEARCH_CAP = 20000  # 递归兜底的条目上限(防病态树;超出记入
 
 # NVRAM 系库基名(票 02:三方 /dev/nvram 同协议库;envram 家族的库归属
 # 需符号级核实,基名匹配只标"需要 NVRAM 模板",不判定家族)
-_NVRAM_FAMILY_BASENAMES = ("libnvram.so", "libCfm.so", "libtpi.so")
+_NVRAM_FAMILY_BASENAMES = NVRAM_FAMILY_BASENAMES
 
 # 固定限制句(每份报告必带;措辞是票 04/16 纪律的落点,不得改写为能力宣称)
 _LIMIT_NO_EXEC = ("预检是静态核查:不执行目标、不运行固件或其加载器、"
@@ -88,6 +95,116 @@ def _vaddr_to_offset(loads: list[tuple[int, int, int]], vaddr: int) -> int | Non
         if vaddr0 <= vaddr < vaddr0 + filesz:
             return offset + (vaddr - vaddr0)
     return None
+
+
+# 动态符号解析的防御上限(防病态/损坏 dynsym;超出报解析失败,不静默截断)
+_DYNSYM_COUNT_CAP = 65536
+
+
+def parse_elf_dynsym(blob: bytes) -> dict:
+    """解析 ELF 动态符号表的已定义/未定义符号名(票 18 家族判定用)。
+
+    纯 struct,32/64 位、大小端通吃;符号数取 DT_HASH nchain,缺 DT_HASH 时
+    以 strtab 紧邻 symtab 的布局估算((strtab-symtab)/entsize,常见布局)——
+    两种来源都不可用时抛 ElfParseError(调用方按"不可判定"处理,不猜)。
+    只读字节,不执行代码。
+    """
+    if len(blob) < 20 or blob[:4] != b"\x7fELF":
+        raise ElfParseError("非 ELF 文件(魔数不符)")
+    ei_class, ei_data = blob[4], blob[5]
+    if ei_class not in (1, 2) or ei_data not in (1, 2):
+        raise ElfParseError(f"ELF class/data 非法: {ei_class}/{ei_data}")
+    end = "<" if ei_data == 1 else ">"
+    bits = 32 if ei_class == 1 else 64
+    if bits == 32:
+        phoff = struct.unpack_from(end + "I", blob, 28)[0]
+        phentsize, phnum = struct.unpack_from(end + "HH", blob, 42)
+    else:
+        phoff = struct.unpack_from(end + "Q", blob, 32)[0]
+        phentsize, phnum = struct.unpack_from(end + "HH", blob, 54)
+    if phnum == 0 or phentsize == 0:
+        raise ElfParseError("无程序头表")
+    phdr_end = phoff + phnum * phentsize
+    if phoff <= 0 or phdr_end > len(blob):
+        raise ElfParseError("程序头表越界")
+
+    loads: list[tuple[int, int, int]] = []
+    dynamic: tuple[int, int] | None = None
+    for i in range(phnum):
+        base = phoff + i * phentsize
+        if bits == 32:
+            p_type, p_offset, p_vaddr, _pa, p_filesz = struct.unpack_from(
+                end + "IIIII", blob, base)
+        else:
+            p_type, _flags = struct.unpack_from(end + "II", blob, base)
+            p_offset, p_vaddr, _pa, p_filesz = struct.unpack_from(
+                end + "QQQQ", blob, base + 8)
+        if p_type == _PT_LOAD:
+            loads.append((p_vaddr, p_offset, p_filesz))
+        elif p_type == _PT_DYNAMIC:
+            dynamic = (p_offset, p_filesz)
+    if dynamic is None:
+        raise ElfParseError("无动态段(静态形态无 dynsym)")
+
+    doff, dsz = dynamic
+    entsize = 8 if bits == 32 else 16
+    fmt = end + ("iI" if bits == 32 else "qQ")
+    if dsz % entsize or doff + dsz > len(blob):
+        raise ElfParseError("动态段越界或长度非法")
+    symtab = strtab = hash_vaddr = None
+    for off in range(doff, doff + dsz, entsize):
+        tag, val = struct.unpack_from(fmt, blob, off)
+        if tag == _DT_NULL:
+            break
+        if tag == 6:
+            symtab = val          # DT_SYMTAB
+        elif tag == 5:
+            strtab = val          # DT_STRTAB
+        elif tag == 4:
+            hash_vaddr = val      # DT_HASH
+    if symtab is None or strtab is None:
+        raise ElfParseError("动态段缺 DT_SYMTAB/DT_STRTAB")
+    symtab_off = _vaddr_to_offset(loads, symtab)
+    strtab_off = _vaddr_to_offset(loads, strtab)
+    if symtab_off is None or strtab_off is None:
+        raise ElfParseError("DT_SYMTAB/DT_STRTAB 不在任何 PT_LOAD 内")
+    count: int | None = None
+    if hash_vaddr is not None:
+        hash_off = _vaddr_to_offset(loads, hash_vaddr)
+        if hash_off is not None and hash_off + 8 <= len(blob):
+            count = struct.unpack_from(end + "I", blob, hash_off + 4)[0]
+    if count is None and strtab_off > symtab_off:
+        sym_entsize = 16 if bits == 32 else 24
+        count = (strtab_off - symtab_off) // sym_entsize
+    if count is None or count <= 0 or count > _DYNSYM_COUNT_CAP:
+        raise ElfParseError(f"dynsym 符号数不可判定或越界: {count}")
+
+    defined: list[str] = []
+    undefined: list[str] = []
+    sym_fmt = (end + "IIIBBH") if bits == 32 else (end + "IBBHQQ")
+    sym_size = struct.calcsize(sym_fmt)
+    for i in range(count):
+        base = symtab_off + i * sym_size
+        if base + sym_size > len(blob):
+            raise ElfParseError("dynsym 条目越界(文件截断)")
+        if bits == 32:
+            nameoff, _value, _size, _info, _other, shndx = struct.unpack_from(
+                sym_fmt, blob, base)
+        else:
+            nameoff, _info, _other, shndx, _value, _size = struct.unpack_from(
+                sym_fmt, blob, base)
+        if nameoff == 0:
+            continue
+        if strtab_off + nameoff >= len(blob):
+            raise ElfParseError("dynstr 偏移越界")
+        nul = blob.find(b"\x00", strtab_off + nameoff)
+        if nul == -1:
+            raise ElfParseError("dynstr 条目未终止")
+        name = blob[strtab_off + nameoff: nul].decode("utf-8", "replace")
+        if not name:
+            continue
+        (defined if shndx != 0 else undefined).append(name)
+    return {"defined": defined, "undefined": undefined}
 
 
 def parse_elf_runtime(blob: bytes) -> dict:
@@ -422,24 +539,57 @@ class QemuPrecheckTool(AgentTool):
                   f"NEEDED 库 {lib} 在固件根内未找到{truncated_note}"
                   "(运行期加载将失败;确认固件根是否完整或需适配模板补齐)")
 
-        # 6) 模板适用性(票 02 口径:NVRAM 系库 → 需模板;支持表未定稿 = 运行阻塞)
+        # 6) 模板适用性(票 18 决定性支持表:目标 dynsym 符号级家族判定)
         nvram_needed = [lib for lib in elf["needed"]
                         if lib.split("/")[-1] in _NVRAM_FAMILY_BASENAMES]
-        report["template_applicability"] = {
-            "nvram_family_needed": nvram_needed,
-            "base_templates": ("基础适配(目录/配置/argv/环境/CGI 输入)按会话声明提供,"
-                               "预检不校验具体值"),
-        } if nvram_needed else {"nvram_family_needed": []}
-        if nvram_needed:
-            report["template_applicability"]["template_status"] = \
-                "not_in_support_table"
-            report["template_applicability"]["detail"] = (
-                f"NEEDED 含 NVRAM 系库 {', '.join(nvram_needed)}:运行期需要 NVRAM "
-                "模板注入;模板支持表未定稿(票 11),且 /dev/nvram 系与 "
-                "envram(MTD)系的家族归属需符号级核实,预检不判定——按 ADR-0013 "
-                "记运行阻塞,不临时编造实现")
-            block("template_applicability", QemuResultClass.DEPENDENCY_BLOCKED,
-                  report["template_applicability"]["detail"])
+        tpl: dict = {"nvram_family_needed": nvram_needed}
+        if not nvram_needed:
+            tpl["family"] = "none"
+            tpl["base_templates"] = ("基础适配(目录/配置/argv/环境/stdin/"
+                                     "CGI 输入/夹具)按会话声明提供,预检不校验具体值")
+            report["template_applicability"] = tpl
+        else:
+            try:
+                syms = parse_elf_dynsym(blob)
+                family = nvram_family_for_target(
+                    elf["needed"], syms["undefined"], syms["defined"])
+            except ElfParseError as exc:
+                family = {"family": "unknown", "libs": nvram_needed,
+                          "undefined_supported": [], "undefined_envram": [],
+                          "note": f"目标 dynsym 解析失败,家族不可判定: {exc}"}
+            tpl.update({k: family.get(k) for k in
+                        ("family", "libs", "undefined_supported",
+                         "undefined_envram", "note")})
+            tpl["supported_reads"] = (list(NVRAM_SUPPORTED_READS)
+                                      if family["family"] in ("dev_nvram", "mixed")
+                                      else [])
+            tpl["base_templates"] = ("基础适配(目录/配置/argv/环境/stdin/"
+                                     "CGI 输入/夹具)按会话声明提供,预检不校验具体值")
+            if family["family"] in ("dev_nvram", "mixed"):
+                tpl["template_status"] = "supported_reads_unlocked"
+                tpl["detail"] = (
+                    "/dev/nvram 系已核实读取接口解锁(nvram_get/bcm_nvram_get;"
+                    "票 02 反汇编 + 票 18 真实后端实测):运行期需会话声明 "
+                    "nvram_values/nvram_sources(逐项有来源);"
+                    + (family.get("note") or ""))
+                if family["family"] == "mixed":
+                    block("template_applicability", QemuResultClass.DEPENDENCY_BLOCKED,
+                          "envram(MTD)系调用不在支持表:相关代码路径运行期将如实"
+                          "失败(未支持族不因同名库放行);/dev/nvram 系读取不受影响")
+            elif family["family"] == "envram":
+                tpl["template_status"] = "unsupported_family"
+                tpl["detail"] = (f"目标调用 envram(MTD)系"
+                                 f"({', '.join(family['undefined_envram'])}):"
+                                 "未支持族,不因同名库放行;运行期将因 MTD 缺失如实失败")
+                block("template_applicability", QemuResultClass.DEPENDENCY_BLOCKED,
+                      tpl["detail"])
+            else:
+                tpl["template_status"] = "undetermined"
+                tpl["detail"] = ("NEEDED 命中 NVRAM 系基名但符号级家族不可判定:"
+                                 + (family.get("note") or "维持不判定/阻塞(票 18 口径)"))
+                block("template_applicability", QemuResultClass.DEPENDENCY_BLOCKED,
+                      tpl["detail"])
+            report["template_applicability"] = tpl
 
         # 7) 执行设施(镜像内 qemu 自报版本;能走到这里说明架构已入选)
         facility = self._facility_check(profile.qemu_binary)
@@ -480,8 +630,19 @@ def _render_text(report: dict) -> str:
         lines.append("- 依赖: 无 NEEDED(静态或不可解析)")
     tpl = report.get("template_applicability") or {}
     if tpl.get("nvram_family_needed"):
-        lines.append(f"- 模板适用性: 需 NVRAM 模板({', '.join(tpl['nvram_family_needed'])});"
-                     "支持表未定稿,当前为运行阻塞")
+        status = tpl.get("template_status")
+        if status == "supported_reads_unlocked":
+            lines.append(f"- 模板适用性: NVRAM[{tpl.get('family')}] 已核实读取接口"
+                         f"({', '.join(tpl.get('supported_reads') or [])})解锁;"
+                         "会话需声明 nvram_values(逐项有来源)")
+            if tpl.get("undefined_envram"):
+                lines.append(f"    envram 调用未支持(运行期如实失败): "
+                             f"{', '.join(tpl['undefined_envram'])}")
+        else:
+            lines.append(f"- 模板适用性: NVRAM[{tpl.get('family')}] 未解锁"
+                         f"({tpl.get('note') or status});当前为运行阻塞")
+    elif "nvram_family_needed" in tpl:
+        lines.append("- 模板适用性: 无 NVRAM 系依赖(基础适配按会话声明提供)")
     facility = report.get("execution_facility") or {}
     if facility.get("available") is True:
         version = facility.get("version") or "版本可查"

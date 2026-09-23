@@ -17,7 +17,9 @@
 """
 from __future__ import annotations
 
+import base64
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -31,6 +33,7 @@ from firmware_audit.step5_agent.providers.tools import (
     tool_names_for_role,
 )
 from firmware_audit.step5_agent.providers.tools.base import ToolContext
+from firmware_audit.step5_agent.providers.tools import qemu_adapt
 from firmware_audit.step5_agent.providers.tools import qemu_session as qs
 from firmware_audit.step5_agent.providers.tools.qemu_recovery import (
     reap_leftover_sessions,
@@ -78,6 +81,7 @@ class FakeDocker:
         self.removed: list[str] = []
         self.detached: list[list[str]] = []
         self.containers_started: list[str] = []
+        self.stdin_sizes: list[int | None] = []
 
     def run_detached(self, image, args, *, name, mounts=None, tmpfs=None,
                      entrypoint=None, network="none", read_only=False,
@@ -88,7 +92,8 @@ class FakeDocker:
         self.containers_started.append(name)
         return 0, f"cid-{name}\n", ""
 
-    def exec(self, container, args, *, env=None, detach=False, timeout=300):
+    def exec(self, container, args, *, env=None, detach=False, timeout=300,
+             stdin_bytes=None):
         if detach:
             self.detached.append(args)
             return 0, "", ""
@@ -104,6 +109,7 @@ class FakeDocker:
                 return 0, "2\n", ""
         if args[:1] == ["/usr/bin/timeout"]:
             self.calls.append(("exec", tuple(args), tuple(sorted((env or {}).items()))))
+            self.stdin_sizes.append(len(stdin_bytes) if stdin_bytes is not None else None)
             if self.exec_results:
                 item = self.exec_results.pop(0)
                 if isinstance(item, BaseException):
@@ -587,13 +593,34 @@ def test_execution_shape(tmp_path: Path, fake_docker: FakeDocker) -> None:
 
 
 def test_explicit_argv0_is_recorded_and_passed(tmp_path: Path, fake_docker: FakeDocker) -> None:
+    """票 18:argv0 为绝对 guest 路径(多路复用 CGI 真实调用形态)——目标以
+    同一文件身份 bind 到该路径执行;裸名字已不支持(PRoot 以命令路径为 argv[0])。"""
     _arm_workspace(tmp_path)
-    result = _tool(tmp_path).execute(**_default_kwargs(argv0="nvram-wrapper", args="get foo"))
-    assert result.data["declared"]["argv0"] == "nvram-wrapper"
+    result = _tool(tmp_path).execute(**_default_kwargs(
+        argv0="/usr/sbin/nvram-wrapper", args="get foo"))
+    assert result.data["declared"]["argv0"] == "/usr/sbin/nvram-wrapper"
     exec_call = next(call for call in fake_docker.calls if call[0] == "exec")
     argv = exec_call[1]
-    target_index = argv.index("/usr/sbin/nvram")
-    assert argv[target_index + 1 : target_index + 4] == ("nvram-wrapper", "get", "foo")
+    # bind:同一目标呈现在 argv0 路径(只读执行视图,不改固件根)
+    assert "/session/firmware/usr/sbin/nvram:/usr/sbin/nvram-wrapper" in argv
+    # 命令 = argv0 路径;其后仅跟声明 argv(PRoot 以命令路径为 argv[0])
+    assert "/usr/sbin/nvram-wrapper" in argv
+    assert "get" in argv and "foo" in argv
+    assert argv[-3:] == ("/usr/sbin/nvram-wrapper", "get", "foo")
+
+
+def test_argv0_rejects_bare_name_and_shadowing(tmp_path: Path, fake_docker: FakeDocker) -> None:
+    """裸名字 argv0(PRoot 下无法表达)与遮蔽固件根内已有文件均拒绝。"""
+    _arm_workspace(tmp_path)
+    r = _tool(tmp_path).execute(**_default_kwargs(argv0="nvram-wrapper"))
+    assert r.data["result_class"] == "prep_blocked"
+    assert "绝对路径" in r.data["detail"]
+    assert not any(call[0] == "run_detached" for call in fake_docker.calls)
+    r = _tool(tmp_path).execute(**_default_kwargs(
+        argv0="/lib/ld-uClibc.so.0"))
+    assert r.data["result_class"] == "prep_blocked"
+    assert "遮蔽" in r.data["detail"]
+    assert not any(call[0] == "run_detached" for call in fake_docker.calls)
 
 
 def test_argv0_rejects_nul_injection(tmp_path: Path, fake_docker: FakeDocker) -> None:
@@ -1082,7 +1109,199 @@ def test_session_pins_inspected_image_id(tmp_path, fake_docker):
     assert call[1] == "sha256:test-image"
 
 
-# ---------- 真实:ARM/MIPS 会话(门控) ----------
+# ---------- 票 18:环境适配模板(离线;Docker 替身) ----------
+
+def test_adaptation_session_shape_and_ledger(tmp_path: Path, monkeypatch,
+                                             fake_docker) -> None:
+    """适配声明在开启时固化:容器挂载、逐执行 PRoot bind、LD_PRELOAD、
+    台账逐项来源;复用会话携带适配参数被拒。"""
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    _arm_workspace(ws)
+    (ws / "extracted" / "fw" / "etc").mkdir()
+    (ws / "extracted" / "fw" / "etc" / "conntrack.conf").write_bytes(b"conf")
+    tool = _tool(ws, role="analysis")
+    fixture_b64 = base64.b64encode(b"tcp 6 ESTABLISHED src=10.0.0.1\n").decode()
+
+    r = tool.execute(
+        file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+        investigation_ref="case-adapt",
+        adapt_binds=("rw:/var=base/varstate\n"
+                     "ro:/proc/net/ip_conntrack=fixture/conntrack\n"
+                     "ro:/etc/conntrack.conf=extracted/etc/conntrack.conf\n"),
+        adapt_fixtures=f"conntrack={fixture_b64}",
+        nvram_values="wan_wifi_ssid=testwlan\n",
+        nvram_sources="wan_wifi_ssid=declared_test_input\n",
+        keep_open=True)
+    d = r.data
+    assert d["result_class"] == "normal_exit", d
+    session_id = d["session_id"]
+
+    # 会话容器挂载:夹具与适配材料目录(ro)
+    open_call = next(c for c in fake_docker.calls if c[0] == "run_detached")
+    container_mounts = {m[1]: m[2] for m in open_call[3]}
+    assert container_mounts["/session/fixtures"] == "ro"
+    assert container_mounts["/session/adapt"] == "ro"
+
+    # 目标执行 argv:逐执行 bind;LD_PRELOAD 经 exec_env 注入(替身逐字记录)
+    exec_call = next(c for c in fake_docker.calls if c[0] == "exec")
+    argv = " ".join(exec_call[1])
+    assert "/session/runtime/base/varstate:/var" in argv
+    assert "/session/fixtures/conntrack:/proc/net/ip_conntrack" in argv
+    assert "/session/firmware/etc/conntrack.conf:/etc/conntrack.conf" in argv
+    assert "/session/adapt/libnvram_shim.so:/session/adapt/libnvram_shim.so" in argv
+    assert "/session/adapt/nvram.img:/session/adapt/nvram.img" in argv
+    env_pairs = dict(exec_call[2])
+    assert env_pairs.get("LD_PRELOAD") == "/session/adapt/libnvram_shim.so"
+
+    # 台账:声明逐项来源与身份;适配桩产物已复制进会话 adapt 目录
+    entry = _read_ledger(ws)["sessions"][0]
+    adaptation = entry["adaptation"]
+    assert adaptation["nvram"]["values_count"] == 1
+    assert adaptation["nvram"]["values"] == {"wan_wifi_ssid": "declared_test_input"}
+    assert len(adaptation["nvram"]["image_sha256"]) == 64
+    assert adaptation["nvram"]["unsupported"].startswith("set/unset/commit")
+    assert adaptation["fixtures"][0]["source"] == "declared_test_input"
+    assert {b["kind"] for b in adaptation["binds"]} == {"base", "fixture", "extracted"}
+    adapt_dir = ws / "qemu_sessions" / session_id / "adapt"
+    assert (adapt_dir / "libnvram_shim.so").is_file()
+    assert (adapt_dir / "nvram.img").read_bytes() == b"wan_wifi_ssid=testwlan\x00"
+    assert (ws / "qemu_sessions" / session_id / "fixtures" / "conntrack") \
+        .read_bytes().startswith(b"tcp 6")
+
+    # 复用会话:不同声明拒绝(适配在会话期固化);相同声明幂等放行执行
+    r2 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-adapt", session_id=session_id,
+                      nvram_values="k=different", nvram_sources="k=s")
+    assert r2.data["result_class"] == "prep_blocked"
+    assert "固化" in r2.data["detail"]
+    # 含遮蔽型 extracted bind 的相同声明也必须幂等放行(派生记账字段
+    # shadowed_original 不计入声明比较)
+    r3 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-adapt", session_id=session_id,
+                      adapt_binds=("rw:/var=base/varstate\n"
+                                   "ro:/proc/net/ip_conntrack=fixture/conntrack\n"
+                                   "ro:/etc/conntrack.conf=extracted/etc/conntrack.conf\n"),
+                      adapt_fixtures=f"conntrack={fixture_b64}",
+                      nvram_values="wan_wifi_ssid=testwlan\n",
+                      nvram_sources="wan_wifi_ssid=declared_test_input\n",
+                      args="get wl0_ssid", use_strace=False)
+    d3 = r3.data
+    assert d3["result_class"] == "normal_exit", d3
+    assert d3["execution"]["seq"] == 2
+    assert d3["adaptation"]["binds"][2]["shadowed_original"]["sha256"] is not None
+    # 相同声明 + stop=true:幂等通过并停机封存
+    r4 = tool.execute(investigation_ref="case-adapt", session_id=session_id,
+                      stop=True)
+    assert r4.data["action"] == "session_stop"
+    assert r4.data["sealed"] is True
+
+    # 适配声明入报告
+    assert d["adaptation"]["nvram"]["family"] == "dev_nvram"
+    assert any("适配(会话期固化)" in line for line in (r.text or "").splitlines())
+
+
+def test_adaptation_declaration_failures_refuse_before_open(
+        tmp_path: Path, monkeypatch, fake_docker) -> None:
+    """声明非法/NVRAM 值缺来源/桩钉值漂移:准备阻塞,不建容器不占名额。"""
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    _arm_workspace(ws)
+    tool = _tool(ws, role="analysis")
+
+    cases = [
+        ({"adapt_binds": "ro:/tmp/x=fixture/a"}, "保留前缀"),
+        ({"adapt_binds": "ro:/x=fixture/missing",
+          "adapt_fixtures": "other=" + base64.b64encode(b"x").decode()}, "未声明夹具"),
+        ({"nvram_values": "k=v"}, "缺来源引用"),
+        ({"nvram_sources": "k=s"}, "没有对应值"),
+    ]
+    for over, why in cases:
+        r = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                         investigation_ref=f"case-reject", **over)
+        d = r.data
+        assert d["result_class"] == "prep_blocked", (why, d)
+        assert why in d["detail"], (why, d["detail"])
+    assert _read_ledger(ws)["sessions"] == []
+    assert fake_docker.containers_started == []
+
+    # 桩钉值漂移:开启前拒绝,不装配
+    r = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                     investigation_ref="case-drift",
+                     nvram_values="k=v", nvram_sources="k=s")
+    assert r.data["result_class"] == "normal_exit"
+    monkeypatch.setattr(qemu_adapt, "NVRAM_SHIM_SHA256", "f" * 64)
+    r = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                     investigation_ref="case-drift-2",
+                     nvram_values="k=v", nvram_sources="k=s")
+    assert r.data["result_class"] == "prep_blocked"
+    assert "漂移" in r.data["detail"]
+    sessions = _read_ledger(ws)["sessions"]
+    assert all(s["investigation_ref"] == "case-drift" for s in sessions)
+
+
+def test_nvram_unresolved_gap_recorded_and_consumed_per_execution(
+        tmp_path: Path, monkeypatch, fake_docker) -> None:
+    """未声明键:桩日志读回为执行级 gap;逐执行消费,不跨执行串账。"""
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    _arm_workspace(ws)
+    tool = _tool(ws, role="analysis")
+
+    real_exec = fake_docker.exec
+
+    def exec_writing_log(container, args, *, env=None, detach=False,
+                         timeout=300, stdin_bytes=None):
+        if not detach and args[:1] == ["/usr/bin/timeout"]:
+            for runtime in (ws / "qemu_sessions").glob("*/runtime"):
+                (runtime / "nvram-unresolved.log").write_text(
+                    "wl0_ssid\nhttp_passwd\n", encoding="utf-8")
+        return real_exec(container, args, env=env, detach=detach,
+                         timeout=timeout, stdin_bytes=stdin_bytes)
+
+    monkeypatch.setattr(qs, "docker_exec", exec_writing_log)
+
+    r = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                     investigation_ref="case-gap",
+                     nvram_values="wan_ip=10.0.0.1\n",
+                     nvram_sources="wan_ip=declared_test_input\n",
+                     keep_open=True)
+    d = r.data
+    assert d["result_class"] == "normal_exit", d
+    gaps = d["adaptation_gaps"]
+    assert gaps["nvram_unresolved_keys"] == ["wl0_ssid", "http_passwd"]
+    assert "不得作为设备真实行为结论" in gaps["note"]
+    assert any("适配缺口" in line for line in (r.text or "").splitlines())
+    ledger_entry = _read_ledger(ws)["sessions"][0]
+    assert ledger_entry["executions"][0]["adaptation_gaps"] == gaps
+    # 第二次执行:写入的键相同,但作为本次执行的新鲜 gap 记录(日志已重置)
+    sid = d["session_id"]
+    r2 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-gap", session_id=sid)
+    assert r2.data["adaptation_gaps"]["nvram_unresolved_keys"] == \
+        ["wl0_ssid", "http_passwd"]
+    assert _read_ledger(ws)["sessions"][0]["executions"][1]["adaptation_gaps"][
+        "nvram_unresolved_keys"] == ["wl0_ssid", "http_passwd"]
+
+
+def test_stdin_delivery_records_digest(tmp_path: Path, fake_docker) -> None:
+    """stdin_ref:文件字节作为目标 stdin 送达;台账记 ref/sha256/字节数。"""
+    ws = tmp_path / "ws"
+    _arm_workspace(ws)
+    (ws / "extracted" / "fw" / "post-body.txt").write_bytes(b"uid=admin&pwd=x")
+    tool = _tool(ws, role="analysis")
+    r = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                     investigation_ref="case-stdin", stdin_ref="fw/post-body.txt")
+    d = r.data
+    assert d["result_class"] == "normal_exit", d
+    assert d["declared"]["stdin"]["ref"] == "fw/post-body.txt"
+    assert d["declared"]["stdin"]["size_bytes"] == 15
+    assert d["declared"]["stdin"]["sha256"] == \
+        qs.sha256_text("uid=admin&pwd=x")
+    assert fake_docker.stdin_sizes == [15]
+    entry = _read_ledger(ws)["sessions"][0]
+    assert entry["executions"][0]["declared"]["stdin"]["size_bytes"] == 15
+
 
 def _require_real():
     from firmware_audit.docker.docker_utils import docker_available
@@ -1091,6 +1310,34 @@ def _require_real():
                     "(先运行 firmware_audit/docker/qemu-exec-v2/build_image.sh)")
     if not TGT6_SQUASH.is_dir():
         pytest.skip(f"target/6 解包树缺失: {TGT6_SQUASH}")
+
+
+TGT7_SQUASH = (REPO_ROOT / "target/7/process/extracted/"
+               "000002_partition_1.bin.extracted/0/squashfs-root")
+
+
+def _copy_lib_tree(src_root: Path, dst_root: Path) -> None:
+    """复制固件 lib 全目录(符号链接原样,常规文件按内容);原件只读。"""
+    lib = src_root / "lib"
+    if not lib.is_dir():
+        return
+    for item in lib.iterdir():
+        dst = dst_root / "lib" / item.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if item.is_symlink():
+            shutil.copy2(item, dst, follow_symlinks=False)
+        elif item.is_file():
+            shutil.copy2(item, dst, follow_symlinks=True)
+
+
+def _copy_rel(src_root: Path, dst_root: Path, rel: str) -> bool:
+    src = src_root / rel
+    if not (src.is_file() or src.is_symlink()):
+        return False
+    dst = dst_root / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst, follow_symlinks=True)
+    return True
 
 
 def _real_workspace(tmp: Path) -> Path:
@@ -1355,7 +1602,7 @@ def test_real_mips_non_shell_parent(tmp_path: Path, monkeypatch) -> None:
     tool = _tool(tmp_path, role="analysis")
     r = tool.execute(file_ref="fw8/bin/busybox", firmware_root="fw8",
                      investigation_ref="case-mips",
-                     argv0="sh", args="-c '/bin/busybox echo env-parent-mips-ok'")
+                     args="sh -c '/bin/busybox echo env-parent-mips-ok'")
     d = r.data
     assert d["result_class"] == "normal_exit", d
     assert "env-parent-mips-ok" in d["observation_excerpt"]["stdout"]["excerpt"]
@@ -1376,3 +1623,262 @@ def test_execution_knob_env_name_consistent_across_layers() -> None:
     assert ENV_KEYS[QEMU_MAX_SESSION_EXECUTIONS_KEY] == QEMU_MAX_SESSION_EXECUTIONS_ENV
     assert (DEFAULT_BUDGET_CONFIG[QEMU_MAX_SESSION_EXECUTIONS_KEY]
             == DEFAULT_MAX_SESSION_EXECUTIONS)
+
+
+# ---------- 票 18:真实通路与 NVRAM ABI(门控;真实 PRoot/QEMU 后端) ----------
+
+def test_real_opkg_mipsbe_business_pathway_and_control(
+        tmp_path: Path, monkeypatch) -> None:
+    """票 18 选定业务通路(target/8 opkg,MIPS32 大端):固件原生包数据库
+    → 已装包清单;正常对照(info 过滤同一配置)证明输入→输出真实处理。
+    预检不计入该项验收;结果分类只是 Evidence,不构成漏洞结论。"""
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    tgt8 = TGT8_SQUASH
+    if not tgt8.is_dir():
+        pytest.skip(f"target/8 解包树缺失: {tgt8}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    for rel in ("bin/opkg", "lib/libc.so", "lib/ld-musl-mips-sf.so.1",
+                "lib/libgcc_s.so.1", "lib/libubox.so",
+                "etc/opkg.conf", "usr/lib/opkg/status"):
+        assert _copy_rel(tgt8, root, rel), f"固件子树缺失: {rel}"
+    tool = _tool(ws, role="analysis")
+
+    # ① 业务输出:固件原生 status 数据库 → 已装包清单
+    r1 = tool.execute(file_ref="fw/bin/opkg", firmware_root="fw",
+                      investigation_ref="case-opkg", keep_open=True,
+                      args="list-installed", use_strace=False,
+                      timeout_seconds=90,
+                      adapt_binds="rw:/var/lock=base/varlock")
+    d1 = r1.data
+    assert d1["result_class"] == "normal_exit", d1
+    out1 = d1["observation_excerpt"]["stdout"]["excerpt"]
+    assert "busybox" in out1 and "base-files" in out1
+    assert d1["adaptation"]["binds"][0]["mode"] == "rw"
+
+    # ② 正常对照:同一固件配置,info 子命令过滤出单条记录
+    r2 = tool.execute(file_ref="fw/bin/opkg", firmware_root="fw",
+                      investigation_ref="case-opkg", session_id=d1["session_id"],
+                      args="info busybox", use_strace=False, timeout_seconds=90,
+                      adapt_binds="rw:/var/lock=base/varlock")
+    d2 = r2.data
+    assert d2["result_class"] == "normal_exit", d2
+    out2 = d2["observation_excerpt"]["stdout"]["excerpt"]
+    assert "Package: busybox" in out2 and "Version:" in out2
+    # 输入不同 → 输出不同:两次都是真实业务处理,而非启动成功
+    assert d2["executions_total"] == 2
+    assert d2["declared"]["argv"] == ["info", "busybox"]
+
+
+def test_real_t6_nvram_abi_known_missing_unknown(tmp_path: Path,
+                                                 monkeypatch) -> None:
+    """票 18 AC(target/6 通用接口):真实 libnvram 库经适配桩取得
+    已声明值;缺失/未知键按固件缺失键语义返回 NULL 并记入未决 gap。"""
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    if not TGT6_SQUASH.is_dir():
+        pytest.skip(f"target/6 解包树缺失: {TGT6_SQUASH}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    assert _copy_rel(TGT6_SQUASH, root, "usr/sbin/nvram")
+    _copy_lib_tree(TGT6_SQUASH, root)
+    tool = _tool(ws, role="analysis")
+
+    common = dict(nvram_values="wl0_ssid=fwtest_ssid\nrouter_mode=ap\n",
+                  nvram_sources="wl0_ssid=declared_test_input\n"
+                                "router_mode=declared_test_input\n")
+    r1 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-t6abi", keep_open=True,
+                      use_strace=False, args="get wl0_ssid", **common)
+    d1 = r1.data
+    assert d1["result_class"] == "normal_exit", d1
+    assert d1["observation_excerpt"]["stdout"]["excerpt"] == "wl0_ssid=fwtest_ssid\n"
+    assert d1["adaptation"]["nvram"]["family"] == "dev_nvram"
+
+    r2 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-t6abi",
+                      session_id=d1["session_id"],
+                      use_strace=False, args="get router_mode", **common)
+    d2 = r2.data
+    assert d2["observation_excerpt"]["stdout"]["excerpt"] == "router_mode=ap\n"
+    assert d2["adaptation_gaps"] is None
+
+    # 缺失/未知键:真实库返回 NULL(空输出),键入未决日志,结果明示 gap
+    r3 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-t6abi",
+                      session_id=d1["session_id"],
+                      use_strace=False, args="get fwtest_missing_key", **common)
+    d3 = r3.data
+    assert d3["result_class"] == "normal_exit", d3
+    assert d3["observation_excerpt"]["stdout"]["excerpt"] == ""
+    gaps = d3["adaptation_gaps"]
+    assert gaps is not None and gaps["nvram_unresolved_keys"] == ["fwtest_missing_key"]
+    assert "不得作为设备真实行为结论" in gaps["note"]
+    ledger_entry = _read_ledger(ws)["sessions"][0]
+    assert ledger_entry["executions"][2]["adaptation_gaps"] == gaps
+
+
+def test_real_t7_nvram_abi_and_envram_negative(tmp_path: Path,
+                                               monkeypatch) -> None:
+    """票 18 AC(target/7):真实固件库读取设备真实默认值
+    (webroot_ro/nvram_default.cfg 为来源);envram(MTD)系未支持族
+    不因同名库放行——真实 envram 代码对缺失 MTD 如实失败,模板值不泄漏。"""
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    if not TGT7_SQUASH.is_dir():
+        pytest.skip(f"target/7 解包树缺失: {TGT7_SQUASH}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    assert _copy_rel(TGT7_SQUASH, root, "bin/nvram")
+    assert _copy_rel(TGT7_SQUASH, root, "bin/envram")
+    _copy_lib_tree(TGT7_SQUASH, root)
+    tool = _tool(ws, role="analysis")
+
+    common = dict(nvram_values="lan_ifname=br0\nos_name=linux\n",
+                  nvram_sources="lan_ifname=target/7 webroot_ro/nvram_default.cfg\n"
+                                "os_name=target/7 webroot_ro/nvram_default.cfg\n")
+
+    # ① 设备真实默认值经真实库读出
+    r1 = tool.execute(file_ref="fw/bin/nvram", firmware_root="fw",
+                      investigation_ref="case-t7abi", keep_open=True,
+                      use_strace=False, args="get lan_ifname", **common)
+    d1 = r1.data
+    assert d1["result_class"] == "normal_exit", d1
+    assert d1["observation_excerpt"]["stdout"]["excerpt"] == "lan_ifname=br0\n"
+
+    # ② 缺失键 → NULL + gap
+    r2 = tool.execute(file_ref="fw/bin/nvram", firmware_root="fw",
+                      investigation_ref="case-t7abi",
+                      session_id=d1["session_id"],
+                      use_strace=False, args="get t7_missing_probe", **common)
+    d2 = r2.data
+    assert d2["observation_excerpt"]["stdout"]["excerpt"] == ""
+    assert d2["adaptation_gaps"]["nvram_unresolved_keys"] == ["t7_missing_probe"]
+
+    # ③ envram 负对照:同一模板值不得经 envram 系泄漏
+    r3 = tool.execute(file_ref="fw/bin/envram", firmware_root="fw",
+                      investigation_ref="case-t7envram",
+                      use_strace=False, timeout_seconds=45,
+                      args="get lan_ifname", **common)
+    d3 = r3.data
+    out3 = (d3["observation_excerpt"]["stdout"]["excerpt"]
+            + d3["observation_excerpt"]["stderr"]["excerpt"])
+    assert "read flash error" in out3, out3
+    assert "br0" not in out3, "模板值不得经未支持族泄漏"
+    assert d3["adaptation_gaps"] is None or \
+        d3["adaptation_gaps"].get("nvram_unresolved_keys") is None
+
+
+def test_real_t7_httpd_bcm_vendor_wrapper_consumes_template(
+        tmp_path: Path, monkeypatch) -> None:
+    """票 18 AC(target/7 厂商包装):httpd 启动期经真实 libCfm
+    bcm_nvram_get 消费模板值(br0 出现在 SIOCGIFADDR ioctl 的业务逻辑中);
+    常驻服务本身第一阶段不交付,进程按预算清理并如实分类。"""
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    if not TGT7_SQUASH.is_dir():
+        pytest.skip(f"target/7 解包树缺失: {TGT7_SQUASH}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    assert _copy_rel(TGT7_SQUASH, root, "bin/httpd")
+    _copy_lib_tree(TGT7_SQUASH, root)
+    tool = _tool(ws, role="analysis")
+    r = tool.execute(file_ref="fw/bin/httpd", firmware_root="fw",
+                     investigation_ref="case-t7bcm", use_strace=True,
+                     timeout_seconds=15,
+                     nvram_values="lan_ifname=br0\nos_name=linux\n",
+                     nvram_sources="lan_ifname=target/7 webroot_ro/nvram_default.cfg\n"
+                                   "os_name=target/7 webroot_ro/nvram_default.cfg\n")
+    d = r.data
+    # 常驻服务被预算击杀:target_signal/timeout 都是如实的分类
+    assert d["result_class"] in ("target_signal", "timeout"), d
+    stderr = d["observation_excerpt"]["stderr"]["excerpt"]
+    assert "SIOCGIFADDR" in stderr and "br0" in stderr, stderr[:500]
+    assert d["cleanup"]["verdict"] in ("clean", "clean_after_kill")
+    # 台账:声明值与来源逐字可复查
+    declared_nv = d["adaptation"]["nvram"]
+    assert declared_nv["values"] == {
+        "lan_ifname": "target/7 webroot_ro/nvram_default.cfg",
+        "os_name": "target/7 webroot_ro/nvram_default.cfg"}
+
+
+def test_real_t6_conntrack_cgi_honest_block(tmp_path: Path, monkeypatch) -> None:
+    """票 18 选定的 t6 CGI 通路候选在真实后端的如实记录:会话门附件代码
+    在输出前确定性 SIGSEGV(输入无关;动态崩溃不构成漏洞结论)。
+    业务通路交付由 target/8 opkg 承担(见上文),本用例固化该阻塞证据。"""
+    import base64 as b64
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    if not TGT6_SQUASH.is_dir():
+        pytest.skip(f"target/6 解包树缺失: {TGT6_SQUASH}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    assert _copy_rel(TGT6_SQUASH, root, "htdocs/cgibin")
+    _copy_lib_tree(TGT6_SQUASH, root)
+    tool = _tool(ws, role="analysis")
+    conntrack = ("tcp      6 4294967295 ESTABLISHED src=192.168.0.100 "
+                 "dst=192.168.0.1 sport=5000 dport=80 [ASSURED] use=1\n")
+    sesscfg = "600\n8\n16\n1\n"
+    r = tool.execute(
+        file_ref="fw/htdocs/cgibin", firmware_root="fw",
+        investigation_ref="case-conntrack", use_strace=True,
+        argv0="/htdocs/web/conntrack.cgi",
+        env="REQUEST_METHOD=GET\n"
+            "SCRIPT_FILENAME=/htdocs/web/conntrack.cgi\n"
+            "REQUEST_URI=/conntrack.cgi?NETWORK=192.168.0&MASK=24\n"
+            "HTTP_COOKIE=uid=probeuid",
+        adapt_binds=("rw:/var=base/var\n"
+                     "ro:/proc/net/ip_conntrack=fixture/conntrack\n"
+                     "ro:/var/session/sesscfg=fixture/sesscfg\n"),
+        adapt_fixtures=(
+            "conntrack=" + b64.b64encode(conntrack.encode()).decode() + "\n"
+            "sesscfg=" + b64.b64encode(sesscfg.encode()).decode()),
+        timeout_seconds=45)
+    d = r.data
+    # 会话门(argv0 分发、/var 会话存储、sesscfg 解析)真实运行过;
+    # 在产出业务输出前 SIGSEGV——崩溃如实分类,不冒充业务输出
+    stderr = (d["observation_excerpt"]["stderr"]["excerpt"]
+              + d["observation_excerpt"]["stdout"]["excerpt"])
+    assert "/var/session/1" in d["observation_excerpt"]["stderr"]["excerpt"] or \
+        "/var/session" in stderr, stderr[:400]
+    assert d["result_class"] in ("nonzero_exit", "target_signal"), d
+    assert "<conntrack>" not in d["observation_excerpt"]["stdout"]["excerpt"]
+    assert "uncaught target signal" in stderr or d["result_class"] == "target_signal"
+
+
+def test_adaptation_mismatch_build_error_refuses_in_channel(
+        tmp_path: Path, fake_docker) -> None:
+    """复用会话的幂等比较会重建 NVRAM 映像:超装载上限的传入声明必须在
+    refuse 通道拒绝(ok=True/prep_blocked/拒绝入台账),不得逃逸成异常。"""
+    ws = tmp_path / "ws"
+    _arm_workspace(ws)
+    tool = _tool(ws, role="analysis")
+    r1 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-builderr", keep_open=True,
+                      nvram_values="k=v", nvram_sources="k=s",
+                      use_strace=False)
+    d1 = r1.data
+    assert d1["result_class"] == "normal_exit", d1
+    oversized = "\n".join(f"k{i:03d}=" + "v" * 250 for i in range(500))
+    sources = "\n".join(f"k{i:03d}=s" for i in range(500))
+    r2 = tool.execute(file_ref="fw/usr/sbin/nvram", firmware_root="fw",
+                      investigation_ref="case-builderr",
+                      session_id=d1["session_id"],
+                      nvram_values=oversized, nvram_sources=sources)
+    assert r2.ok is True
+    assert r2.data["result_class"] == "prep_blocked"
+    assert "装载上限" in r2.data["detail"]
+    ledger = _read_ledger(ws)
+    assert any(ref["reason"] == "prep_blocked" and "装载上限" in ref["detail"]
+               for ref in ledger["refusals"])

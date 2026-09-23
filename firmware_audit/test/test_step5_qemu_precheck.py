@@ -61,6 +61,8 @@ PINS_PATH = REPO_ROOT / "firmware_audit" / "docker" / "qemu-exec-v2" / "pins.env
 TGT6_SQUASH = (REPO_ROOT / "target/6/process/extracted/"
                "000000_DIR890LA1_FW111b02_20170519_beta01.bin.extracted/"
                "1C0094/squashfs-root")
+TGT7_SQUASH = (REPO_ROOT / "target/7/process/extracted/"
+               "000002_partition_1.bin.extracted/0/squashfs-root")
 TGT8_SQUASH = (REPO_ROOT / "target/8/process/extracted/"
                "000000_openwrt-19.07.0-ath79-generic-tplink_archer-c7-v2-"
                "squashfs-sysupgrade.bin.extracted/185BC4/squashfs-root")
@@ -76,12 +78,16 @@ _DT_NULL, _DT_NEEDED, _DT_STRTAB = 0, 1, 5
 
 def elf32_blob(*, machine: int, little: bool = True, interp: str | None = None,
                needed: list[str] | None = None,
-               with_dynamic: bool = True) -> bytes:
+               with_dynamic: bool = True,
+               dynsym: list[tuple[str, bool]] | None = None) -> bytes:
     """最小 ELF32 执行镜像:PT_LOAD 全文件恒等映射 + 可选 PT_INTERP/PT_DYNAMIC。
 
     interp=None 且 needed=[] 且 with_dynamic=False → 纯静态形态。
+    dynsym=[(名字, 是否已定义)] 时附带 DT_SYMTAB/DT_STRtab/DT_HASH(票 18
+    符号级家族判定夹具)。
     """
     needed = list(needed or [])
+    dynsym = list(dynsym or [])
     end = "<" if little else ">"
     has_interp = interp is not None
     phnum = 1 + int(has_interp) + int(with_dynamic)
@@ -94,22 +100,48 @@ def elf32_blob(*, machine: int, little: bool = True, interp: str | None = None,
         interp_off = off
         off += len(interp_blob)
 
-    strtab_blob = b"\x00" + "".join(f"{n}\x00" for n in needed).encode()
+    all_names = needed + [n for n, _ in dynsym]
+    strtab_blob = b"\x00" + "".join(f"{n}\x00" for n in all_names).encode()
     strtab_off = strtab_vaddr = off
     off += len(strtab_blob)
 
     name_offs: list[int] = []
     cur = 1
-    for n in needed:
+    for n in all_names:
         name_offs.append(cur)
         cur += len(n) + 1
 
-    dyn_parts = [struct.pack(end + "iI", _DT_NEEDED, o) for o in name_offs]
+    dyn_parts = [struct.pack(end + "iI", _DT_NEEDED, o) for o in name_offs[:len(needed)]]
     if with_dynamic:
         dyn_parts.append(struct.pack(end + "iI", _DT_STRTAB, strtab_vaddr))
+        if dynsym:
+            # symtab 紧随动态段之后;strtab 单独放(票 18 解析器按 vaddr 查)
+            symtab_vaddr = off
+            sym_entries = b""
+            for i, (name, defined) in enumerate(dynsym):
+                sym_entries += struct.pack(end + "IIIBBH",
+                                           name_offs[len(needed) + i],
+                                           0x1000 * (i + 1), 0,
+                                           0x12 if defined else 0x22,
+                                           0, 1 if defined else 0)
+            symtab_blob = sym_entries
+            symtab_off = symtab_vaddr
+            off += len(symtab_blob)
+            hash_blob = struct.pack(end + "II", 1, len(dynsym)) + \
+                struct.pack(end + "I", 0) + \
+                b"".join(struct.pack(end + "I", i)
+                         for i in range(1, len(dynsym) + 1))
+            hash_vaddr = off
+            off += len(hash_blob)
+            dyn_parts.append(struct.pack(end + "iI", 6, symtab_vaddr))
+            dyn_parts.append(struct.pack(end + "iI", 4, hash_vaddr))
         dyn_parts.append(struct.pack(end + "iI", _DT_NULL, 0))
     dyn_blob = b"".join(dyn_parts)
     dyn_off = off
+
+    tail_blobs = b""
+    if dynsym:
+        tail_blobs = symtab_blob + hash_blob
 
     loads_sz = dyn_off + len(dyn_blob)
     phdrs = [struct.pack(end + "IIIIIIII", _PT_LOAD, 0, 0, 0, loads_sz, loads_sz, 5, 0x1000)]
@@ -124,7 +156,9 @@ def elf32_blob(*, machine: int, little: bool = True, interp: str | None = None,
     ehdr = ident + struct.pack(end + "HHIIIIIHHHHHH",
                                2, machine, 1, 0, ehsize, 0, 0,
                                ehsize, phentsize, phnum, 0, 0, 0)
-    return ehdr + b"".join(phdrs) + interp_blob + strtab_blob + dyn_blob
+    # 字节序与 off 推进一致:interp → strtab → [symtab → hash] → dyn
+    return (ehdr + b"".join(phdrs) + interp_blob + strtab_blob
+            + tail_blobs + dyn_blob)
 
 
 def _fake_loader() -> bytes:
@@ -206,6 +240,39 @@ def test_parse_elf_mips32be_and_static() -> list[str]:
     static = parse_elf_runtime(elf32_blob(machine=40, with_dynamic=False))
     if static["interp"] is not None or static["needed"]:
         fails.append(f"静态形态应无 interp/needed: {static}")
+    return fails
+
+
+def test_parse_elf_dynsym_defined_undefined() -> list[str]:
+    """票 18:dynsym 解析——已定义/未定义符号分流;缺 DT_HASH 时按布局估算。"""
+    from firmware_audit.step5_agent.providers.tools.qemu_precheck import (
+        ElfParseError,
+        parse_elf_dynsym,
+    )
+    fails: list[str] = []
+    blob = elf32_blob(machine=40, interp=ARM_LE_LOADER,
+                      needed=["libCfm.so"],
+                      dynsym=[("bcm_nvram_get", False), ("envram_get", False),
+                              ("local_fn", True)])
+    syms = parse_elf_dynsym(blob)
+    if set(syms["undefined"]) != {"bcm_nvram_get", "envram_get"}:
+        fails.append(f"未定义符号应精确分流: {syms['undefined']}")
+    if "local_fn" not in syms["defined"]:
+        fails.append(f"已定义符号应入 defined: {syms['defined']}")
+    if parse_elf_dynsym(elf32_blob(machine=40, needed=[],
+                                   dynsym=[("only_fn", True)]))["undefined"] != []:
+        fails.append("无未定义符号时应返回空 undefined")
+    # 无 DT_SYMTAB 的动态夹具(仅 NEEDED/STRTAB)→ 解析失败,不可判定
+    try:
+        parse_elf_dynsym(elf32_blob(machine=40, needed=["libc.so.0"]))
+        fails.append("无 DT_SYMTAB 的动态夹具应报解析失败")
+    except ElfParseError:
+        pass
+    try:
+        parse_elf_dynsym(b"\x7fELF garbage")
+        fails.append("垃圾输入应报 ElfParseError")
+    except ElfParseError:
+        pass
     return fails
 
 
@@ -364,8 +431,11 @@ def test_precheck_missing_needed_lib_dependency_blocked() -> list[str]:
 
 
 def test_precheck_nvram_family_template_blocker() -> list[str]:
-    """票 02 移交:NEEDED 含 NVRAM 系库 → 需模板注入;支持表未定稿(票 11)= 运行阻塞;
-    /dev/nvram 系与 envram(MTD)系家族归属预检不判定(未核实不定论)。"""
+    """票 18 决定性支持表:NVRAM 系基名命中但符号级家族不可判定 → 维持阻塞。
+
+    夹具目标无 dynsym(解析失败路径);/dev/nvram 系解锁与 envram 阻塞见
+    后续两个家族用例。
+    """
     fails: list[str] = []
     with tempfile.TemporaryDirectory() as td:
         ws, fref, rref = _make_workspace(
@@ -377,16 +447,96 @@ def test_precheck_nvram_family_template_blocker() -> list[str]:
             r = _run_precheck(ws, fref, rref)
         d = r.data or {}
         if d.get("result_class") != "dependency_blocked":
-            fails.append(f"NVRAM 系需模板(未定稿)应 dependency_blocked: {d.get('result_class')}")
+            fails.append(f"家族不可判定应 dependency_blocked: {d.get('result_class')}")
         tpl = d.get("template_applicability") or {}
         if "libnvram.so" not in (tpl.get("nvram_family_needed") or []):
             fails.append(f"模板适用性应记录 NVRAM 系库: {tpl}")
-        detail = tpl.get("detail") or ""
-        if "票 11" not in detail or "不判定" not in detail:
-            fails.append(f"模板阻塞 detail 应含支持表未定稿与家族不判定: {detail}")
-        # 库本身在固件根内找得到——阻塞原因必须归模板而非库缺失
+        if tpl.get("template_status") != "undetermined":
+            fails.append(f"不可判定应记 undetermined: {tpl.get('template_status')}")
+        if "不可判定" not in (tpl.get("detail") or ""):
+            fails.append(f"阻塞 detail 应含不可判定原因: {tpl.get('detail')}")
+        # 库本身在固件根内找得到——阻塞原因必须归家族判定而非库缺失
         if "libnvram.so" not in (d.get("dependencies") or {}).get("resolved", {}):
             fails.append("libnvram.so 在根内存在,不得误报为库缺失")
+    return fails
+
+
+def test_precheck_nvram_dev_family_unlocks_supported_reads() -> list[str]:
+    """票 18:目标导入 nvram_get → /dev/nvram 系已核实读取接口解锁,无阻塞。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        ws, fref, rref = _make_workspace(
+            Path(td),
+            blob=elf32_blob(machine=40, interp=ARM_LE_LOADER,
+                            needed=["libnvram.so", "libc.so.0"],
+                            dynsym=[("nvram_get", False), ("printf", False)]),
+            loader=ARM_LE_LOADER,
+            libs={"libnvram.so": _fake_loader(), "libc.so.0": _fake_loader()})
+        with stub_facility():
+            r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        tpl = d.get("template_applicability") or {}
+        if tpl.get("family") != "dev_nvram":
+            fails.append(f"导入 nvram_get 应判 dev_nvram: {tpl.get('family')}")
+        if tpl.get("supported_reads") != ["nvram_get", "bcm_nvram_get"]:
+            fails.append(f"应解锁已核实读取接口: {tpl.get('supported_reads')}")
+        if d.get("result_class") not in ("ok",):
+            fails.append(f"已核实接口解锁后不应阻塞: {d.get('result_class')} "
+                         f"{[b['detail'] for b in d.get('blockers') or []]}")
+    return fails
+
+
+def test_precheck_nvram_envram_family_stays_blocked() -> list[str]:
+    """票 18:目标只调用 envram(MTD)系 → 未支持族阻塞,不因同名库放行。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        ws, fref, rref = _make_workspace(
+            Path(td),
+            blob=elf32_blob(machine=40, interp=ARM_LE_LOADER,
+                            needed=["libCfm.so", "libc.so.0"],
+                            dynsym=[("envram_get_value", False),
+                                    ("envram_set_value", False)]),
+            loader=ARM_LE_LOADER,
+            libs={"libCfm.so": _fake_loader(), "libc.so.0": _fake_loader()})
+        with stub_facility():
+            r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        tpl = d.get("template_applicability") or {}
+        if tpl.get("family") != "envram":
+            fails.append(f"导入 envram_* 应判 envram: {tpl.get('family')}")
+        if tpl.get("supported_reads"):
+            fails.append(f"envram 族不得解锁读取接口: {tpl.get('supported_reads')}")
+        if d.get("result_class") != "dependency_blocked":
+            fails.append(f"envram 未支持族应 dependency_blocked: {d.get('result_class')}")
+        detail = " ".join(b["detail"] for b in d.get("blockers") or [])
+        if "不因同名库放行" not in detail:
+            fails.append(f"阻塞文案应声明不因同名库放行: {detail}")
+    return fails
+
+
+def test_precheck_nvram_mixed_family_unlocks_reads_with_caveat() -> list[str]:
+    """票 18:t7 httpd 形态——同导 /dev/nvram 读取与 envram_*:读取解锁,
+    envram 路径以运行阻塞明示(不因 caveat 抹掉读取支持)。"""
+    fails: list[str] = []
+    with tempfile.TemporaryDirectory() as td:
+        ws, fref, rref = _make_workspace(
+            Path(td),
+            blob=elf32_blob(machine=40, interp=ARM_LE_LOADER,
+                            needed=["libCfm.so", "libc.so.0"],
+                            dynsym=[("bcm_nvram_get", False),
+                                    ("envram_get_value", False)]),
+            loader=ARM_LE_LOADER,
+            libs={"libCfm.so": _fake_loader(), "libc.so.0": _fake_loader()})
+        with stub_facility():
+            r = _run_precheck(ws, fref, rref)
+        d = r.data or {}
+        tpl = d.get("template_applicability") or {}
+        if tpl.get("family") != "mixed":
+            fails.append(f"并发调用应判 mixed: {tpl.get('family')}")
+        if tpl.get("supported_reads") != ["nvram_get", "bcm_nvram_get"]:
+            fails.append(f"mixed 仍应解锁 /dev/nvram 系读取: {tpl.get('supported_reads')}")
+        if d.get("result_class") != "dependency_blocked":
+            fails.append(f"envram caveat 应为 dependency_blocked: {d.get('result_class')}")
     return fails
 
 
@@ -722,14 +872,14 @@ def test_real_precheck_tgt8_busybox_ready() -> None:
 
 
 def test_real_precheck_tgt6_nvram_template_blocker() -> None:
-    """target/6 nvram(ARM32 LE/uClibc):静态条件全过,但 NEEDED libnvram.so
-    需要 NVRAM 模板(支持表未定稿,票 11)→ dependency_blocked;
-    报告保留原始 NEEDED,不宣称 ARM 子进程链可用。"""
+    """target/6 nvram(ARM32 LE/uClibc):静态条件全过;目标导入 nvram_get →
+    票 18 决定性支持表判 dev_nvram 家族,已核实读取接口解锁(不再阻塞);
+    报告保留原始 NEEDED 与会话声明要求,不宣称 ARM 子进程链可用。"""
     _require_exec_image()
     r = _precheck_real(TGT6_SQUASH, "usr/sbin/nvram")
     assert r.ok, f"预检执行失败: {r.error}"
     d = r.data or {}
-    assert d["result_class"] == "dependency_blocked", f"blockers={d.get('blockers')}"
+    assert d["result_class"] == "ok", f"blockers={d.get('blockers')}"
     arch = d["architecture"]
     assert arch["key"] == "arm32le" and arch["qemu_binary"] == "qemu-arm-static"
     assert d["interpreter"]["requested"] == "/lib/ld-uClibc.so.0"
@@ -740,10 +890,49 @@ def test_real_precheck_tgt6_nvram_template_blocker() -> None:
     assert "libnvram.so" in deps["resolved"]
     tpl = d["template_applicability"]
     assert "libnvram.so" in tpl["nvram_family_needed"]
-    assert "不判定" in tpl["detail"]
+    assert tpl["family"] == "dev_nvram", tpl
+    assert tpl["template_status"] == "supported_reads_unlocked", tpl
+    assert "nvram_get" in tpl["supported_reads"]
+    assert "nvram_values" in tpl["detail"]
     joined = " ".join(d["limitations"])
     assert "子进程链" in joined
     assert "以会话期实测为准" in joined or "受阻" in joined or "未定论" in joined
+
+
+def test_real_precheck_tgt7_envram_cli_stays_blocked() -> None:
+    """target/7 envram CLI(ARM32 LE):目标只调用 envram(MTD)系 → 票 18
+    未支持族阻塞,不因 libCfm 同名库或 libnvram 基名放行。"""
+    if not TGT7_SQUASH.is_dir():
+        pytest.skip(f"target/7 解包树缺失: {TGT7_SQUASH}")
+    _require_exec_image()
+    r = _precheck_real(TGT7_SQUASH, "bin/envram")
+    assert r.ok, f"预检执行失败: {r.error}"
+    d = r.data or {}
+    tpl = d["template_applicability"]
+    assert tpl["family"] == "envram", tpl
+    assert tpl["template_status"] == "unsupported_family", tpl
+    assert d["result_class"] == "dependency_blocked", d.get("blockers")
+    assert tpl["supported_reads"] == []
+    joined = " ".join(b["detail"] for b in d.get("blockers") or [])
+    assert "不因同名库放行" in joined
+
+
+def test_real_precheck_tgt7_httpd_mixed_family() -> None:
+    """target/7 httpd:同时导入 bcm_nvram_get(/dev/nvram 系)与 envram_*
+    → mixed:读取解锁 + envram 路径运行阻塞 caveat。"""
+    if not TGT7_SQUASH.is_dir():
+        pytest.skip(f"target/7 解包树缺失: {TGT7_SQUASH}")
+    _require_exec_image()
+    r = _precheck_real(TGT7_SQUASH, "bin/httpd")
+    assert r.ok, f"预检执行失败: {r.error}"
+    d = r.data or {}
+    tpl = d["template_applicability"]
+    assert tpl["family"] == "mixed", tpl
+    assert set(tpl["undefined_supported"]) >= {"bcm_nvram_get"}
+    assert tpl["supported_reads"] == ["nvram_get", "bcm_nvram_get"]
+    assert d["result_class"] == "dependency_blocked", d.get("blockers")
+    joined = " ".join(b["detail"] for b in d.get("blockers") or [])
+    assert "envram" in joined
 
 
 def test_main() -> int:
@@ -752,6 +941,7 @@ def test_main() -> int:
         ("parse_elf_arm32le", test_parse_elf_arm32le),
         ("parse_elf_mips32be_and_static", test_parse_elf_mips32be_and_static),
         ("parse_elf_rejects_garbage", test_parse_elf_rejects_garbage),
+        ("parse_elf_dynsym_defined_undefined", test_parse_elf_dynsym_defined_undefined),
         ("precheck_params_contract", test_precheck_params_contract),
         ("result_class_enum_is_spec_eight", test_result_class_enum_is_spec_eight),
         ("precheck_happy_path_arm32le", test_precheck_happy_path_arm32le),
@@ -759,6 +949,9 @@ def test_main() -> int:
         ("precheck_missing_loader_dependency_blocked", test_precheck_missing_loader_dependency_blocked),
         ("precheck_missing_needed_lib_dependency_blocked", test_precheck_missing_needed_lib_dependency_blocked),
         ("precheck_nvram_family_template_blocker", test_precheck_nvram_family_template_blocker),
+        ("precheck_nvram_dev_family_unlocks_supported_reads", test_precheck_nvram_dev_family_unlocks_supported_reads),
+        ("precheck_nvram_envram_family_stays_blocked", test_precheck_nvram_envram_family_stays_blocked),
+        ("precheck_nvram_mixed_family_unlocks_reads_with_caveat", test_precheck_nvram_mixed_family_unlocks_reads_with_caveat),
         ("precheck_unsupported_arch_prep_blocked_no_facility_call", test_precheck_unsupported_arch_prep_blocked_no_facility_call),
         ("precheck_not_elf_prep_blocked", test_precheck_not_elf_prep_blocked),
         ("precheck_facility_failure", test_precheck_facility_failure),

@@ -66,6 +66,7 @@ from .qemu_base import (
     timestamp,
 )
 from .qemu_precheck import ElfParseError, find_in_root, parse_elf_runtime
+from . import qemu_adapt
 
 # 执行会话固定形状(票 16 组合验证结论,不做成参数):
 _PROOT_BIN = "/usr/local/bin/proot"
@@ -81,6 +82,7 @@ _DEFAULT_GUEST_ENV = {"PATH": "/bin:/sbin:/usr/bin:/usr/sbin"}
 _KILL_GRACE_SECONDS = 5
 _DOCKER_OVERHEAD_SECONDS = 30
 _OUTPUT_EXCERPT_CHARS = 6000
+_STDIN_MAX_BYTES = 1 << 20
 _STUB_SCAN_RE = re.compile(
     r"^pid=(?P<pid>\d+) exe=(?P<exe>\S+) size=(?P<size>\d+|-) "
     r"sha256=(?P<sha256>[0-9a-f]{64}|-) cmd=(?P<cmd>.*)$"
@@ -263,13 +265,35 @@ class QemuExecuteTool(AgentTool):
         "args": {"type": "str", "default": "",
                  "desc": "目标参数串;按 POSIX 引号规则切分后逐个传入(无 shell 参与)"},
         "argv0": {"type": "str", "default": "",
-                  "desc": "目标 argv[0];为空时使用 guest 目标路径,不经过 shell"},
+                  "desc": "目标 argv[0](guest 内绝对路径;PRoot 以命令路径为 "
+                          "argv[0]):默认为目标 guest 路径;多路复用 CGI 传"
+                          "真实调用路径(如 /htdocs/web/conntrack.cgi),目标"
+                          "会以同一文件身份 bind 到该路径呈现,不遮蔽固件根内"
+                          "已有文件"},
         "env": {"type": "str", "default": "",
                 "desc": "额外环境变量,换行分隔的 K=V(值可含 =);不继承宿主环境"},
         "cwd": {"type": "str", "default": "/",
                 "desc": "guest 工作目录(固件根内绝对路径或 /tmp)"},
         "input_ref": {"type": "str", "default": "",
                       "desc": "可选输入文件(extracted 内);只读绑定到 guest 的 /session/input"},
+        "stdin_ref": {"type": "str", "default": "",
+                      "desc": "可选 stdin 文件(extracted 内);字节作为目标进程 stdin 送达"},
+        "adapt_binds": {"type": "str", "default": "",
+                        "desc": "会话级适配 bind(仅开启会话时生效,会话期固化)。"
+                                "每行一条:ro:<guest路径>=extracted/<固件内相对路径> | "
+                                "ro:<guest路径>=fixture/<名> | rw:<guest路径>=base/<名>"
+                                "(可写基础目录);/session、/dev、/tmp、/host-rootfs 保留"},
+        "adapt_fixtures": {"type": "str", "default": "",
+                           "desc": "会话级测试夹具声明(来源=declared_test_input)。"
+                                   "每行 <名>=<base64(utf-8)>,供 adapt_binds 以 "
+                                   "fixture/<名> 引用;台账记 sha256"},
+        "nvram_values": {"type": "str", "default": "",
+                         "desc": "NVRAM 模板值(仅 /dev/nvram 系已核实读取接口;"
+                                 "真实固件库原样执行)。每行 key=value"},
+        "nvram_sources": {"type": "str", "default": "",
+                          "desc": "NVRAM 值的来源引用,每行 key=<来源>(固件材料"
+                                  "带文件/行引用,或 declared_test_input);"
+                                  "任一值缺来源即准备阻塞"},
         "timeout_seconds": {"type": "int", "default": 60,
                             "desc": "单次执行预算秒数(默认 60,硬上限 180)"},
         "use_strace": {"type": "bool", "default": True,
@@ -360,7 +384,10 @@ class QemuExecuteTool(AgentTool):
              firmware_root: str = "", session_id: str = "",
              keep_open: bool = False, stop: bool = False, args: str = "",
              argv0: str = "", env: str = "", cwd: str = "/",
-             input_ref: str = "", timeout_seconds: int = 60,
+             input_ref: str = "", stdin_ref: str = "",
+             adapt_binds: str = "", adapt_fixtures: str = "",
+             nvram_values: str = "", nvram_sources: str = "",
+             timeout_seconds: int = 60,
              use_strace: bool = True) -> ToolResult:
         sessions_root = self._sessions_root()
         ledger = SessionLedger(sessions_root / "ledger.json")
@@ -429,6 +456,21 @@ class QemuExecuteTool(AgentTool):
         if root is None or not root.is_dir():
             return refuse(f"固件根不存在或越界(须为 extracted/ 内目录): {firmware_root}")
         if existing is not None:
+            if any((adapt_binds, adapt_fixtures, nvram_values, nvram_sources)):
+                try:
+                    incoming = self._parse_adaptation(
+                        root=root, binds_text=adapt_binds,
+                        fixtures_text=adapt_fixtures, values_text=nvram_values,
+                        sources_text=nvram_sources)
+                    # 幂等比较会重建 incoming NVRAM 映像,映像超限等声明
+                    # 错误在此同样走 refuse 通道(与其他拒绝同账,不逃逸)
+                    matches = self._adaptation_matches(
+                        existing.get("adaptation") or {}, incoming)
+                except qemu_adapt.AdaptationError as exc:
+                    return refuse(f"适配声明非法: {exc}")
+                if not matches:
+                    return refuse("适配声明(bind/夹具/NVRAM)在会话开启时固化;"
+                                  "复用会话只能重复开启时的声明,如需更改请新开会话")
             report["session_id"] = session_id
             stored_root = ((existing.get("firmware_root") or {}).get("path") or "")
             if stored_root and Path(stored_root) != root.resolve():
@@ -457,11 +499,23 @@ class QemuExecuteTool(AgentTool):
         try:
             prepared = self._prepare_execution(
                 root=root, file_ref=file_ref, args=args, argv0=argv0, env=env,
-                cwd=cwd, input_ref=input_ref, timeout_seconds=timeout_seconds,
+                cwd=cwd, input_ref=input_ref, stdin_ref=stdin_ref,
+                timeout_seconds=timeout_seconds,
                 use_strace=use_strace)
         except _PrepError as exc:
             return refuse(str(exc), exc.kind)
-        declared, target, input_mount, elf = prepared
+        declared, target, input_mount, elf, stdin_bytes = prepared
+        # 适配声明先于名额/容器解析(声明非法不消耗任何名额);复用会话
+        # 不重新解析(固化声明已在 _adaptation_matches 幂等核对)。
+        adaptation: dict = {}
+        if existing is None:
+            try:
+                adaptation = self._parse_adaptation(
+                    root=root, binds_text=adapt_binds,
+                    fixtures_text=adapt_fixtures, values_text=nvram_values,
+                    sources_text=nvram_sources)
+            except qemu_adapt.AdaptationError as exc:
+                return refuse(f"适配声明非法: {exc}")
 
         if existing is not None:
             exec_limit = entry.get("execution_budget") or {}
@@ -513,6 +567,16 @@ class QemuExecuteTool(AgentTool):
             # 运行目录先落盘再挂载(会话内跨执行状态的真实载体;新会话干净
             # 重建,不继承旧运行文件)。
             (session_dir / "runtime").mkdir(parents=True, exist_ok=True)
+            # 适配材料固化(夹具/基础目录/适配桩+模板映像)先于记账与容器;
+            # 失败则退出且未占名额(条目未入台账)。
+            try:
+                entry["adaptation"] = qemu_adapt.materialize(
+                    session_dir, root,
+                    fixtures=adaptation.get("fixtures") or {},
+                    binds=adaptation.get("binds") or [],
+                    nvram=adaptation.get("nvram"))
+            except (OSError, qemu_adapt.AdaptationError) as exc:
+                return refuse(f"适配材料固化失败: {exc}")
             # 占位记账先于容器创建:执行窗口内宿主死亡也有名额记录与
             # 容器名收割锚点(恢复路径按名强制收割)。
             ledger.add("sessions", entry)
@@ -520,6 +584,10 @@ class QemuExecuteTool(AgentTool):
                       (session_dir / "runtime", _GUEST_RUNTIME, "rw")]
             if input_mount is not None:
                 mounts.append(input_mount)
+            mounts += qemu_adapt.container_mounts(
+                session_dir,
+                with_fixtures=bool(entry["adaptation"].get("fixtures")),
+                with_nvram=bool(entry["adaptation"].get("nvram")))
             if not self._open_container(entry, mounts):
                 # 开启失败:立即封存(rm 报 absent/uncertain,如实记录),
                 # 名额已消耗(占位),不伪装成可继续的会话。
@@ -536,7 +604,8 @@ class QemuExecuteTool(AgentTool):
         exec_entry = self._execute_once(entry, ledger, session_dir,
                                         container=container_ref,
                                         declared=declared, input_mount=input_mount,
-                                        root=root, target=target, elf=elf)
+                                        root=root, target=target, elf=elf,
+                                        stdin_bytes=stdin_bytes)
         if exec_entry is None:
             # 预算在启动前耗尽:目标未运行。本次新开的单发会话立即封存
             # (不留一个从未执行的活动会话);复用会话保持 running,交由
@@ -568,6 +637,8 @@ class QemuExecuteTool(AgentTool):
                        "execution": exec_entry.get("execution"),
                        "cleanup": exec_entry.get("cleanup"),
                        "chain": exec_entry.get("chain"),
+                       "adaptation": entry.get("adaptation") or {},
+                       "adaptation_gaps": exec_entry.get("adaptation_gaps"),
                        "observation_excerpt": exec_entry.get("observation_excerpt"),
                        "executions_total": len(entry["executions"]),
                        "execution_budget": entry["execution_budget"]})
@@ -597,11 +668,13 @@ class QemuExecuteTool(AgentTool):
 
     def _prepare_execution(self, *, root: Path, file_ref: str, args: str,
                            argv0: str, env: str, cwd: str, input_ref: str,
-                           timeout_seconds: int, use_strace: bool):
+                           stdin_ref: str, timeout_seconds: int,
+                           use_strace: bool):
         """单次执行的声明输入固化(参数面;无 shell 参与)。
 
-        返回 (declared, target, input_mount, elf);失败抛 _PrepError
-        (kind 区分准备阻塞/依赖阻塞)。
+        返回 (declared, target, input_mount, elf, stdin_bytes);失败抛
+        _PrepError(kind 区分准备阻塞/依赖阻塞)。stdin 字节只在本次执行
+        内存中传递,不入台账(台账记 ref/sha256/字节数)。
         """
         target = self._resolve_extracted(file_ref)
         if target is None or not target.is_file():
@@ -625,8 +698,17 @@ class QemuExecuteTool(AgentTool):
         except ValueError as exc:
             raise _PrepError(f"args 引号解析失败(POSIX 规则): {exc}")
         declared_argv0 = (argv0 or "").strip()
-        if "\x00" in declared_argv0:
-            raise _PrepError("argv0 不得包含 NUL 字节")
+        if declared_argv0 and (not declared_argv0.startswith("/")
+                               or ".." in declared_argv0.split("/")
+                               or "\x00" in declared_argv0):
+            raise _PrepError("argv0 必须是 guest 内绝对路径(多路复用 CGI 的"
+                             "真实调用形态)且不含 .. 或 NUL")
+        guest_target = "/" + target.relative_to(root).as_posix()
+        if declared_argv0 and declared_argv0 != guest_target:
+            existing = root / declared_argv0.lstrip("/")
+            if existing.exists() and existing.resolve() != target.resolve():
+                raise _PrepError(
+                    f"argv0 路径在固件根内已存在其他文件,不得遮蔽: {declared_argv0}")
         declared_env = dict(_DEFAULT_GUEST_ENV)
         for line in (env or "").splitlines():
             line = line.strip()
@@ -660,6 +742,19 @@ class QemuExecuteTool(AgentTool):
                 # 固件根外的输入:单文件只读绑定挂到约定路径
                 input_guest = _GUEST_INPUT
                 input_mount = (input_path, _GUEST_INPUT, "ro")
+        stdin_bytes: bytes | None = None
+        stdin_meta: dict | None = None
+        if stdin_ref.strip():
+            stdin_path = self._resolve_extracted(stdin_ref)
+            if stdin_path is None or not stdin_path.is_file():
+                raise _PrepError(f"stdin_ref 不存在或越界: {stdin_ref}")
+            stdin_bytes = stdin_path.read_bytes()
+            if len(stdin_bytes) > _STDIN_MAX_BYTES:
+                raise _PrepError(
+                    f"stdin_ref 超过上限 {_STDIN_MAX_BYTES} 字节: {stdin_ref}")
+            stdin_meta = {"ref": stdin_ref,
+                          "sha256": qemu_adapt.sha256_bytes(stdin_bytes),
+                          "size_bytes": len(stdin_bytes)}
         digest_map: dict[str, str] = {"target": sha256_file(target)}
         deps_truncated = False
         try:
@@ -668,7 +763,6 @@ class QemuExecuteTool(AgentTool):
             raise _PrepError(str(exc), QemuResultClass.DEPENDENCY_BLOCKED)
         for rel in dep_rels:
             digest_map[rel] = sha256_file(root / rel)
-        guest_target = "/" + target.relative_to(root).as_posix()
         declared = {
             "target": {"ref": file_ref, "sha256": digest_map["target"],
                        "guest_path": guest_target},
@@ -679,6 +773,7 @@ class QemuExecuteTool(AgentTool):
             "input": ({"ref": input_ref, "guest_path": input_guest,
                        "sha256": sha256_file(input_path)}
                       if input_path is not None else None),
+            "stdin": stdin_meta,
             "timeout_requested_seconds": int(timeout_seconds),
             "timeout_seconds": timeout_clamped,
             "use_strace": bool(use_strace),
@@ -689,7 +784,62 @@ class QemuExecuteTool(AgentTool):
         if deps_truncated:
             declared["dependencies_search_truncated"] = (
                 "固件根检索达上限后截断,依赖身份档案可能缺项(明示,不当缺失)")
-        return declared, target, input_mount, elf
+        return declared, target, input_mount, elf, stdin_bytes
+
+    # ---- 分步辅助:适配声明解析(会话开启时;不写盘) ----
+
+    @staticmethod
+    def _adaptation_matches(stored: dict, incoming: dict) -> bool:
+        """复用会话的声明幂等比较:bind 逐字段、夹具按 sha256、NVRAM 按
+        映像 sha256 与来源逐项比对(不落盘)。
+
+        stored 是 materialize 固化形态(可能含 shadowed_original 等派生键),
+        比较前把双方投影到声明字段(模式/路径/来源/摘要),派生字段不计入
+        声明——它们是同一声明的记账产物,不应造成幂等误拒。
+        """
+        bind_fields = ("mode", "guest_path", "kind", "ref", "sha256")
+        stored_binds = [{k: b.get(k) for k in bind_fields}
+                        for b in (stored.get("binds") or [])]
+        incoming_binds = [{k: b.get(k) for k in bind_fields}
+                          for b in (incoming.get("binds") or [])]
+        if stored_binds != incoming_binds:
+            return False
+        stored_fx = {f["name"]: f["sha256"]
+                     for f in (stored.get("fixtures") or [])}
+        incoming_fx = {name: qemu_adapt.sha256_bytes(content)
+                       for name, content in (incoming.get("fixtures") or {}).items()}
+        if stored_fx != incoming_fx:
+            return False
+        stored_nv = stored.get("nvram")
+        incoming_nv = incoming.get("nvram")
+        if stored_nv is None and incoming_nv is None:
+            return True
+        if stored_nv is None or incoming_nv is None:
+            return False
+        incoming_values = {key: item["value"]
+                           for key, item in (incoming_nv or {}).items()}
+        incoming_image = qemu_adapt.build_nvram_image(
+            {k: {"value": v} for k, v in incoming_values.items()})
+        if qemu_adapt.sha256_bytes(incoming_image) != stored_nv.get("image_sha256"):
+            return False
+        return stored_nv.get("values") == {key: item["source"]
+                                           for key, item in incoming_nv.items()}
+
+    @staticmethod
+    def _parse_adaptation(*, root: Path, binds_text: str, fixtures_text: str,
+                          values_text: str, sources_text: str) -> dict:
+        """适配声明解析与校验(qemu_adapt 单一出处);全空 → 空声明。
+
+        NVRAM 声明非空时先校验适配桩钉值(漂移在开启前拒绝,不占名额)。
+        """
+        fixtures = qemu_adapt.parse_fixtures(fixtures_text)
+        binds = qemu_adapt.parse_binds(binds_text, root, fixtures)
+        nvram = None
+        if (values_text or "").strip() or (sources_text or "").strip():
+            values = qemu_adapt.parse_nvram_declaration(values_text, sources_text)
+            qemu_adapt.shim_artifact()
+            nvram = values
+        return {"fixtures": fixtures, "binds": binds, "nvram": nvram}
 
     # ---- 分步辅助:容器开启 ----
 
@@ -716,7 +866,7 @@ class QemuExecuteTool(AgentTool):
     def _execute_once(self, entry: dict, ledger: SessionLedger,
                       session_dir: Path, *, container: str, declared: dict,
                       input_mount: tuple | None, root: Path, target: Path,
-                      elf: dict) -> dict | None:
+                      elf: dict, stdin_bytes: bytes | None = None) -> dict | None:
         """会话内一次声明执行;执行事实先持久化,观测缺口如实补记。
 
         返回执行条目;返回 None = 未启动目标(案例剩余预算不足)。
@@ -727,6 +877,9 @@ class QemuExecuteTool(AgentTool):
         declared["timeout_seconds"] = timeout_clamped
         seq = len(entry.get("executions") or []) + 1
         exec_entry: dict = {"seq": seq, "declared": declared}
+        adaptation = entry.get("adaptation") or {}
+        adapt_binds = adaptation.get("binds") or []
+        with_nvram = bool(adaptation.get("nvram"))
         # 观察者(docker exec -d;延时后写快照到 guest 不可见的 stub tmpfs;
         # 逐执行独立快照文件,桩名随本次 PRoot 实例变化)
         snapshot_guest = f"{_GUEST_STUB}/.proc-snapshot-exec-{seq:03d}.txt"
@@ -743,15 +896,36 @@ class QemuExecuteTool(AgentTool):
             proot_argv += ["-b", dev]
         if input_mount is not None:
             proot_argv += ["-b", f"{_GUEST_INPUT}:{_GUEST_INPUT}"]
-        proot_argv += ["-w", declared["cwd"],
-                       declared["target"]["guest_path"], declared["argv0"]] \
-            + declared["argv"]
+        if adapt_binds or with_nvram:
+            # 会话适配(开启时固化的声明)逐执行重新挂载;子进程经 proot
+            # 与环境继承同一适配,不改变固件自身代码。
+            proot_argv += qemu_adapt.proot_binds(adapt_binds,
+                                                 with_nvram=with_nvram)
+        # argv0 语义(票 18 实测:PRoot 以命令路径作为 guest argv[0],命令后
+        # 的独立参数会成为 argv[1] 起——裸名字 argv0 无法表达)。因此:
+        # - argv0 == guest 路径(默认):命令即目标路径,argv[0]=目标路径;
+        # - argv0 为绝对 guest 路径(多路复用 CGI 的真实调用形态,如
+        #   /htdocs/web/conntrack.cgi):把同一真实目标 bind 到该路径执行,
+        #   argv[0] 即该路径;目标文件身份(digest)不变,bind 单独入账。
+        argv0 = declared["argv0"]
+        guest_target = declared["target"]["guest_path"]
+        if argv0 == guest_target:
+            proot_argv += ["-w", declared["cwd"], guest_target]
+        else:
+            proot_argv += ["-b", f"{_GUEST_ROOT}{guest_target}:{argv0}"]
+            proot_argv += ["-w", declared["cwd"], argv0]
+        proot_argv += declared["argv"]
         exec_env = {**declared["env"], "PROOT_TMP_DIR": _GUEST_STUB}
         if declared["use_strace"]:
             exec_env["QEMU_STRACE"] = "1"
+        if with_nvram:
+            # LD_PRELOAD 是适配桩装配(声明固化的模板),不是模型声明的
+            # guest 输入;LD_ 控制变量对模型声明的 env 仍然拒绝。
+            exec_env["LD_PRELOAD"] = qemu_adapt.NVRAM_LD_PRELOAD
         exec_started = time.monotonic()
         rc, out, err = docker_exec(
             container, proot_argv, env=exec_env,
+            stdin_bytes=stdin_bytes,
             timeout=timeout_clamped + _KILL_GRACE_SECONDS + _DOCKER_OVERHEAD_SECONDS)
         elapsed = round(time.monotonic() - exec_started, 3)
         exec_entry["execution"] = {
@@ -806,6 +980,22 @@ class QemuExecuteTool(AgentTool):
             if note:
                 exec_entry["result_note"] = note
             exec_entry["observation_excerpt"] = self._excerpt(out or "", err or "")
+        if with_nvram:
+            # 未决键读回(逐执行消费:读后清除,避免跨执行串账)。
+            try:
+                unresolved = qemu_adapt.consume_unresolved_keys(
+                    session_dir / "runtime")
+            except OSError as exc:
+                exec_entry["adaptation_gaps"] = {
+                    "nvram_unresolved_keys": None,
+                    "note": f"未决键日志读回失败(缺口明示): {exc}"}
+            else:
+                if unresolved:
+                    exec_entry["adaptation_gaps"] = {
+                        "nvram_unresolved_keys": unresolved,
+                        "note": ("NVRAM 模板未声明键:桩按固件缺失键语义应答 "
+                                 "NULL,未伪造值;相关配置面行为不得作为设备"
+                                 "真实行为结论")}
         ledger.replace(entry["session_id"], entry)
         return exec_entry
 
@@ -1017,6 +1207,26 @@ def _render_text(report: dict) -> str:
     removal = report.get("container_removal") or {}
     if cleanup:
         lines.append(f"- 清理: {cleanup.get('verdict')}(残留 {cleanup.get('leftovers_after')})")
+    adaptation = report.get("adaptation") or {}
+    if adaptation:
+        parts: list[str] = []
+        if adaptation.get("fixtures"):
+            parts.append(f"夹具 {len(adaptation['fixtures'])} 项")
+        if adaptation.get("binds"):
+            parts.append(f"bind {len(adaptation['binds'])} 条"
+                         f"(rw {sum(1 for b in adaptation['binds'] if b['mode'] == 'rw')})")
+        nvram = adaptation.get("nvram")
+        if nvram:
+            parts.append(f"NVRAM[{nvram.get('family')}] 值 {nvram.get('values_count')} 项"
+                         f"(逐项有来源;桩 {str(nvram.get('shim_sha256'))[:12]}…)")
+        lines.append("- 适配(会话期固化): " + ";".join(parts))
+        if nvram:
+            lines.append(f"    NVRAM 未支持: {nvram.get('unsupported')}")
+    gaps = report.get("adaptation_gaps") or {}
+    if gaps:
+        keys = gaps.get("nvram_unresolved_keys")
+        lines.append(f"- 适配缺口: {gaps.get('note')}"
+                     + (f" 键: {', '.join(keys)}" if keys else ""))
     if removal:
         lines.append(f"- 容器: {removal.get('verdict')}"
                      + (";会话已停机封存" if report.get("sealed")
