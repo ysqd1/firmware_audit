@@ -1026,7 +1026,8 @@ class HostVerificationRunner:
                                 self._checkpoint(candidate_id, kind)
                                 result = execute_tool(
                                     tool, arguments, method=execute_method,
-                                    investigation_ref=verification_id, budget=self._budget)
+                                    investigation_ref=verification_id, budget=self._budget,
+                                    role="verification")
                             recovered = self._evidence_store.record(
                                 slot, candidate_id=candidate_id,
                                 investigation_id=verification_id,

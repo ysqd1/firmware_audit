@@ -106,7 +106,9 @@ python -m firmware_audit.step5_agent.run_step5 target/1 --force    # 强制三 A
 
 > `main.py` 不向 Step5 透传 `--force`(全流程重跑时 Step5 恒命中断点跳过),要强制重跑 Step5 请用上面独立入口。
 
-Step5 产物:报告在 `target/<N>/process/agent/orchestrator/report.md`,复核结论在 `verified_findings.json`。终端监控显示可用 `STEP5_DISPLAY=compact|full` 开启(详见 `step5_agent/DISPLAY.md`)。
+Step5 产物:世代化工件在 `target/<N>/process/generations/gen-XXXX/`(确定性报告 `report.md`、Finding `findings.json`、配置快照 `config.json`)。终端监控显示可用 `STEP5_DISPLAY=compact|full` 开启(详见 `step5_agent/DISPLAY.md`)。
+
+Step5 预算与 QEMU 动态执行预算:环境变量见 `.env.example`;每方 QEMU 会话名额(防护上限 3,只可收紧)与会话内执行次数(票 19 定稿 4)走四层解析(显式 > env > 案例 profile > 默认),生效值与来源随世代 `config.json` 快照冻结。案例预算 profile:复制 `profiles/step5-budget-profile.example.json` 到工作区并改名 `step5_budget_profile.json`。
 
 ## 测试
 

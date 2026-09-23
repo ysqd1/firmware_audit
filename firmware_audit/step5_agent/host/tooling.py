@@ -13,7 +13,7 @@ from typing import Any
 
 from ..providers.tools import ReplayPolicy, authorize_tool
 from ..providers.tools.base import ToolResult, validate_params
-from .budget import QEMU_MAX_SESSION_EXECUTIONS_KEY
+from .budget import QEMU_MAX_SESSION_EXECUTIONS_KEY, QEMU_MAX_SESSIONS_KEY
 from .json_values import JsonValueError, clone_json_value
 from .session import ProposalRejectedError
 from .store import StoreError
@@ -52,8 +52,14 @@ def normalize_tool_arguments(
 
 
 def execute_tool(tool: object, arguments: dict[str, Any], *, method: str = "execute",
-                 investigation_ref: str | None = None, budget=None) -> ToolResult:
-    """工具 adapter 失约也转为失败 ToolResult,保留本次逻辑调用身份。"""
+                 investigation_ref: str | None = None, budget=None,
+                 role: str | None = None) -> ToolResult:
+    """工具 adapter 失约也转为失败 ToolResult,保留本次逻辑调用身份。
+
+    role 是调用 runner 的角色(analysis/verification):qemu_execute 的
+    会话名额按 (角色, 归属) 记账,台账身份由 Host 盖章,不依赖工具实例
+    构造时的角色缺省。
+    """
     try:
         if getattr(tool, "name", None) == "qemu_execute":
             if investigation_ref is None or budget is None:
@@ -65,7 +71,11 @@ def execute_tool(tool: object, arguments: dict[str, Any], *, method: str = "exec
                 # 会话内执行次数上限随 QEMU 预算块走分层配置(票 17):
                 # 生效值与来源已随 config.json 快照冻结;旧世代快照缺该键时
                 # 传 None,工具回落 env/默认并在台账记录实际来源。
-                max_executions=budget.resolved.get(QEMU_MAX_SESSION_EXECUTIONS_KEY))
+                max_executions=budget.resolved.get(QEMU_MAX_SESSION_EXECUTIONS_KEY),
+                # 会话名额上限同走分层配置(票 19 AC3):防护钳制在解析层,
+                # 快照生效值与执行侧一致。
+                max_sessions=budget.resolved.get(QEMU_MAX_SESSIONS_KEY),
+                role=role)
         else:
             result = getattr(tool, method)(**arguments)
     except Exception as exc:

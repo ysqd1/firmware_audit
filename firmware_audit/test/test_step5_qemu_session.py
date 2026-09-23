@@ -314,6 +314,56 @@ def test_session_configuration_cannot_exceed_three(tmp_path: Path, fake_docker, 
     assert tool.execute(**_default_kwargs()).data["result_class"] == "prep_blocked"
 
 
+def test_session_quota_host_config_layer_and_clamp(tmp_path: Path,
+                                                   fake_docker: FakeDocker) -> None:
+    """票 19 AC3:会话名额走 Host 分层配置(host_config 来源入台账/报告),
+    防护钳制 ≤3 与 env 层一致——配置不能把每方名额放大。"""
+    _arm_workspace(tmp_path)
+    tool = _tool(tmp_path)
+
+    def scope(kwargs, *, sessions):
+        return tool.execute_for_scope(
+            {k: v for k, v in kwargs.items() if k != "investigation_ref"},
+            investigation_ref=kwargs["investigation_ref"],
+            remaining_seconds=None, max_sessions=sessions)
+
+    r1 = scope(_default_kwargs(), sessions=2)
+    assert r1.data["result_class"] == "normal_exit"
+    # session_budget.used 是本次调用前的已用数(开启计数见台账)
+    assert r1.data["session_budget"] == {"used": 0, "limit": 2,
+                                         "source": "host_config",
+                                         "env_knob": "STEP5_QEMU_MAX_SESSIONS"}
+    r2 = scope(_default_kwargs(), sessions=2)
+    assert r2.data["result_class"] == "normal_exit"
+    assert r2.data["session_budget"]["used"] == 1
+    r3 = scope(_default_kwargs(), sessions=2)
+    assert r3.data["result_class"] == "prep_blocked"
+    assert r3.data["refused"]["reason"] == "session_quota_exhausted"
+    entry = _read_ledger(tmp_path)["sessions"][0]
+    assert entry["session_budget"] == {"limit": 2, "source": "host_config"}
+    # 放大值钳制回防护上限 3
+    for _ in range(3):
+        assert scope(_default_kwargs(investigation_ref="host-clamp"),
+                     sessions=99).data["result_class"] == "normal_exit"
+    assert scope(_default_kwargs(investigation_ref="host-clamp"),
+                 sessions=99).data["result_class"] == "prep_blocked"
+
+
+def test_session_knob_env_name_consistent_across_layers() -> None:
+    """会话名额旋钮在 budget 层与工具层同名同默认(单一来源,测试钉住)。"""
+    from firmware_audit.step5_agent.host.budget import (
+        DEFAULT_BUDGET_CONFIG,
+        ENV_KEYS,
+        QEMU_MAX_SESSIONS_KEY,
+    )
+    from firmware_audit.step5_agent.providers.tools.qemu_base import (
+        DEFAULT_MAX_SESSIONS_PER_SCOPE,
+        QEMU_MAX_SESSIONS_ENV,
+    )
+    assert ENV_KEYS[QEMU_MAX_SESSIONS_KEY] == QEMU_MAX_SESSIONS_ENV
+    assert DEFAULT_BUDGET_CONFIG[QEMU_MAX_SESSIONS_KEY] == DEFAULT_MAX_SESSIONS_PER_SCOPE
+
+
 # ---------- 离线:多执行会话(票 17 核心) ----------
 
 def test_session_reuse_state_continuity_and_stop(tmp_path: Path,
@@ -590,6 +640,26 @@ def test_execution_shape(tmp_path: Path, fake_docker: FakeDocker) -> None:
     assert session["sealed"] is True
     assert session["executions"][0]["declared"]["argv"] == ["get", "foo"]
     assert r.data["declared"]["argv"] == ["get", "foo"]
+
+
+def test_phase_timings_recorded_for_calibration(tmp_path: Path,
+                                                fake_docker: FakeDocker) -> None:
+    """票 19 预算校准的台账 substrate:每次执行记录准备/执行/清理验证/链观测
+    分相耗时,会话记录开启与封存耗时;数值非负且执行相与总耗时一致。"""
+    _arm_workspace(tmp_path)
+    tool = _tool(tmp_path)
+    r = tool.execute(**_default_kwargs(args="get foo"))
+    assert r.data["result_class"] == "normal_exit"
+    exec_entry = _read_ledger(tmp_path)["sessions"][0]["executions"][0]
+    phases = exec_entry["phase_seconds"]
+    assert set(phases) == {"prepare", "execute", "cleanup_verify", "chain_snapshot"}
+    assert all(isinstance(v, (int, float)) and v >= 0 for v in phases.values())
+    assert phases["execute"] == exec_entry["execution"]["elapsed_seconds"]
+    session_entry = _read_ledger(tmp_path)["sessions"][0]
+    assert session_entry["open_seconds"] >= 0
+    assert session_entry["seal_seconds"] >= 0
+    # 报告文本同样呈现分相耗时(校准可读)
+    assert "准备" in r.text and "清理验证" in r.text
 
 
 def test_explicit_argv0_is_recorded_and_passed(tmp_path: Path, fake_docker: FakeDocker) -> None:
@@ -1653,6 +1723,20 @@ def test_real_mips_non_shell_parent(tmp_path: Path, monkeypatch) -> None:
     assert "env-parent-mips-ok" in d["observation_excerpt"]["stdout"]["excerpt"]
 
 
+def test_hard_timeout_cap_clamped_at_180(tmp_path: Path,
+                                         fake_docker: FakeDocker) -> None:
+    """票 19 AC2:60s 默认/180s 硬上限维持——超出 180 的声明被钳到硬上限,
+    不擅自放宽(ADR-0013)。"""
+    _arm_workspace(tmp_path)
+    tool = _tool(tmp_path)
+    r = tool.execute(**_default_kwargs(timeout_seconds=300))
+    assert r.data["result_class"] == "normal_exit"
+    assert r.data["declared"]["timeout_requested_seconds"] == 300
+    assert r.data["declared"]["timeout_seconds"] == 180
+    exec_call = next(c for c in fake_docker.calls if c[0] == "exec")
+    assert list(exec_call[1][1:4]) == ["-k", "5", "180"]
+
+
 def test_execution_knob_env_name_consistent_across_layers() -> None:
     """QEMU 预算旋钮的 env 名与默认值在 budget 层与工具层一致(分层不可互导,
     用测试钉住单一来源)。"""
@@ -1934,6 +2018,178 @@ def test_real_t6_conntrack_cgi_honest_block(tmp_path: Path, monkeypatch) -> None
     assert d["result_class"] in ("nonzero_exit", "target_signal"), d
     assert "<conntrack>" not in d["observation_excerpt"]["stdout"]["excerpt"]
     assert "uncaught target signal" in stderr or d["result_class"] == "target_signal"
+
+
+# ---------- 票 19:校准/干净复现/自主派生(门控;真实 PRoot/QEMU 后端) ----------
+
+def _t6_captcha_workspace(tmp_path: Path) -> Path:
+    """t6 captcha 通路最小子树:cgibin、busybox+sh(system 依赖)、rndimage、
+    字体目录、lib 树。原件只读;输出落在会话运行目录的 rw bind。"""
+    import shutil
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    for rel in ("htdocs/cgibin", "bin/busybox", "usr/sbin/rndimage"):
+        assert _copy_rel(TGT6_SQUASH, root, rel), f"固件子树缺失: {rel}"
+    sh = root / "bin" / "sh"
+    sh.symlink_to("busybox")
+    fonts = TGT6_SQUASH / "usr" / "sbin" / "fonts"
+    if fonts.is_dir():
+        shutil.copytree(fonts, root / "usr" / "sbin" / "fonts")
+    _copy_lib_tree(TGT6_SQUASH, root)
+    return ws
+
+
+def test_real_captcha_cgibin_autonomous_spawn_and_control(
+        tmp_path: Path, monkeypatch) -> None:
+    """票 19 AC6(target/6):原固件程序(cgibin)自主派生子进程——非 shell
+    父程序经 system() → /bin/sh -c → rndimage 渲染验证码 jpeg 落盘,业务
+    XML 输出可检查;无 cookie 对照走 NO SESSION 分支且不派生。opkg 通路
+    不承担本项验收;快照观测缺口如实保留。"""
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    if not TGT6_SQUASH.is_dir():
+        pytest.skip(f"target/6 解包树缺失: {TGT6_SQUASH}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = _t6_captcha_workspace(tmp_path)
+    tool = _tool(ws, role="analysis")
+    sesscfg = base64.b64encode(b"600\n8\n16\n1\n").decode()
+    binds = ("rw:/var=base/var\n"
+             "ro:/var/session/sesscfg=fixture/sesscfg\n"
+             "rw:/htdocs/web/docs=base/docs")
+
+    def run(**over):
+        kwargs = dict(file_ref="fw/htdocs/cgibin", firmware_root="fw",
+                      investigation_ref="case-captcha", keep_open=True,
+                      use_strace=True, timeout_seconds=45,
+                      argv0="/htdocs/web/captcha.cgi",
+                      env=("REQUEST_METHOD=GET\n"
+                           "SCRIPT_FILENAME=/htdocs/web/captcha.cgi\n"
+                           "REQUEST_URI=/captcha.cgi"),
+                      adapt_binds=binds,
+                      adapt_fixtures=f"sesscfg={sesscfg}")
+        kwargs.update(over)
+        return tool.execute(**kwargs)
+
+    # ① 自主派生:带会话 cookie → OK XML + jpeg 落盘 + 派生链 strace 铁证
+    r = run(env=("REQUEST_METHOD=GET\nSCRIPT_FILENAME=/htdocs/web/captcha.cgi\n"
+                 "REQUEST_URI=/captcha.cgi\nHTTP_COOKIE=uid=probeuid"))
+    d = r.data
+    assert d["result_class"] == "normal_exit", d
+    stdout = d["observation_excerpt"]["stdout"]["excerpt"]
+    assert "<captcha>" in stdout and "<result>OK</result>" in stdout, stdout
+    assert "/docs/captcha_" in stdout
+    # 业务产物真实落在会话运行目录(rw bind;原件只读未动)
+    session_dir = Path(d["artifacts"]["session_dir"])
+    jpegs = list((session_dir / "runtime" / "base" / "docs").glob("captcha_*.jpeg"))
+    assert jpegs and all(p.stat().st_size > 0 for p in jpegs), jpegs
+    # 会话存储真实创建(业务状态跨输入存在)
+    assert list((session_dir / "runtime" / "base" / "var" / "session").iterdir())
+    # 派生链身份:strace 记录 cgibin(vfork)→ sh -c "rndimage …" →
+    # execve("/usr/sbin/rndimage") 成功——全部为原固件二进制/库
+    stderr = (session_dir / "exec-001-stderr.txt").read_text(encoding="utf-8",
+                                                             errors="replace")
+    assert 'execve("/bin/sh",{"sh","-c","rndimage -f /htdocs/web/docs/captcha_' in stderr
+    assert 'execve("/usr/sbin/rndimage"' in stderr
+    exec_line = next(line for line in stderr.splitlines()
+                     if 'execve("/usr/sbin/rndimage"' in line)
+    assert "errno" not in exec_line, exec_line
+    assert "/usr/sbin/fonts" in stderr
+    # 快照观测缺口如实明示(短命子进程不宣称完整执行链)
+    assert "快照" in d["chain"]["snapshot_note"]
+    assert d["cleanup"]["verdict"] in ("clean", "clean_after_kill")
+    sid = d["session_id"]
+
+    # ② 正常对照:同一程序,无 cookie → 会话门 NO SESSION,不派生、无产物
+    r2 = tool.execute(file_ref="fw/htdocs/cgibin", firmware_root="fw",
+                      investigation_ref="case-captcha", session_id=sid,
+                      use_strace=True, timeout_seconds=45,
+                      argv0="/htdocs/web/captcha.cgi",
+                      env=("REQUEST_METHOD=GET\n"
+                           "SCRIPT_FILENAME=/htdocs/web/captcha.cgi\n"
+                           "REQUEST_URI=/captcha.cgi"),
+                      adapt_binds=binds,
+                      adapt_fixtures=f"sesscfg={sesscfg}")
+    d2 = r2.data
+    assert d2["result_class"] == "normal_exit", d2
+    assert "<result>FAIL</result>" in d2["observation_excerpt"]["stdout"]["excerpt"]
+    assert "NO SESSION" in d2["observation_excerpt"]["stdout"]["excerpt"]
+    stderr2 = (session_dir / "exec-002-stderr.txt").read_text(
+        encoding="utf-8", errors="replace")
+    assert "rndimage" not in stderr2, "对照分支不得派生 rndimage"
+    assert d2["executions_total"] == 2
+    tool.execute(session_id=sid, stop=True, firmware_root="fw",
+                 investigation_ref="case-captcha")
+
+
+def test_real_opkg_second_clean_session_repeat_and_no_inheritance(
+        tmp_path: Path, monkeypatch) -> None:
+    """票 19 AC4:已交付业务通路(target/8 opkg)在第二个干净会话重复取得
+    相同结果(stdout digest 一致);跨会话不继承运行文件(真实固件 busybox
+    写 /tmp 标记,新会话不可见);同会话内后继执行可见前序写入。"""
+    from firmware_audit.docker.docker_utils import docker_available
+    if not docker_available(QEMU_EXEC_V2_IMAGE):
+        pytest.skip(f"Docker 或镜像 {QEMU_EXEC_V2_IMAGE} 不可用")
+    tgt8 = TGT8_SQUASH
+    if not tgt8.is_dir():
+        pytest.skip(f"target/8 解包树缺失: {tgt8}")
+    monkeypatch.delenv("STEP5_QEMU_MAX_SESSIONS", raising=False)
+    ws = tmp_path / "ws"
+    root = ws / "extracted" / "fw"
+    for rel in ("bin/opkg", "bin/busybox", "lib/libc.so",
+                "lib/ld-musl-mips-sf.so.1", "lib/libgcc_s.so.1",
+                "lib/libubox.so", "etc/opkg.conf", "usr/lib/opkg/status"):
+        assert _copy_rel(tgt8, root, rel), f"固件子树缺失: {rel}"
+    tool = _tool(ws, role="analysis")
+    opkg_common = dict(firmware_root="fw", use_strace=False, timeout_seconds=90,
+                       adapt_binds="rw:/var/lock=base/varlock")
+
+    def pathway(scope: str) -> list[dict]:
+        execs = []
+        kw = dict(opkg_common, investigation_ref=scope, keep_open=True)
+        r1 = tool.execute(file_ref="fw/bin/opkg", args="list-installed", **kw)
+        execs.append(r1.data)
+        r2 = tool.execute(file_ref="fw/bin/opkg", args="info busybox",
+                          session_id=r1.data["session_id"], **kw)
+        execs.append(r2.data)
+        tool.execute(session_id=r1.data["session_id"], stop=True,
+                     firmware_root="fw", investigation_ref=scope)
+        return execs
+
+    # ① 第一会话:业务通路两轮
+    first = pathway("case-opkg-repeat-a")
+    # ② 第二个干净会话(新会话 id、新运行目录):相同声明输入重复
+    #    → 结果与输出 digest 一致
+    second = pathway("case-opkg-repeat-b")
+    for exec_a, exec_b in zip(first, second):
+        assert exec_a["result_class"] == exec_b["result_class"] == "normal_exit"
+        assert (exec_a["execution"]["stdout_sha256"]
+                == exec_b["execution"]["stdout_sha256"])
+    # ③ 跨会话不继承:会话 A 写 /tmp 标记 → 会话 B(新会话)不可见;
+    #    同会话内后继执行可见前序写入
+    rw = tool.execute(file_ref="fw/bin/busybox", firmware_root="fw",
+                      investigation_ref="case-marker",
+                      keep_open=True, use_strace=False, timeout_seconds=30,
+                      args="sh -c 'echo t19-marker > /tmp/t19marker'")
+    d = rw.data
+    assert d["result_class"] == "normal_exit", d
+    marker_sid = d["session_id"]
+    see = tool.execute(file_ref="fw/bin/busybox", firmware_root="fw",
+                       investigation_ref="case-marker", session_id=marker_sid,
+                       use_strace=False, timeout_seconds=30,
+                       args="sh -c '/bin/busybox cat /tmp/t19marker'")
+    assert see.data["result_class"] == "normal_exit", see.data
+    assert "t19-marker" in see.data["observation_excerpt"]["stdout"]["excerpt"]
+    tool.execute(session_id=marker_sid, stop=True, firmware_root="fw",
+                 investigation_ref="case-marker")
+    fresh = tool.execute(file_ref="fw/bin/busybox", firmware_root="fw",
+                         investigation_ref="case-marker-b",
+                         use_strace=False, timeout_seconds=30,
+                         args="sh -c '/bin/busybox cat /tmp/t19marker'")
+    # 新会话无该文件:cat 非零退出且输出不含标记——不继承的如实证据
+    assert fresh.data["result_class"] == "nonzero_exit", fresh.data
+    assert "t19-marker" not in fresh.data["observation_excerpt"]["stdout"]["excerpt"], \
+        "新会话不得继承前会话运行文件"
 
 
 def test_adaptation_mismatch_build_error_refuses_in_channel(

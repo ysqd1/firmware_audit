@@ -136,27 +136,42 @@ DEFAULT_MAX_SESSIONS_PER_SCOPE = 3
 QEMU_MAX_SESSIONS_ENV = "STEP5_QEMU_MAX_SESSIONS"
 
 
-def resolve_max_sessions(env: dict[str, str] | None = None) -> int:
-    """同角色同归属的会话上限:默认 3(ADR-0013 由 4 收紧),env 层可覆盖。
+def resolve_max_sessions_with_source(
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
+    """同角色同归属会话上限及来源:env(STEP5_QEMU_MAX_SESSIONS)> 默认 3。
 
-    缺失/非法/越界(≤0)回落默认——与 STEP5_*_MAX_ITERS 的 resolver 同口径;
-    只能收紧到默认值,不能放大(票 16 复审决定,防配置把名额抬到 99)。
+    防护上限:env 放大值钳制回 3(票 16 复审),缺失/非法/越界(≤0)回落
+    默认并记 source="default";Host 配置层由 RunBudget 分层解析(快照记录
+    生效值与来源)经 execute_for_scope 显式下发,工具侧记 source="host_config"。
     """
     import os
     raw = (os.environ if env is None else env).get(QEMU_MAX_SESSIONS_ENV)
-    if raw is None or not str(raw).strip():
-        return DEFAULT_MAX_SESSIONS_PER_SCOPE
-    try:
-        value = int(str(raw).strip())
-    except ValueError:
-        return DEFAULT_MAX_SESSIONS_PER_SCOPE
-    if value < 1:
-        return DEFAULT_MAX_SESSIONS_PER_SCOPE
+    if raw is not None and str(raw).strip():
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            value = 0
+        if value >= 1:
+            return clamp_session_limit(value), "environment"
+    return DEFAULT_MAX_SESSIONS_PER_SCOPE, "default"
+
+
+def clamp_session_limit(value: int) -> int:
+    """会话名额防护钳制的单一出处(解析层/执行层共用;放大值一律钳回 3)。"""
     return min(value, DEFAULT_MAX_SESSIONS_PER_SCOPE)
 
 
-# ---- 会话内执行次数(票 17:显式预算参数,临时默认 4,票 19 校准定稿) ----
+# ---- 会话内执行次数(票 17 显式预算参数;票 19 据真实样本校准定稿) ----
 
+# 定稿依据(2026-09-23,target/8 opkg 两轮业务通路 ×2 干净会话、target/6
+# captcha 派生通路、target/6 NVRAM 三态,共 8 次真实执行,测量数据见
+# .scratch/qemu-user-mode-experiments/investigation/ticket19/):
+# - 已观测最大单会话执行需求 = 3(NVRAM 已知/第二键/缺失键三态);
+# - Verification 按台账重放关键序列的需求 ≤ Analysis 同会话次数;
+# - execute 相中位 0.135s、最大 0.178s,60s 默认执行预算余量 >300 倍,
+#   180s 硬上限维持;单会话最坏目标耗时 4×60s=240s,每方 ≤3 会话封顶。
+# 定稿 4 = 覆盖正常+对照+复现/异常输入 +1 次余量;对照/异常/复现逐次计数。
 DEFAULT_MAX_SESSION_EXECUTIONS = 4
 QEMU_MAX_SESSION_EXECUTIONS_ENV = "STEP5_QEMU_MAX_SESSION_EXECUTIONS"
 
@@ -171,9 +186,9 @@ def resolve_max_session_executions(
     工具侧记录 source="host_config"。env 层缺失/非法/越界(≤0)回落默认
     并记 source="default"——与 RunBudget._env_value 同口径,不带病生效。
 
-    与 resolve_max_sessions"只能收紧"的策略差异是有意的:会话名额是
+    与会话名额"只能收紧"的策略差异是有意的:会话名额是
     票 16 复审定下的防护性上限(防配置放大到 99);执行次数上限按
-    ADR-0013 是"可覆盖的显式预算参数",票 19 校准可能双向调整默认,
+    ADR-0013 是"可覆盖的显式预算参数",票 19 校准已定稿默认(见上),
     env 层覆盖不设方向限制。
     """
     import os

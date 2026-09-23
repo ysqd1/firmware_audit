@@ -32,12 +32,19 @@ from pathlib import Path
 
 from .engine.context import ContextManager
 from .host import ANALYSIS_SESSION_SYSTEM, RunDriver, RunSummary
+from .host.budget import DEFAULT_BUDGET_CONFIG
 from .host.recon import RECON_SESSION_SYSTEM
 from .host.session import AgentSession
 from .host.verification import VERIFICATION_SESSION_SYSTEM
 from .providers.llm_client import LLMClient, LLMError
 from .providers.tools import make_tools
 from .providers.tools.base import ToolContext
+
+# 案例 profile(票 19 AC3):工作区可选的版本化预算 profile,四层解析的
+# profile 层载体。QEMU 预算块(每方最多 3 会话、会话内执行次数)随既有
+# 分层解析生效,config.json 快照如实记录生效值与来源(source=profile)。
+# 模板见 firmware_audit/profiles/step5-budget-profile.example.json。
+BUDGET_PROFILE_BASENAME = "step5_budget_profile.json"
 
 # 角色 → (系统提示词, transcript 所在权威树)。目录形状与各 runner 的
 # Investigation/Verification 布局同构:recon → investigations/recon/;
@@ -124,6 +131,31 @@ def _print_summary(summary: RunSummary, report: Path) -> None:
     print("\n".join(lines))
 
 
+def _load_budget_profile(process_dir: Path) -> dict | None:
+    """读取工作区案例预算 profile(缺文件 = 不启用 profile 层)。
+
+    只做结构与键名校验(未知键显式失败,不静默忽略);数值合法性由
+    分层解析(显式 > env > profile > 默认)统一把关,非法值在建世代前
+    以 ConfigError 失败。
+    """
+    path = process_dir / BUDGET_PROFILE_BASENAME
+    if not path.is_file():
+        return None
+    import json
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError(f"案例预算 profile 不是合法 JSON: {path} ({exc})") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"案例预算 profile 必须是非空 JSON 对象: {path}")
+    unknown = sorted(set(payload) - set(DEFAULT_BUDGET_CONFIG))
+    if unknown:
+        known = ", ".join(sorted(DEFAULT_BUDGET_CONFIG))
+        raise ValueError(
+            f"案例预算 profile 含未知键: {', '.join(unknown)};可用键: {known}")
+    return payload
+
+
 def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
     """跑完整 Step5(Host 控制生命周期)。返回摘要 dict(mode/generation/
     status/stop_reason/report/findings/candidates);判读细节以世代目录内
@@ -148,6 +180,7 @@ def step5_run(target_dir: Path, force: bool = False, llm=None) -> dict:
         session_factory=_session_factory(base),
         llm=base,
         process_dir=process_dir,
+        profile=_load_budget_profile(process_dir),
     )
     summary = driver.run(force=force)
     report = summary.gen_dir / "report.md"  # 报告路径单一出处(host/reporting 布局)

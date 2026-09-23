@@ -20,6 +20,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from ..providers.tools.qemu_base import (
+    DEFAULT_MAX_SESSIONS_PER_SCOPE,
+    clamp_session_limit,
+)
+
 from .store import StoreError, atomic_json
 
 BUDGET_SCHEMA_VERSION = 1
@@ -28,10 +33,18 @@ CONFIG_SCHEMA_VERSION = 1
 # 会话内执行次数上限的配置键(票 17):DEFAULT_BUDGET_CONFIG / ENV_KEYS /
 # 消费点(host.tooling 下发给 qemu_execute)共用同一出处。
 QEMU_MAX_SESSION_EXECUTIONS_KEY = "qemu_max_session_executions"
+# 每方(Investigation/Verification Case)会话名额的配置键(票 19 AC3):
+# 与 qemu_base 的 env 旋钮同名(STEP5_QEMU_MAX_SESSIONS),防护上限 3 只能
+# 维持或收紧,放大值在解析期钳制,快照记录的生效值与执行侧一致。
+QEMU_MAX_SESSIONS_KEY = "qemu_max_sessions"
 
 # 初始单案例上限(ADR-0012 L71:实现与前三例试运行的初始值,不是成绩)。
-# qemu_max_session_executions(票 17):单会话执行次数上限,临时默认 4,
-# 最终默认由票 19 真实样本校准定稿;生效值与来源随 config.json 快照冻结。
+# qemu_max_session_executions(票 19 定稿):单会话执行次数上限。真实样本
+# 校准(2026-09-23,target/8 opkg 两轮 ×2 干净会话、target/6 captcha 派生、
+# target/6 NVRAM 三态,8 次执行:execute 中位 0.135s/最大 0.178s,会话开启
+# ~0.34s/封存 ~0.17s)支持定稿 4——覆盖已观测最大会话需求(3)+1 次余量,
+# 对照/异常/复现逐次计数;60s 默认执行预算对真实负载有 >300 倍余量,
+# 180s 硬上限维持不变。生效值与来源随 config.json 快照冻结。
 DEFAULT_BUDGET_CONFIG: dict[str, float] = {
     "recon_max_rounds": 30,
     "analysis_max_rounds": 30,
@@ -41,6 +54,7 @@ DEFAULT_BUDGET_CONFIG: dict[str, float] = {
     "max_active_seconds": 7200.0,
     "max_candidates": 8,
     QEMU_MAX_SESSION_EXECUTIONS_KEY: 4,
+    QEMU_MAX_SESSIONS_KEY: 3,
 }
 
 # 本机环境覆盖层的键名单一出处;角色轮次旋钮沿用各 runner 既同名变量
@@ -55,12 +69,13 @@ ENV_KEYS: dict[str, str] = {
     "max_active_seconds": "STEP5_MAX_ACTIVE_SECONDS",
     "max_candidates": "STEP5_CANDIDATE_SLOTS",
     QEMU_MAX_SESSION_EXECUTIONS_KEY: "STEP5_QEMU_MAX_SESSION_EXECUTIONS",
+    QEMU_MAX_SESSIONS_KEY: "STEP5_QEMU_MAX_SESSIONS",
 }
 
 _INT_KEYS = frozenset({
     "recon_max_rounds", "analysis_max_rounds", "verification_max_rounds",
     "max_llm_calls", "max_tool_attempts", "max_candidates",
-    QEMU_MAX_SESSION_EXECUTIONS_KEY,
+    QEMU_MAX_SESSION_EXECUTIONS_KEY, QEMU_MAX_SESSIONS_KEY,
 })
 
 
@@ -132,6 +147,12 @@ def resolve_effective_config(
             continue
         resolved[key] = default
         sources[key] = "default"
+    # 会话名额是防护性上限(票 16 复审:防配置放大到 99):任何配置层都
+    # 只能维持或收紧默认 3;放大值在解析期钳制(clamp_session_limit 单一
+    # 出处),保证快照记录的生效值与执行侧实际执行一致,不留账实差。
+    sessions = resolved.get(QEMU_MAX_SESSIONS_KEY)
+    if isinstance(sessions, int) and sessions > DEFAULT_MAX_SESSIONS_PER_SCOPE:
+        resolved[QEMU_MAX_SESSIONS_KEY] = clamp_session_limit(sessions)
     return {"resolved": resolved, "sources": sources}
 
 

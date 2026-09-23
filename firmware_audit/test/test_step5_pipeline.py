@@ -17,6 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from firmware_audit.step5_agent.engine.context import ContextManager, est_tokens
@@ -235,6 +237,68 @@ def test_host_public_entry_end_to_end(capsys) -> list[str]:
         if "预检" in captured.err or "cve_cache" in captured.err:
             fails.append(f"Host 启动不得输出 CVE 缓存预检: {captured.err[:200]}")
     return fails
+
+
+def test_budget_profile_loader_validation(tmp_path: Path) -> None:
+    """票 19 AC3:案例预算 profile 载入——缺文件不启用;未知键/坏 JSON/
+    空对象显式失败(数值合法性由分层解析把关)。"""
+    from firmware_audit.step5_agent.run_step5 import _load_budget_profile
+    assert _load_budget_profile(tmp_path) is None
+    (tmp_path / "step5_budget_profile.json").write_text(
+        json.dumps({"qemu_max_sessions": 3, "qemu_max_session_executions": 4}),
+        encoding="utf-8")
+    assert _load_budget_profile(tmp_path) == {
+        "qemu_max_sessions": 3, "qemu_max_session_executions": 4}
+    (tmp_path / "step5_budget_profile.json").write_text(
+        '{"no_such_budget_key": 1}', encoding="utf-8")
+    with pytest.raises(ValueError, match="未知键"):
+        _load_budget_profile(tmp_path)
+    (tmp_path / "step5_budget_profile.json").write_text("{oops", encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON"):
+        _load_budget_profile(tmp_path)
+    (tmp_path / "step5_budget_profile.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="非空"):
+        _load_budget_profile(tmp_path)
+
+
+def test_budget_profile_flows_into_config_snapshot() -> None:
+    """票 19 AC3:工作区案例 profile 含 QEMU 预算块(每方最多 3 会话、
+    会话内执行次数)→ 分层解析生效,config.json 快照记录 source=profile;
+    env 层仍优先于 profile。"""
+    with tempfile.TemporaryDirectory() as td:
+        target = _make_workspace(Path(td))
+        (target / "process" / "step5_budget_profile.json").write_text(
+            json.dumps({"qemu_max_sessions": 3,
+                        "qemu_max_session_executions": 6,
+                        "max_llm_calls": 999}),
+            encoding="utf-8")
+        summary = step5_run(target, llm=ScriptedLLM(full_chain_script()))
+        gen_dir = Path(summary["gen_dir"])
+        config = json.loads((gen_dir / "config.json").read_text(encoding="utf-8"))
+        assert config["resolved"]["qemu_max_sessions"] == 3
+        assert config["sources"]["qemu_max_sessions"] == "profile"
+        assert config["resolved"]["qemu_max_session_executions"] == 6
+        assert config["sources"]["qemu_max_session_executions"] == "profile"
+        assert config["resolved"]["max_llm_calls"] == 999
+        assert config["sources"]["max_llm_calls"] == "profile"
+        # 未声明的键回落默认,来源 default(快照逐键如实)
+        assert config["resolved"]["max_tool_attempts"] == 320
+        assert config["sources"]["max_tool_attempts"] == "default"
+
+
+def test_budget_profile_invalid_value_fails_before_generation() -> None:
+    """profile 非法值(ConfigError)在世代创建前失败,不留空壳 running 世代。"""
+    from firmware_audit.step5_agent.host.budget import ConfigError
+
+    with tempfile.TemporaryDirectory() as td:
+        target = _make_workspace(Path(td))
+        (target / "process" / "step5_budget_profile.json").write_text(
+            json.dumps({"qemu_max_session_executions": "many"}),
+            encoding="utf-8")
+        with pytest.raises(ConfigError, match="profile"):
+            step5_run(target, llm=ScriptedLLM(full_chain_script()))
+        if (target / "process" / "generations").exists():
+            raise AssertionError("配置失败不得留下世代目录")
 
 
 def test_public_entry_resumes_after_service_interruption() -> list[str]:

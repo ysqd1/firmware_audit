@@ -32,7 +32,9 @@ class SandboxVerifyTool(AgentTool):
     name = "sandbox_verify"
     description = ("在隔离沙箱内执行复核脚本(仅 python/node/php)动态验证疑似漏洞:"
                    "如命令注入的 Fuzzing Harness、反序列化/代码执行 PoC 探测。"
-                   "沙箱网络隔离、extracted 只读。用于 verification 判断漏洞是否真实可利用。")
+                   "沙箱网络隔离、extracted 只读。用于 verification 判断漏洞是否真实可利用。"
+                   "脚本不能启动 QEMU 或任何原固件目标执行(沙箱镜像无 qemu),"
+                   "固件动态执行只能经 qemu_execute 的会话预算与证据台账。")
     params = {
         "code": {"type": "str", "required": True, "desc": "待执行脚本源码(≤64KB)"},
         "language": {"type": "str", "default": "python", "enum": ["python", "py", "python3",

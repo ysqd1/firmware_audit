@@ -197,6 +197,33 @@ def test_config_snapshot_prompt_versions_roundtrip(tmp_path: Path) -> None:
         load_config_snapshot(tmp_path)
 
 
+def test_qemu_session_knob_layers_clamped_and_truthful() -> None:
+    """票 19 AC3:会话名额进分层配置(显式>env>profile>默认);防护上限 3
+    不可被任何层放大(票 16 复审纪律),解析期钳制,快照记录生效值与来源。"""
+    key = "qemu_max_sessions"
+    document = resolve_effective_config(
+        explicit={key: 2}, env={ENV_KEYS[key]: "1"}, profile={key: 3})
+    assert document["resolved"][key] == 2
+    assert document["sources"][key] == "explicit"
+
+    document = resolve_effective_config(
+        env={ENV_KEYS[key]: "1"}, profile={key: 3})
+    assert document["resolved"][key] == 1
+    assert document["sources"][key] == "environment"
+
+    document = resolve_effective_config(profile={key: 3})
+    assert document["resolved"][key] == 3
+    assert document["sources"][key] == "profile"
+
+    document = resolve_effective_config(explicit={key: 99})
+    assert document["resolved"][key] == 3
+    document = resolve_effective_config(env={ENV_KEYS[key]: "7"})
+    assert document["resolved"][key] == 3
+    document = resolve_effective_config(env={ENV_KEYS[key]: "x"})
+    assert document["resolved"][key] == 3
+    assert document["sources"][key] == "default"
+
+
 def test_env_keys_stay_coherent_with_role_resolvers(monkeypatch) -> None:
     """键名单一纪律:配置链与各角色 resolver 读同名环境变量,不漂移。"""
     from firmware_audit.step5_agent.host.candidates import resolve_processing_slots

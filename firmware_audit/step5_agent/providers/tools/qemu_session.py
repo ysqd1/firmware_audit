@@ -8,11 +8,13 @@
   运行目录内前序执行写入的文件后继可读;执行之间无目标进程存活(逐执行
   清理验证),prooted 装载桩/后端残留不作为运行状态保留。
 - stop=true:停机封存;带 session_id 且不带 file_ref 时为仅停机不执行。
-- 会话内执行次数上限为显式预算参数(临时默认 4,最终由票 19 校准):
-  Host 配置层(config.json 快照)> env(STEP5_QEMU_MAX_SESSION_EXECUTIONS)>
-  默认,生效值与来源记入台账;超限拒绝,对照/异常/复现逐次计数。
-- 会话名额归属不变:每 (角色, investigation_ref) 独立最多 N 个会话(默认
-  3,STEP5_QEMU_MAX_SESSIONS 覆盖);预检不占名额;失败不自动原样重试。
+- 会话内执行次数上限为显式预算参数(票 19 定稿默认 4,依据真实样本校准,
+  见 qemu_base):Host 配置层(config.json 快照)> env(
+  STEP5_QEMU_MAX_SESSION_EXECUTIONS)> 默认,生效值与来源记入台账;
+  超限拒绝,对照/异常/复现逐次计数。
+- 会话名额归属不变:每 (角色, investigation_ref) 独立最多 N 个会话(防护
+  上限默认 3,只可收紧;STEP5_QEMU_MAX_SESSIONS 覆盖,票 19 起随分层配置
+  走 Host 注入);预检不占名额;失败不自动原样重试。
 - 调查终态(正常完成/预算耗尽/中断)由 Host 强制停机封存全部开启会话,
   Host 死亡后的恢复路径强制收割遗留容器(见 qemu_recovery)。中断即会话
   死亡:恢复不复活会话,运行产物仅留档,续跑开启新会话且已持久化执行
@@ -60,9 +62,10 @@ from .qemu_base import (
     QEMU_ARCH_MATRIX,
     QemuArchProfile,
     QemuResultClass,
+    clamp_session_limit,
     qemu_exec_v2_label_mismatches,
     resolve_max_session_executions,
-    resolve_max_sessions,
+    resolve_max_sessions_with_source,
     timestamp,
 )
 from .qemu_precheck import ElfParseError, find_in_root, parse_elf_runtime
@@ -301,16 +304,24 @@ class QemuExecuteTool(AgentTool):
     }
 
     def execute_for_scope(self, arguments: dict, *, investigation_ref: str,
-                          remaining_seconds, max_executions: int | None = None) -> ToolResult:
-        """Host 绑定实际调查/案卷、动态剩余预算与会话内执行上限;模型不能
-        通过改名获得名额或放大预算。"""
+                          remaining_seconds, max_executions: int | None = None,
+                          max_sessions: int | None = None,
+                          role: str | None = None) -> ToolResult:
+        """Host 绑定实际调查/案卷、动态剩余预算、会话/执行上限与调用角色;
+        模型不能通过改名获得名额或放大预算。role 由 Host runner 盖章
+        (analysis/verification),空值回落工具实例角色(独立演示)。"""
         self._remaining_seconds = remaining_seconds
         self._max_executions = max_executions
+        self._max_sessions = max_sessions
+        if role:
+            self._scope_role = role
         try:
             return self.execute(**{**arguments, "investigation_ref": investigation_ref})
         finally:
             self._remaining_seconds = None
             self._max_executions = None
+            self._max_sessions = None
+            self._scope_role = None
 
     def _effective_timeout(self, requested: int) -> int:
         seconds = max(1, min(int(requested), 180))
@@ -320,11 +331,18 @@ class QemuExecuteTool(AgentTool):
         return seconds
 
     def _execution_limit(self) -> tuple[int, str]:
-        """会话内执行次数上限及来源:Host 配置层 > env > 默认(票 17)。"""
+        """会话内执行次数上限及来源:Host 配置层 > env > 默认(票 17/19)。"""
         host_value = getattr(self, "_max_executions", None)
         if type(host_value) is int and host_value >= 1:
             return host_value, "host_config"
         return resolve_max_session_executions()
+
+    def _session_limit(self) -> tuple[int, str]:
+        """会话名额上限及来源:Host 配置层(解析层已钳制 ≤3)> env > 默认。"""
+        host_value = getattr(self, "_max_sessions", None)
+        if type(host_value) is int and host_value >= 1:
+            return clamp_session_limit(host_value), "host_config"
+        return resolve_max_sessions_with_source()
 
     # ---- 工具路径解析 ----
 
@@ -391,7 +409,7 @@ class QemuExecuteTool(AgentTool):
              use_strace: bool = True) -> ToolResult:
         sessions_root = self._sessions_root()
         ledger = SessionLedger(sessions_root / "ledger.json")
-        role = self.role or "analysis"
+        role = (getattr(self, "_scope_role", None) or self.role or "analysis")
         session_id = (session_id or "").strip()
         wants_execution = bool((file_ref or "").strip())
         investigation_ref = (investigation_ref or "").strip()
@@ -479,9 +497,10 @@ class QemuExecuteTool(AgentTool):
             entry = existing
             session_dir = sessions_root / session_id
         else:
-            limit = resolve_max_sessions()
+            limit, limit_source = self._session_limit()
             used = ledger.count(role, investigation_ref)
             report["session_budget"] = {"used": used, "limit": limit,
+                                        "source": limit_source,
                                         "env_knob": "STEP5_QEMU_MAX_SESSIONS"}
             if used >= limit:
                 ledger.add("refusals", {
@@ -497,11 +516,13 @@ class QemuExecuteTool(AgentTool):
             entry = None  # 稍后在设施核查通过后开启
 
         try:
+            prep_started = time.monotonic()
             prepared = self._prepare_execution(
                 root=root, file_ref=file_ref, args=args, argv0=argv0, env=env,
                 cwd=cwd, input_ref=input_ref, stdin_ref=stdin_ref,
                 timeout_seconds=timeout_seconds,
                 use_strace=use_strace)
+            prep_seconds = round(time.monotonic() - prep_started, 3)
         except _PrepError as exc:
             return refuse(str(exc), exc.kind)
         declared, target, input_mount, elf, stdin_bytes = prepared
@@ -538,6 +559,7 @@ class QemuExecuteTool(AgentTool):
                              or entry["container"]["name"])
         else:
             # ---- 4) 开启会话:设施核查 → 干净容器 → 占位记账先于创建 ----
+            open_started = time.monotonic()
             facility = self._facility(declared["qemu_binary"])
             report["backend"] = facility
             if not facility.get("available"):
@@ -559,6 +581,7 @@ class QemuExecuteTool(AgentTool):
                                   "path": str(root.resolve())},
                 "backend": facility,
                 "container": {"name": container_name},
+                "session_budget": {"limit": limit, "source": limit_source},
                 "execution_budget": {"limit": exec_limit_value,
                                      "source": exec_limit_source, "used": 0},
                 "executions": [],
@@ -599,13 +622,16 @@ class QemuExecuteTool(AgentTool):
                                "container_removal": entry.get("cleanup")})
                 return finish()
             container_ref = entry["container"]["id"]
+            entry["open_seconds"] = round(time.monotonic() - open_started, 3)
+            ledger.replace(entry["session_id"], entry)
 
         # ---- 5) 执行一次(逐执行:观察者/PRoot/清理验证/台账追加) ----
         exec_entry = self._execute_once(entry, ledger, session_dir,
                                         container=container_ref,
                                         declared=declared, input_mount=input_mount,
                                         root=root, target=target, elf=elf,
-                                        stdin_bytes=stdin_bytes)
+                                        stdin_bytes=stdin_bytes,
+                                        prepare_seconds=prep_seconds)
         if exec_entry is None:
             # 预算在启动前耗尽:目标未运行。本次新开的单发会话立即封存
             # (不留一个从未执行的活动会话);复用会话保持 running,交由
@@ -635,6 +661,7 @@ class QemuExecuteTool(AgentTool):
                        "result_class_label": exec_entry.get("result_class_label"),
                        "result_note": exec_entry.get("result_note"),
                        "execution": exec_entry.get("execution"),
+                       "phase_seconds": exec_entry.get("phase_seconds"),
                        "cleanup": exec_entry.get("cleanup"),
                        "chain": exec_entry.get("chain"),
                        "adaptation": entry.get("adaptation") or {},
@@ -883,7 +910,8 @@ class QemuExecuteTool(AgentTool):
     def _execute_once(self, entry: dict, ledger: SessionLedger,
                       session_dir: Path, *, container: str, declared: dict,
                       input_mount: tuple | None, root: Path, target: Path,
-                      elf: dict, stdin_bytes: bytes | None = None) -> dict | None:
+                      elf: dict, stdin_bytes: bytes | None = None,
+                      prepare_seconds: float = 0.0) -> dict | None:
         """会话内一次声明执行;执行事实先持久化,观测缺口如实补记。
 
         返回执行条目;返回 None = 未启动目标(案例剩余预算不足)。
@@ -962,14 +990,20 @@ class QemuExecuteTool(AgentTool):
 
         # 观测段:输出落盘、清理验证、链身份快照;异常记缺口不崩溃。
         observation_error: str | None = None
+        cleanup_seconds = 0.0
+        chain_seconds = 0.0
         try:
             (session_dir / f"exec-{seq:03d}-stdout.txt").write_text(
                 out or "", encoding="utf-8", errors="replace")
             (session_dir / f"exec-{seq:03d}-stderr.txt").write_text(
                 err or "", encoding="utf-8", errors="replace")
+            reap_started = time.monotonic()
             exec_entry["cleanup"] = self._reap_and_verify(container)
+            cleanup_seconds = round(time.monotonic() - reap_started, 3)
+            chain_started = time.monotonic()
             self._attach_chain_snapshot(exec_entry, container, session_dir,
                                         snapshot_guest)
+            chain_seconds = round(time.monotonic() - chain_started, 3)
         except Exception as exc:
             observation_error = f"{type(exc).__name__}: {exc}"
             exec_entry["observation_error"] = observation_error
@@ -979,6 +1013,15 @@ class QemuExecuteTool(AgentTool):
                                    "stub_identity_note": "观测异常,快照未读取",
                                    "snapshot_note": "观测异常,缺项明示"}
 
+        # 票 19 预算校准 substrate:分相耗时(准备=声明输入固化,执行=docker
+        # exec 全程,清理验证=残留扫描/击杀,链观测=快照读回);观测异常时记
+        # 截止异常点的实测值,分布与缺口同账可查。
+        exec_entry["phase_seconds"] = {
+            "prepare": prepare_seconds,
+            "execute": elapsed,
+            "cleanup_verify": cleanup_seconds,
+            "chain_snapshot": chain_seconds,
+        }
         if rc == 124 and elapsed >= (timeout_clamped + _KILL_GRACE_SECONDS
                                      + _DOCKER_OVERHEAD_SECONDS - 1):
             exec_entry.update(result_class=QemuResultClass.FACILITY_FAILURE.value,
@@ -1046,6 +1089,7 @@ class QemuExecuteTool(AgentTool):
 
     def _seal_session(self, ledger: SessionLedger, entry: dict, *, kind: str) -> None:
         """停机封存单个会话:容器权威拆除 → 台账终态(失败如实留 seal_failed)。"""
+        seal_started = time.monotonic()
         name = (entry.get("container") or {}).get("name") or ""
         verdict, detail = remove_session_container(name) if name else ("absent", None)
         entry["cleanup"] = {"verdict": verdict, "detail": detail}
@@ -1053,6 +1097,7 @@ class QemuExecuteTool(AgentTool):
         entry["status"] = "sealed" if entry["sealed"] else "seal_failed"
         entry["seal_kind"] = kind
         entry["sealed_at"] = timestamp()
+        entry["seal_seconds"] = round(time.monotonic() - seal_started, 3)
         ledger.replace(entry["session_id"], entry)
 
     # ---- 清理验证与分类(执行侧) ----
@@ -1208,6 +1253,12 @@ def _render_text(report: dict) -> str:
                      f"耗时 {execution.get('elapsed_seconds')}s;"
                      f"声明输入、输出 digest 与结果已按序追加进会话台账(第 "
                      f"{execution.get('seq')} 次执行)")
+    phases = report.get("phase_seconds") or {}
+    if phases:
+        lines.append(f"- 分相耗时: 准备 {phases.get('prepare')}s / "
+                     f"执行 {phases.get('execute')}s / "
+                     f"清理验证 {phases.get('cleanup_verify')}s / "
+                     f"链观测 {phases.get('chain_snapshot')}s")
     chain = report.get("chain") or {}
     if chain:
         lines.append(f"- 链观测: 快照 {len(chain.get('snapshot') or [])} 条;"

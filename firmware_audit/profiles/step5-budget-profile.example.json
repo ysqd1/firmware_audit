@@ -1,0 +1,4 @@
+{
+  "qemu_max_sessions": 3,
+  "qemu_max_session_executions": 4
+}
