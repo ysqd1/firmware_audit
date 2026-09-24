@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from .base import AgentTool, ToolContext, ToolResult
+from .base import AgentTool, ToolContext, ToolResult, render_params_doc
 from .binwalk_rescan import BinwalkRescanTool
 from .checksec import ChecksecTool
 from .cve_bin_tool_scan import CveBinToolScanTool
@@ -109,6 +109,12 @@ def tool_contracts() -> dict[str, ToolContract]:
     return dict(_CONTRACT_BY_NAME)
 
 
+def _require_role(role: str) -> None:
+    """统一未知角色错误文案;授权与契约渲染共用,避免借异常成语分叉。"""
+    if role not in BLIND_DISCOVERY_ROLES:
+        tool_names_for_role(role)  # 未知角色在此抛 ToolAuthorizationError
+
+
 def tool_names_for_role(role: str) -> tuple[str, ...]:
     """返回角色在 Blind Discovery 中可见的工具名，保持注册顺序。"""
     if role not in BLIND_DISCOVERY_ROLES:
@@ -119,8 +125,7 @@ def tool_names_for_role(role: str) -> tuple[str, ...]:
 
 def authorize_tool(role: str, tool_name: str) -> ToolContract:
     """校验角色的单次工具 Action，并返回其重放契约。"""
-    if role not in BLIND_DISCOVERY_ROLES:
-        tool_names_for_role(role)  # 统一未知角色错误文案
+    _require_role(role)
     contract = _CONTRACT_BY_NAME.get(tool_name)
     available = ", ".join(tool_names_for_role(role))
     if contract is None:
@@ -134,6 +139,42 @@ def authorize_tool(role: str, tool_name: str) -> ToolContract:
             f"可用工具: {available}。请改用已授权工具或提交当前调查建议"
         )
     return contract
+
+
+def role_tool_contract(role: str) -> str:
+    """渲染该角色已授权工具的参数契约(ADR-0004 声明侧 A 送达,票 27)。
+
+    与 make_tools/authorize_tool 共用同一注册表(单一来源):名称、用途与
+    参数规格(必填/类型/默认/枚举/说明)全部取自工具类声明,不手工维护
+    参数表,且与 validate_params 的执行侧校验同源。三角色系统提示词在
+    导入期拼入本节,提示版本指纹(driver.prompt_version_document)因此
+    覆盖参数契约;未授权工具不出现在对应角色的契约中。
+
+    边界:STEP5_EXCLUDE_TOOLS 的运行时排除(骨架不变的运营旋钮)不在本
+    渲染感知范围内——被排除工具仍出现在契约中,调用在 Host 工具分发处
+    查空拒绝(ProposalRejectedError "已授权但未由 Host 配置",计入协议
+    失败计数);排除感知需把排除集纳入提示指纹语义,另行决策,不在票 27。
+    """
+    _require_role(role)
+    blocks: list[str] = []
+    for contract in _TOOL_CONTRACTS:
+        if role not in contract.roles:
+            continue
+        tool_type = contract.tool_type
+        params_doc = render_params_doc(tool_type.params)
+        params_block = params_doc if params_doc else "  (无参数)"
+        blocks.append(
+            f"#### {tool_type.name}\n"
+            f"用途:{tool_type.description}\n"
+            f"参数声明(首行为 JSON 骨架,其后每行一个参数;声明未列出的参数名\n"
+            f"会被整份拒绝,整份调用不执行):\n{params_block}"
+        )
+    header = (
+        "### 可用工具参数契约(由工具注册表生成,与执行校验同一份声明)\n"
+        "只可调用本节列出的已授权工具;参数按各工具的参数声明填写,声明未列出的\n"
+        "参数名会被整份拒绝(整份调用不执行,不产生 Observation 或状态变化)。"
+    )
+    return header + "\n\n" + "\n\n".join(blocks)
 
 
 def make_tools(
@@ -175,6 +216,7 @@ def make_tools(
 __all__ = ["AgentTool", "ToolContext", "ToolResult", "make_tools",
            "ReplayPolicy", "ToolContract", "ToolAuthorizationError",
            "tool_contracts", "tool_names_for_role", "authorize_tool",
+           "role_tool_contract",
            "FindDecompiledFunctionTool", "ImportsQueryTool", "StringsQueryTool",
            "ReadFileTool", "ListFilesTool", "SearchCodeTool", "ChecksecTool",
            "R2ListFunctionsTool", "R2DisassembleFunctionTool", "R2XrefQueryTool",

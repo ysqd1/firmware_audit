@@ -6,7 +6,7 @@
 
 覆盖:
   - 每个工具:未知参数 / 类型错误 / 缺失必选 → ok=False + 可自纠错误文本
-  - read_file 收到 recursive → "未知参数 recursive,已忽略;合法参数:path/offset/limit"
+  - read_file 收到 recursive → "未知参数 recursive;整份调用已拒绝且未执行,…"
   - params_doc 与校验共享同一份 params 声明(单一来源,ADR-0004 A 侧)
 """
 from __future__ import annotations
@@ -225,12 +225,18 @@ def test_every_tool_rejects_invalid_params() -> list[str]:
 
 
 def test_read_file_recursive_graceful() -> list[str]:
-    """read_file 收到 recursive → '未知参数 recursive,已忽略;合法参数:path/offset/limit'。"""
+    """read_file 收到 recursive → '未知参数 recursive;整份调用已拒绝且未执行,…'。
+
+    票 27:反馈必须声明整份调用未执行,'已忽略'措辞会造成部分生效误解。
+    """
     fails: list[str] = []
     r = _tools()["read_file"].execute(path="x", recursive=True)
-    expected = "未知参数 recursive,已忽略;合法参数:path/offset/limit"
+    expected = ("未知参数 recursive;整份调用已拒绝且未执行,"
+                "不产生任何 Observation 或状态变化。合法参数:path/offset/limit")
     if r.ok or expected not in (r.error or ""):
         fails.append(f"recursive 应优雅拦截: ok={r.ok} err={r.error}")
+    if "已忽略" in (r.error or ""):
+        fails.append(f"反馈不得再使用'已忽略'措辞: {r.error}")
     if (r.error or "").startswith(("TypeError", "AttributeError")):
         fails.append(f"不得暴露 Python 异常: {r.error}")
     return fails

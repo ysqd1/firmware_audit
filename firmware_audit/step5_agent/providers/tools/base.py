@@ -101,7 +101,8 @@ def validate_params(spec: dict, kwargs: dict) -> tuple[dict | None, str | None]:
     legal = set(spec)
     unknown = [k for k in kwargs if k not in legal]  # 按调用方传入顺序列出
     if unknown:
-        return None, f"未知参数 {', '.join(unknown)},已忽略;合法参数:{'/'.join(spec)}"
+        return None, (f"未知参数 {', '.join(unknown)};整份调用已拒绝且未执行,"
+                      f"不产生任何 Observation 或状态变化。合法参数:{'/'.join(spec)}")
 
     checked: dict[str, object] = {}
     for name, decl in spec.items():

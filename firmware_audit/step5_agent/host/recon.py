@@ -25,7 +25,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ...file_rules import is_search_excluded
-from ..providers.tools import ToolAuthorizationError, authorize_tool, tool_names_for_role
+from ..providers.tools import (
+    ToolAuthorizationError, authorize_tool, tool_names_for_role,
+    role_tool_contract,
+)
 from ..providers.tools.base import MAX_TEXT_CHARS, validate_params
 from .budget import RunBudget
 from .candidates import (
@@ -946,7 +949,7 @@ class HostReconRunner:
         return store_path
 
 
-RECON_SESSION_SYSTEM = """## 1 角色与使命
+_RECON_SESSION_SYSTEM = """## 1 角色与使命
 你是固件安全审计的侦查 Agent(recon)。使命:对解包树做一次广度攻击面调查,
 产出 Candidate proposals、已检查范围与 coverage gaps,为逐条深度调查圈定
 入口。只铺面、不深挖、不判级——判级与证据链是下游 analysis 的职责。
@@ -971,6 +974,8 @@ Host 会在首轮消息注入确定性现场概览(顶层目录×文件数×大�
   信号;禁止把它们与公开已知问题做版本映射推断(如按版本区间认定存在
   公开漏洞),也不得当作缺陷成立的证据。信号只负责如实列出,是否成立由
   analysis 取证、verification 独立复核决定。
+
+{{TOOL_CONTRACT}}
 
 ## 4 complete_survey 规范
 完成时提交 complete_survey,内容全部放在 state_delta,四段缺一不可:
@@ -1004,3 +1009,9 @@ Host 会在首轮消息注入确定性现场概览(顶层目录×文件数×大�
 - 目录里没有的东西不要写;版本、行号、组件名只在工具返回中出现时才引用。
 - coverage Candidate 不得写成问题结论;signal Candidate 不得判级或下结论。
 - 同一文件最多 1-2 轮工具调用;可疑点只负责"列出来",深挖留给 analysis。"""
+
+# 提示正文含 JSON 花括号,不能用 str.format;用占位符替换嵌入共享契约。
+# 工具参数契约由注册表生成(票 27,ADR-0004 声明侧 A 送达),与执行校验
+# 同源;拼入常量即被 prompt_version_document 指纹覆盖。
+RECON_SESSION_SYSTEM = _RECON_SESSION_SYSTEM.replace(
+    "{{TOOL_CONTRACT}}", role_tool_contract("recon"))

@@ -25,7 +25,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
+from ..providers.tools import (
+    ReplayPolicy, ToolAuthorizationError, authorize_tool, role_tool_contract,
+)
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
 from .budget import RunBudget
 from .candidates import (
@@ -1432,6 +1434,8 @@ Reference 只用于重新定位原始材料,不能作为你的支持证据。最
 - 只有这些本次 Evidence 能支撑 Claim Result;引用其他 ID 会被整份拒绝。
 - 单个工具失败是正常 Observation;判 unresolved 要写明限制,不要编造结果。
 
+{{TOOL_CONTRACT}}
+
 ## 3 Claim Result 协议
 随动作或 complete_verification 在 state_delta.claim_results 提交,逐项:
 {"judgment": "supported|refuted|not_applicable|unresolved",
@@ -1460,5 +1464,8 @@ Reference 只用于重新定位原始材料,不能作为你的支持证据。最
 Claim Result,不要开新 Candidate。"""
 
 # 提示正文含 JSON 花括号,不能用 str.format;用占位符替换嵌入共享契约。
+# 工具参数契约由注册表生成(票 27,ADR-0004 声明侧 A 送达),与执行校验
+# 同源;拼入常量即被 prompt_version_document 指纹覆盖。
 VERIFICATION_SESSION_SYSTEM = _VERIFICATION_SESSION_SYSTEM.replace(
-    "{{RELATED_CANDIDATE_CONTRACT}}", RELATED_CANDIDATE_CONTRACT)
+    "{{RELATED_CANDIDATE_CONTRACT}}", RELATED_CANDIDATE_CONTRACT
+).replace("{{TOOL_CONTRACT}}", role_tool_contract("verification"))

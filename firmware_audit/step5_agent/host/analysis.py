@@ -29,7 +29,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..providers.tools import ReplayPolicy, ToolAuthorizationError, authorize_tool
+from ..providers.tools import (
+    ReplayPolicy, ToolAuthorizationError, authorize_tool, role_tool_contract,
+)
 from ..providers.tools.base import MAX_TEXT_CHARS, ToolResult, validate_params
 from .budget import RunBudget
 from .candidates import (
@@ -940,6 +942,8 @@ _ANALYSIS_SESSION_SYSTEM = """## 1 角色与使命
   (Observation View 中的 ev-xxxxxx)。
 - 单个工具失败是正常 Observation,换路取证,不要编造结果。
 
+{{TOOL_CONTRACT}}
+
 ## 3 state_delta 结构化状态
 随每个动作提交增量(只写变化,不重发全量)。可选字段只在本轮有变化时出现;
 未变化的字段整体省略,空数组占位(如 gaps_opened: []、gaps_resolved: []、
@@ -982,6 +986,9 @@ path_nodes: [])会被整份拒绝。
   每个动作尽量推进实质调查。"""
 
 # 提示正文含 JSON 花括号,不能用 str.format;占位符替换嵌入共享契约。
+# 工具参数契约由注册表生成(票 27,ADR-0004 声明侧 A 送达),与执行校验
+# 同源;拼入常量即被 prompt_version_document 指纹覆盖。
 ANALYSIS_SESSION_SYSTEM = _ANALYSIS_SESSION_SYSTEM.replace(
-    "{{RELATED_CANDIDATE_CONTRACT}}", ANALYSIS_RELATED_CANDIDATE_CONTRACT)
+    "{{RELATED_CANDIDATE_CONTRACT}}", ANALYSIS_RELATED_CANDIDATE_CONTRACT
+).replace("{{TOOL_CONTRACT}}", role_tool_contract("analysis"))
 
