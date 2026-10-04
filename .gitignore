@@ -33,7 +33,13 @@ e2e_*.log
 firmware_audit/docker/binwalk/binwalk/
 firmware_audit/docker/ghidra/ghidra*.zip.scratch/
 
-.scratch/
+.scratch/**
+!.scratch/**/
+!.scratch/**/*.md
+!.scratch/audit-workbench-prototype/*.html
+!.scratch/audit-workbench-prototype/*.css
+!.scratch/audit-workbench-prototype/*.js
+.scratch/**/investigation/
 firmware_audit/docker/ghidra/ghidra_11.3.2_PUBLIC.zip
 
 # ---- 本地会话/工具状态 ----
@@ -44,3 +50,18 @@ firmware_audit/docker/qemu-exec/deb-cache/
 firmware_audit/docker/qemu-exec-v2/src-cache/
 # Ticket 16: pinned PRoot source is a build input, not a disposable archive cache.
 !firmware_audit/docker/qemu-exec-v2/proot-5.4.0.tar.gz
+
+# Local firmware datasets, downloaded references, and generated caches
+/dataset/
+/可参考的开源项目/
+/benchmark/cases/*/firmware/
+.mypy_cache/
+.ruff_cache/
+*.log
+*.swp
+
+# Benchmark answer material stays local
+/benchmark/ground_truth/
+/benchmark/reference/
+/benchmark/reviews/
+/docs/benchmark-case-selection-2026-09-20.md

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>审计工作台 · 交互原型</title>
+  <!-- THROWAWAY PROTOTYPE: selected A direction only. Simulated data only. -->
+  <link rel="stylesheet" href="prototype.css">
+</head>
+<body>
+<main id="app"></main>
+<div class="drawer-back" id="drawerBack"><aside class="drawer" role="dialog" aria-modal="true" aria-label="记录详情" id="drawer"></aside></div>
+<div class="prototype-mark">原型 · 模拟数据</div>
+<script src="prototype-a.js"></script>
+<script>
+  const candidates=[
+    {id:'cand-0001',title:'管理接口参数进入命令执行路径',file:'extracted/www/cgi-bin/admin.cgi',kind:'信号候选',status:'调查中',pill:'run',evidence:12,action:'r2_xref_query · 追踪调用点'},
+    {id:'cand-0002',title:'内嵌 TLS 私钥的使用范围',file:'extracted/etc/certs/server.key',kind:'信号候选',status:'已确认',pill:'confirm',evidence:8,action:'独立复核完成'},
+    {id:'cand-0003',title:'升级包校验链完整性',file:'extracted/usr/sbin/upgrade',kind:'覆盖候选',status:'证据不足',pill:'warn',evidence:4,action:'缺少设备侧触发证据'},
+    {id:'cand-0004',title:'Web 会话认证入口',file:'extracted/www/cgi-bin/login.cgi',kind:'覆盖候选',status:'待调查',pill:'dim',evidence:2,action:'排队中'}
+  ];
+  function pill(text,cls){return `<span class="pill ${cls}">${text}</span>`}
+  function closeDrawer(){document.getElementById('drawerBack').classList.remove('open')}
+  document.getElementById('drawerBack').addEventListener('click',e=>{if(e.target.id==='drawerBack')closeDrawer()});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDrawer()});
+  function render(){document.getElementById('app').innerHTML=variantANew();document.title='审计工作台 · 交互原型'}
+  render();
+</script>
+</body>
+</html>

@@ -1,73 +1,51 @@
-# 代码规范
+# 工程规则
 
-## 铁律
+本文件是代码、工具和验收约束的单一入口；任务流程与架构导航见 [AGENTS.md](AGENTS.md)。
 
-1. **包可跑** — `python -m firmware_audit.main <target_dir>` 一行启动,不装一堆依赖
-2. **LLM 必需(Step5)** — 预处理(Step0-1)纯代码;Step5 无 API key 或 API 调用失败时**立即终止,不降级**([ADR-0002](./docs/adr/0002-step5-no-key-hard-stop.md))
-3. **同步为主** — 不用 asyncio,顺序执行,清晰优先
-4. **失败不崩** — 任何步骤失败降级兜底,继续往下跑,记录失败原因
-5. **输入目录即工作区** — `target/<N>/` 既是输入也是产出目录,固件和 process/(extracted/ analysis/) 共处
-6. **工具用 Docker** — binwalk/ghidra/r2 等走容器,宿主机只跑 Python(唯一例外:Step0 ext4 直读的 debugfs/mount 后端在宿主原生执行)
-7. **Agent 层按 ADR 推进** — LLM orchestrator 编排三 Agent(recon→analysis→verification),调度守卫与顺序门单向([ADR-0001](./docs/adr/0001-step5-orchestrator.md);编排层包化 [ADR-0009](./docs/adr/0009-step5-orchestration-package.md));requirements.md 为早期快照已过时,以 docs/adr/ 与 CONTEXT.md 为准
-8. **路径用 pathlib** — 跨平台,不用字符串拼路径
-9. **日志清晰** — 每步打印进度和统计,失败要可追溯
+访谈后的同步与精简统一执行 AGENTS.md 的 `post-grill-doc-sync` 收尾 hook；本文件保留可执行约束，设计细节通过链接按需读取。
 
-## Agent 层约定(2026-08-16 新增;最近更新 2026-09-09)
+## 实现与依赖
 
-- **工具统一 ToolResult 接口**(2026-08-17 定稿)— 三类实现:CLI 类 subprocess 调容器内 CLI(checksec/cve-bin-tool/radare2 等)、读盘类直读工作区与边车(find_decompiled_function/strings/imports/read_file;strings/imports 为边车优先 + r2 兜底的混合型,ADR-0010)、API 类 urllib(cve_lookup);另有唯一的**产物生产工具** ghidra_decompile(容器反编译并落盘边车三件套,ADR-0010);返回 `{ok, text, data, error, elapsed, raw}`,text ≤16000 字符截断(2026-09-06 票01 由 8KB 上调;基类 `max_text_chars` 可按工具覆盖,summarize 素材护栏 64000)
-- **幂等与超时** — 同参同果(cve_lookup 以缓存快照为准);每工具可配超时
-- **分析一次、多次查询** — 复用边车三件套(.c/strings/imports;ghidra_decompile 幂等缓存 + sha256 去重,ADR-0010),不重复反编译
-- **漏斗式调用** — 廉价工具先行(r2 层/读盘类毫秒级),昂贵操作按触发条件深挖;2026-09-09 起固化为两级升级调用模型(ADR-0010)
+- 保持可通过 `python -m firmware_audit.main` 启动的 Python 包；同步、串行执行为默认。优先标准库，新增运行时第三方依赖须有已确认需求依据，现有依赖见 `firmware_audit/requirements.txt`。
+- 默认不引入 Web 服务、数据库、Redis、前端、RAG/向量库、Agent 框架、事件总线或流式协议。用户已确认本机审计工作台设计，尚待 spec 与工单、未实现；正式服务需仅绑定本机、一次只运行一个 Target，并把结果写入 `result/<项目名>/`。源目录必须恰好识别一个固件；审计过程须可恢复，中断须保留现场，LLM 决策、工具参数/返回及实际 CLI argv 均须可追溯。
+- 文件路径用 `pathlib`；包内遵循现有相对导入。模块 docstring 说明职责和关键约束，名称表达行为，注释解释原因，配置集中在既有 profile/配置解析层。
+- 模块按职责划分，复用公共逻辑，避免第三份同类拷贝；抽象须服务当前调用方，不为假设需求加层。
+- Step5 依赖方向：入口 → Host → engine/providers。engine 与 providers 互不导入且不反向依赖 Host；新增顶层单元同步 [分层守护测试](firmware_audit/test/test_step5_layer_guard.py)。已退役控制流不通过兼容 shim 或双模式恢复。
 
-## 禁止
+## 失败与状态
 
-- 不引入 FastAPI / 数据库 / Redis / 前端
-- RAG / 向量库 / embedding 暂不做(留待以后,现在还早)
-- 不做事件总线 / 流式输出
-- Agent 抽象只做必要一层,不引入 agent 框架(LangChain/AutoGen 等);多 Agent 编排只用自有 orchestrator(ADR-0001/0009)
-- 不提取 P-code 喂 LLM
-- 不把反编译产物写进源目录(extracted/ 只读,产物进 analysis/)
-- 不创建不必要的类和抽象
-- 不在 target/<N>/ 之外创建任何产出文件
-- 零第三方依赖(原唯一例外 cryptography 已随 Step4 退役删除,ADR-0011,2026-09-09 落地;pyyaml 为 file_rules/profile 与 Step0 既有依赖,不算新增)
+- 工具可恢复失败返回结构化结果，说明原因及下一步；不能静默伪造成功、空数据或证据。
+- Step5 无 key 或主执行路径 LLM 调用失败时终止并保留可恢复状态，不以规则结果替代审计。既定辅助调用的降级按对应 ADR/实现契约处理，不用“失败不崩”吞掉所有异常。
+- Host 持有权威生命周期、预算及恢复记录；模型提供的角色、调查标识或预算不能越过 Host 校验。
+- 正常退出、非零退出、信号、超时、依赖阻塞、设施失败和清理不确定按工具契约区分；客户端退出或目标返回 124 本身不足以证明超时或清理完成。
 
-## 风格
+## 工具、路径与隔离
 
-- 函数短小,一个函数干一件事
-- 配置(名单、模式表、危险函数表)集中在 profile 或文件顶部
-- 报告用 Markdown,证据要含文件路径 + 行号 + 代码片段
-- Jython 脚本(ExtractInfo.py)用 Python 2 语法,文件写入用 `io.open(encoding="utf-8")`
-- 目录约定:`firmware_audit/step0`、`step1/` 放预处理(原 step2-4 已退役,ADR-0011),`step5_agent/` 放 Agent 与工具层(工具在其 `tools/` 子目录),`test/` 放单元测试,`docker/` 放 Docker 相关,`profiles/` 放固件机型名单;跨目录用相对导入
-- 给 TRAE 修改 ExtractInfo.py(Jython)的任务,必须要求其**重建镜像 + 容器内实跑单个 ELF 自测**——Ghidra Jython API 的坑(如 `isString()`/`DataDB` 映射)只有真跑容器才暴露,单元测试覆盖不到
+- 工具经注册表装配及 Host 角色授权，沿用 `AgentTool` 的结构化 `params` 校验和 `ToolResult`。新增工具同时定义副作用、预算和恢复行为；查询幂等不等于动态执行可以自动重放。
+- 宿主处理 Python、读盘和 API 请求；外部分析 CLI 走 Docker。Step0 ext4 的 debugfs/mount 是已确认的宿主后端例外。新增执行方式先核对 ADR。
+- 容器默认断网，解包树只读；缓存和实验运行目录按需、最小化可写挂载。原始固件、权威 Evidence 和封存工件不由被测程序修改。
+- 路径先校验工作区归属和符号链接解析结果，再转换容器路径。LLM 工具参数使用工具路径（如 `extracted/...`），不把宿主路径或 `process/` 前缀冒充工具可读路径。
+- 搜索默认范围为 `extracted/` 与 `analysis/` 内容树，不扩展到世代日志、缓存或其他 target；专用 Evidence 读取遵循独立授权。
+- Docker 命令优先 argv 参数列表；必须使用 shell 时逐项正确引用输入，不能将纯字符串拼接当作防注入。shell 模板避免使用会误解释 ${...} 花括号的 Python 格式化。
+- 非 Ghidra 工具显式覆盖沙箱 ENTRYPOINT；容器内临时文件不假设跨独立工具调用共享。子进程文本输出显式 UTF-8 解码并容忍非法字节，输出采集有界。
+- 动态执行只能经受控入口记账；PRoot 不替代 Docker 隔离。确认版本/补丁身份、执行边界与真实回归后才放行；模型参数不能关闭边界检查。
+- 超时和中断须处理整个执行的子孙进程，必要时销毁容器；不确定时保留日志和状态。已封存运行只读，恢复不得重复扣账或自动重放有副作用动作。
 
-## 工程守则(2026-09-09 增补:讲解明了 / 模块化 / 规范化)
+## 证据与工件
 
-**讲解明了**
-- 每个模块文件头 docstring 讲清职责与关键决策依据,不读调用方也能看懂本模块干什么
-- 命名回答"是什么/干什么",注释只写"为什么";代码看不出的约束(超时的实测依据、魔数来源、防御性检查针对的事故)必须留一行注释
-- 错误文案是文档的一部分:报错必须引导下一步动作("先调 X"),不写干巴巴的"未找到"
+- Candidate、Claim、Evidence、Verification Case、Finding 使用当前领域术语；复核独立获取关键观察，只有 Host 按 Claim 门槛确认后形成 Finding。
+- 路径、地址、代码、版本与漏洞编号须有实际材料出处。版本匹配、程序成功、崩溃或模拟失败不能单独证明漏洞成立或不存在。
+- 工件包含版本与身份信息；不兼容时显式迁移或失效重跑，不按文件存在就跳过。生产产物写当前工作区/世代，工程调查与测试材料使用声明的 scratch/临时目录。
+- 工具 Observation 与原始 Evidence 分开，截断/输出上限及回读入口明确；记录反映 Agent 实际所见，不假设被截断内容已进入上下文。
+- 先 r2、信息不足再 Ghidra；反编译写 `analysis/` 并复用有效缓存，不写入解包源树，也不提取 P-code 喂给 LLM。动态适配记录来源与差异，未知设备配置不能伪造成空值或成功。
+- 密钥不写入代码、日志或提交；Blind Discovery 及实现验证不读 GT、不把 GT 注入提示词。需要 GT 的专门评估须单独授权并与发现运行隔离。
 
-**模块化**
-- 一个模块一顶职责帽;模块膨胀按 ADR-0009 先例拆包,依赖只准向下,新增顶层单元先登记分层守护测试再写代码
-- 公共逻辑提为辅助函数/基类,同一逻辑禁止出现第三个拷贝
-- 工具一工具一文件、经注册表装配,不得绕过 make_tools 与权限矩阵
+## 测试与完成标准
 
-**规范化**
-- 新工具遵守接口契约:结构化 params 声明(ADR-0004)+ ToolResult + 前置参数校验
-- 命名遵循 CONTEXT.md 术语表;工具名带引擎前缀(r2_* / ghidra_decompile)区分"现算"与"读缓存"
-- 工件带 schema 版本号:跨版本要么失效重跑要么显式兼容,禁止静默错配
-- 测试走既有 seam(工具 execute 层 / 权限矩阵 / ScriptedLLM);行为变更全套件绿,架构决策落 ADR
-
-## 已知坑
-
-- **推理模型双字段回复**(2026-08-17 deepseek-v4-flash 冒烟实测;机制适用于一切返回 reasoning_content 的模型):回复分两个字段,思考在 `reasoning_content`、正文在 `content`;思考耗尽 max_tokens 时 content 为空(finish_reason=length)。LLMClient 只把正文给 ReAct 解析器(思考随 usage.reasoning_content 留档,见 08-30 拆分);max_tokens 默认 32768(ADR-0005,思考计入预算,思考烧满由截断续写兜底)。冒烟结论:协议遵循良好,5 步自主完成 imports→xref→decompile 链,单任务 ~10k token。
-- **cve-bin-tool 3.4 的 PURL2CPE 源首跑必崩**:populate_purl2cpe 时 purl2cpe.db 未初始化,报 `OperationalError: no such table: purl2cpe`。必须 `--disable-data-source PURL2CPE`(cve_bin_tool_scan.py 已内置)。CVE 库首跑下载 NVD 数据较慢(无 key 限速),降级返回错误不崩。**预热 + 库挂载的坑**(2026-08-22 实测):库挂在宿主 `process/.cve_cache`,工具挂到容器 `$HOME/.cache`(父目录,非旧约定 `~/.cache/cvedb`——那是 3.4 找不到库报码 40 的根因);预热命令必须带目录参数(`-u now /tmp`,缺则 InsufficientArgs 码 24)且别把 `cve-bin-tool` 目录本身当挂载根(clear_cached_data 报 Device or resource busy)。详见 agents.md / tools_summary.md。
-
-- **radare2 源码安装是"软链安装"(symstall)**:bullseye apt 无 radare2 包,源码 `sys/install.sh` 后 /usr/local 下的 bin/lib/pkgconfig 全是指向构建目录(/tmp/radare2)的符号链接;删构建目录前必须把软链解引用成真实文件,否则 449 个软链全部悬空、r2 报 command not found。安装全程见 docker/sandbox/Dockerfile,r2 固定 5.9.8 tag,capstone 下载用 `CS_COMMIT_ARCHIVE=1` 走 wget(直连 git clone 会被网络掐断)。
-- **sandbox 镜像 ENTRYPOINT 是 Ghidra AnalyzeHeadless**:`firm_audit/sandbox` 调任何非 Ghidra 工具(checksec/radare2/cve-bin-tool/semgrep)必须用 `run_docker()` 的 `entrypoint` 参数覆盖,否则命令参数全部被 Ghidra 吃掉报 InvalidInputException(step0 调 sfdisk 同款模式)。镜像内 PATH 也被 Ghidra 覆盖过,Dockerfile 已显式补全,但 login shell(`bash -l`)会再次触发覆盖,容器内跑脚本用显式 `export PATH`。
-- **semgrep 在 bullseye 沙箱锁定 1.100.0**(2026-08-17 实测):原 DeepAudit 镜像的 semgrep 是坏的(site-packages/semgrep/bin/ 混入 Windows DLL,Linux semgrep-core 从未存在)。重装版本边界:semgrep ≥1.101 的 Linux 预编译 wheel 是 manylinux_2_35(glibc 2.35),bullseye 是 glibc 2.31,pip 匹配不到 wheel 会退回 sdist 现场构建,但产物内 semgrep-core 仍需 glibc 2.35,运行即 "Failed to find semgrep-core";1.100.0 是最后一代 manylinux2014(glibc 2.17)平台 wheel,实测可用(本地规则扫描验证)。配套约束:必须带依赖装(不能 `--no-deps`,opentelemetry 链是运行时 import 硬依赖);先 pin `"setuptools<81"`(opentelemetry 依赖 pkg_resources,setuptools≥81 已移除);镜像里遗留的孤儿包 `opentelemetry-instrumentation-threading 0.58b0`(Required-by 为空)要卸载,否则 pip3 check 报版本冲突。安装见 docker/sandbox/Dockerfile,验证脚本 docker/sandbox/verify_agent_tools.sh(四工具+java/sfdisk/Ghidra 实跑全检,ALL-PASS 才算镜像可用)。
-- **镜像压扁(export/import)的正确姿势与坑**(2026-08-17):增量层上删除文件不缩小镜像体积(下层白字节数据仍在),要真正减体积必须压扁。流程:回归 ALL-PASS 后 `docker create` + `docker export -o x.tar` + `docker import --change ...` 补元数据。实测:9.53GB 层叠镜像压扁后 5.1GB(历史层重复数据占了大半,远超删除项本身的 1.35GB)。三个坑:①PowerShell 下 `--change 'ENTRYPOINT ["x"]'` 的内层双引号被剥,ENTRYPOINT 变成 shell 形式,必须用 flatten-entrypoint.Dockerfile 的 JSON 语法补一层修正(零体积元数据层);②import 后全部 ENV 丢失,必须逐一补回(PATH 要同时剔除已删除的 cargo/go 段);③analyzeHeadless 的选项要空格分隔(`-analysisTimeoutPerFile 60`),`=` 形式会被当文件参数报 InvalidInputException。压扁后层缓存链失效:主 Dockerfile 是"完整配方"(下次从压扁 latest 重建会重跑全部 RUN 层约 10 分钟),日常加新工具建议用独立小 Dockerfile `FROM firm_audit/sandbox:latest` 只写新增层(2026-08-18 已完成切换:latest 即压扁镜像,旧 9.53GB 层与 :flat 中间 tag 已清理)。
-- **沙箱冗余工具链已删**(2026-08-17 用户确认):openjdk-11/17(apt purge,autoremove 只连带清了 libasound2/libcups2/libavahi/libnss3 等 JDK 专属依赖)、Rust(rustup:/usr/local/rustup + /usr/local/cargo)、Go(/usr/local/go)、gosec(/usr/local/bin/gosec)。删后裸 `java` 软链到 /opt/jdk-21 消除版本歧义(原来 alternatives 指向 17,而 Ghidra 走 JAVA_HOME=21,存在隐性分叉)。依赖核查结论:semgrep-core 是 OCaml 静态二进制、cve-bin-tool 是 Python,均不依赖 Rust/Go;Ghidra 11.3.2 只要 JDK 21。
-- **binwalk 解包偶发 bug(可复现性差)**:binwalk 3.1.1 对同一固件两次解包可能得到**不同结果**。实测:同一 `nano14-backup-SANITIZED.tar.xz`(84MB,MD5 `8491aa15...`),一次解出正确 211MB tar(4721 条目,29 ELF),另一次解出**错误的 412MB 文件**(103 条目 + 200MB 垃圾数据),并多出 **853 个 hex 偏移目录**(如 `decompressed.bin.extracted/10012B3/pem.crt`,全是 binwalk 从垃圾数据里 carve 的 PEM)。`decompressed.bin` 大小是判据:正确值 = XZ 解开大小(宿主 `lzma.decompress` 可验证,211MB)。**binwalk 镜像本身没变**(7月29日构建),是 binwalk 运行时偶发不稳定。**影响**:解包层数/文件数/ELF 数都可能漂移,审计可复现性差。**对策**:审计前用宿主 lzma 验证固件 XZ 解开大小,异常解包结果(出现大量 hex 目录)要警惕,必要时重跑。
-- **Ghidra 分析长尾**:大型共享库自动分析可能陷入无限循环,必须在 Ghidra 命令加 `-analysisTimeoutPerFile 300` 截断(空格分隔形式,`=` 形式会被当文件参数报 InvalidInputException,见压扁坑③),保证部分输出(functions/strings/imports)而非零产出。
-- **Ghidra Jython API 坑**:`getDefinedStrings()` 不存在、`DataDB` 无 `isString()`,正确做法是 `getDefinedData(True)` + `getValue()` 返回 unicode + `isinstance(value, basestring)` 过滤。
+- 行为修复先建立能捕获实际问题的回归测试，使用既有工具/Host 接缝与 ScriptedLLM；默认不调用真实模型或消耗 GLM 额度。
+- 记录命令与实际结果，区分通过、失败、跳过；真实 Docker/固件 AC 需要实际执行证据，离线替身或 skipped 不算交付。
+- 代码变更完成定向测试及工单要求的全量回归。既有环境失败单列并给出依据，不删断言或放宽预期来制造全绿。
+- 镜像、PRoot/QEMU 补丁或 Ghidra 脚本改变后，重建对应镜像并实跑相关固件/ELF。升级后重新验证兼容性、执行边界与清理，不能仅依赖版本输出。
+- 修改 ExtractInfo.py 保持 Ghidra Jython 的 Python 2 兼容，文本写入使用 `io.open(..., encoding="utf-8")`；容器实跑不能用单元测试替代。
+- 常用离线回归命令：`pytest -q firmware_audit/test --ignore=firmware_audit/test/test_step5_host_evaluation.py`。仍须核对相关测试的 Docker/LLM 门控；该命令排除 GT 评估，不代表所有集成测试自动执行。
+- code-review 按 Standards 与 Spec 两轴检查；修复后评审覆盖最终改动。工单完成须有 AC 证据、测试结果、未解决项及最终评审记录，不以测试数量或标签代替验收。

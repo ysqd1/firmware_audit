@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "case_id": "dlink-dir890l-2017-14948",
+  "target_id": "target/6",
+  "firmware": {
+    "filename": "DIR890LA1_FW111b02_20170519_beta01.bin",
+    "sha256": "e422edacb6e47d5162054aea88ea98983921f28beabd167d4949b18e4900aeba",
+    "size_bytes": 20197524
+  },
+  "difficulty_tier": "standard",
+  "budget": {
+    "recon_max_rounds": 30,
+    "analysis_max_rounds": 30,
+    "verification_max_rounds": 15,
+    "max_llm_calls": 400,
+    "max_tool_attempts": 320,
+    "max_active_seconds": 7200.0,
+    "max_candidates": 8
+  },
+  "runtime_notes": "解包冒烟 2026-09-20 通过:binwalk 单层直达 squashfs-root,完整 Linux 目录树(含 web 内容目录与 sbin)。max_active_seconds 为浮点秒。",
+  "isolation_review_points": [
+    "case_id 含 CVE 年份编号;正式接线时 Step5 可见参数建议改用中性 id(如 target 序号),case_id↔GT 映射只在评测侧维护",
+    "本 profile 与 target/6/README.md 一样不得携带任何漏洞描述;参考材料只在 benchmark/reference/"
+  ]
+}

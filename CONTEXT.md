@@ -14,6 +14,10 @@ _Avoid_: 镜像(仅指磁盘镜像), 包(package)
 `target/<N>/process/` 目录——固件解包产物与全部审计产出的唯一落盘根,也是 Step5 工具(read_file/list_files 等)的白名单根。磁盘镜像场景下每个分区子文件夹自成一个工作区。
 _Avoid_: 输出目录(out 是单个分区的子目录)
 
+**审计项目 (audit project)**:
+用户命名的一项固件审计记录,关联一个源目录及其中恰好一个固件输入,并拥有独立的审计工作区与多个运行世代。显示名称用于识别项目,不等于源目录路径或运行世代身份。该概念已确认,控制台与数据契约待规格化和实现。
+_Avoid_: `target/<N>` 磁盘目录名, Candidate Target 字段
+
 **解包树 (extracted tree)**:
 Step1 把固件解包出的文件目录树(`process/extracted/`),只读,是后续所有分析的原始材料。
 _Avoid_: 解包根, extracted

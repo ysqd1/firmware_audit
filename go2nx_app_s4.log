@@ -1,7 +1,0 @@
-E:\固件\create\important\firmware_audit\step4\step4_decompile.py:951: CryptographyDeprecationWarning: SSH DSA keys are deprecated and will be removed in a future release.
-  key = loader(data)
-E:\固件\create\important\firmware_audit\step4\step4_decompile.py:885: CryptographyDeprecationWarning: Parsed a negative serial number, which is disallowed by RFC 5280. Loading this certificate will cause an exception in the next release of cryptography.
-  key, cert, addl = pkcs12.load_key_and_certificates(data, None)
-[Step4] 清理孤儿产物: 删除 0 个(反编译 0, ELF 产物 0, 文本 0, 证书 0)
-[Step4] 处理完成: ELF=0(ok=0, failed=0, 跳过=0, 续传复用=0, cap跳过=0), crypto=372(crypto_gpg=24, crypto_pkcs12=1, crypto_private_key=6, crypto_public_key=7, crypto_x509=334), 文本扫描=29222(有发现=9464), ELF字符串扫描=0(有发现=0), 不透明分诊=36217(hex/srec从text捞=0, 已分诊=32996)
-[driver] Step4 完成,fileinfo.json 已回写

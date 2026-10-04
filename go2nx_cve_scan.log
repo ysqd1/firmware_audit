@@ -1,4 +1,0 @@
-running cve-bin-tool on full APP tree...
-rc=1 elapsed=962s stdout=0 chars
-saved -> E:\固件\create\important\target\3\app_inventory\cve_scan_full.json
-JSON parse failed (rc=1 空输出=无命中?): Expecting value: line 1 column 1 (char 0) | stdout head: 
